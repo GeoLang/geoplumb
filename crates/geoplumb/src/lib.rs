@@ -21,7 +21,7 @@ pub mod window;
 
 pub use caps::{Caps, CapsSet, Constraint, Crs};
 pub use chunk::{Chunk, RasterChunk};
-pub use element::{Source, Transform};
+pub use element::{Fanin, Source, Transform};
 pub use engine::{Engine, Invalidation, materialize};
 pub use error::{Error, Result};
 pub use graph::{Graph, NodeId};

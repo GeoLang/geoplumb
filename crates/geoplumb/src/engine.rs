@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::caps::Caps;
 use crate::chunk::RasterChunk;
-use crate::element::{Source, Transform};
+use crate::element::{Fanin, Source, Transform};
 use crate::error::Result;
 use crate::graph::{Graph, Node, NodeId};
 use crate::solver;
@@ -24,6 +24,10 @@ enum RtElem {
     Transform {
         parent: usize,
         element: Arc<dyn Transform>,
+    },
+    Fanin {
+        parents: Vec<usize>,
+        element: Arc<dyn Fanin>,
     },
 }
 
@@ -91,6 +95,22 @@ impl Engine {
                         grid,
                     )
                 }
+                Node::Fanin {
+                    parents,
+                    mut element,
+                } => {
+                    let input_caps: Vec<Caps> = parents.iter().map(|p| caps[p.0].clone()).collect();
+                    element.configure(&input_caps, &caps[i])?;
+                    let grids: Vec<GridSpec> = parents.iter().map(|p| nodes[p.0].grid).collect();
+                    let grid = element.output_grid(&grids);
+                    (
+                        RtElem::Fanin {
+                            parents: parents.iter().map(|p| p.0).collect(),
+                            element: Arc::from(element),
+                        },
+                        grid,
+                    )
+                }
             };
             grid.chunk_px = caps[i].raster().chunk_px;
             nodes.push(RtNode {
@@ -134,27 +154,36 @@ impl Engine {
         for i in node.0..self.nodes.len() {
             let Some(d) = dirty[i] else { continue };
             for (j, n) in self.nodes.iter().enumerate().skip(i + 1) {
-                if let RtElem::Transform { parent, element } = &n.elem {
-                    if *parent == i {
-                        // spread at the coarsest cached level so a coarse
-                        // chunk's wider halo is still covered
-                        let max_level = {
-                            let state = self.cache.lock().unwrap();
-                            state
-                                .entries
-                                .keys()
-                                .filter(|(idx, _)| *idx == j)
-                                .map(|(_, k)| k.level)
-                                .max()
-                                .unwrap_or(0)
-                        };
-                        let spread = element.spread(&d, n.grid.resolution_at(max_level));
-                        dirty[j] = Some(match dirty[j] {
-                            None => spread,
-                            Some(prev) => union(prev, spread),
-                        });
-                    }
+                let feeds = match &n.elem {
+                    RtElem::Source(_) => false,
+                    RtElem::Transform { parent, .. } => *parent == i,
+                    RtElem::Fanin { parents, .. } => parents.contains(&i),
+                };
+                if !feeds {
+                    continue;
                 }
+                // spread at the coarsest cached level so a coarse chunk's
+                // wider halo is still covered
+                let max_level = {
+                    let state = self.cache.lock().unwrap();
+                    state
+                        .entries
+                        .keys()
+                        .filter(|(idx, _)| *idx == j)
+                        .map(|(_, k)| k.level)
+                        .max()
+                        .unwrap_or(0)
+                };
+                let res = n.grid.resolution_at(max_level);
+                let spread = match &n.elem {
+                    RtElem::Source(_) => unreachable!("sources feed nothing"),
+                    RtElem::Transform { element, .. } => element.spread(&d, res),
+                    RtElem::Fanin { element, .. } => element.spread(&d, res),
+                };
+                dirty[j] = Some(match dirty[j] {
+                    None => spread,
+                    Some(prev) => union(prev, spread),
+                });
             }
             let grid = self.nodes[i].grid;
             let mut state = self.cache.lock().unwrap();
@@ -292,6 +321,17 @@ impl Engine {
                 let input = self.pull_assembled(*parent, in_req).await?;
                 let element = element.clone();
                 offload(move || element.compute(&out, &input)).await
+            }
+            RtElem::Fanin { parents, element } => {
+                let inputs = futures::future::try_join_all(
+                    parents
+                        .iter()
+                        .enumerate()
+                        .map(|(k, p)| self.pull_assembled(*p, element.plan(&out, k))),
+                )
+                .await?;
+                let element = element.clone();
+                offload(move || element.compute(&out, &inputs)).await
             }
         }
     }

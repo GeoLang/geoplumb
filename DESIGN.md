@@ -18,13 +18,14 @@ Adapted from glass2glass's CSP design (`src/caps.rs`, `src/solver.rs`, MPL-2.0).
 - `Identity(CapsSet)` — pass-through, optionally narrowing
 - `Derived { input, passthrough, output }` — output derived from input, declarative: a `FieldMask` names the fields copied across, the override pattern pins retargeted fields (reproject pins `crs`)
 
-`CapsSet` is preference-ordered alternatives of field patterns (dtype, bands, crs, resolution range, chunk px). The solver runs a forward sweep (narrow each output link), a backward sweep (consumers narrow producers, coupling backward through `Derived` only on passthrough fields), then fixates source-first so children fixate against concrete parent caps. Failures are structured and name the link.
+`CapsSet` is preference-ordered alternatives of field patterns (dtype, bands, crs, resolution range, chunk px). The solver alternates forward sweeps (narrow each output link through the node's constraint) and backward sweeps (consumers narrow producers, coupling backward through `Derived` only on passthrough fields) until the links stop changing: a fanin couples its input links through the shared consumer, so one sweep each way is no longer complete. Fixation then assigns concrete caps source-first by backtracking search, because a diamond can leave branch preference orders that disagree, where greedy per-link fixation picks a jointly impossible combination. The greedy choice is tried first, so chains and plain fan-out fixate as before. Failures are structured and name the link.
+
+A fanin declares one `Constraint` that applies to every input link and the output link alike, so all pins negotiate to matching caps.
 
 Divergences from g2g, deliberate:
 
 - Resolution stays a range on fixated caps and is resolved per pull by ladder snapping, because in a pull engine resolution is request-time, not negotiation-time.
 - Field coupling is declarative (masks) rather than closure-based. Geo caps fields are independent enough that the closure machinery and passthrough probing are unnecessary.
-- Single-input nodes only, so the constraint graph is a forest and one sweep each way is complete. Fan-in (mosaic, multi-input algebra) brings back g2g's backtracking fixation.
 
 ## Chunks and snapping
 
@@ -32,7 +33,7 @@ Requests snap to a per-node grid: a power-of-two resolution ladder anchored at t
 
 Chunks are self-describing (`RasterChunk`: bands, resolved bbox, resolution, crs) because responses are addressed by request, not stream order, and snapping may widen the window. `Chunk` is an enum, vector and point cloud variants are reserved.
 
-Each node's grid derives from its parent's through `output_grid`: identity for most transforms, a reproject anchors the canonical origin for known CRS (web mercator, wgs84) and estimates base resolution from the local scale.
+Each node's grid derives from its parent's through `output_grid`: identity for most transforms, a reproject anchors the canonical origin for known CRS (web mercator, wgs84) and estimates base resolution from the local scale. A fanin takes its finest input grid by default, and its elements sample inputs bilinearly onto the output grid, exact when an input shares the output alignment.
 
 ## Runtime
 
@@ -48,9 +49,10 @@ Thin wrappers over sibling crates: terrano-core for kernels and GeoTIFF IO, proj
 
 Two sources. `RasterSrc` holds the whole dataset resident and serves ladder levels by block-averaged decimation. `CogSrc` reads windowed over terrano's `CogReader`: each pull fetches only the tiles it touches at the file overview nearest the requested ladder level, block-averaging the remainder when the file pyramid is shallower than the request. Its transport is the `RangeRead` seam, with a local file impl in terrano and a blocking-reqwest `HttpRange` here for remote files.
 
+Two fanin elements. `Mosaic` takes the first input, wiring order, that has a value at each output pixel. `Combine` samples both inputs onto the output grid and runs terrano's binary op band by band.
+
 ## Known limits
 
-- Fan-in is not modeled: no mosaic of multiple sources, no two-input algebra.
 - Reproject auto-plug (splicing on CRS mismatch) is deferred, graphs wire reproject explicitly.
 - The cache is in-memory only, a disk tier belongs behind the same map.
 - `CogSrc` covers the subset terrano writes (uncompressed single-band f64) and serializes range reads per source behind a mutex. No time axis.

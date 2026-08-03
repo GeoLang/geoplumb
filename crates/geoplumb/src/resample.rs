@@ -57,10 +57,23 @@ pub(crate) fn sample_bilinear(band: &Raster, chunk: &RasterChunk, x: f64, y: f64
     let v01 = sample(r0, c0 + 1.0);
     let v10 = sample(r0 + 1.0, c0);
     let v11 = sample(r0 + 1.0, c0 + 1.0);
+    let w = [
+        (1.0 - tx) * (1.0 - ty),
+        tx * (1.0 - ty),
+        (1.0 - tx) * ty,
+        tx * ty,
+    ];
     match (v00, v01, v10, v11) {
-        (Some(a), Some(b), Some(c), Some(d)) => Some(
-            a * (1.0 - tx) * (1.0 - ty) + b * tx * (1.0 - ty) + c * (1.0 - tx) * ty + d * tx * ty,
-        ),
-        _ => v00.or(v01).or(v10).or(v11),
+        (Some(a), Some(b), Some(c), Some(d)) => Some(a * w[0] + b * w[1] + c * w[2] + d * w[3]),
+        // some neighbors missing: nearest present one, ignoring neighbors
+        // whose weight is float jitter so a point on a pixel center never
+        // takes a value a whole pixel away
+        _ => [v00, v01, v10, v11]
+            .iter()
+            .zip(w)
+            .filter(|(_, w)| *w > 1e-6)
+            .filter_map(|(v, w)| v.map(|v| (w, v)))
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, v)| v),
     }
 }
