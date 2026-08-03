@@ -859,7 +859,9 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -1128,7 +1130,7 @@ dependencies = [
 [[package]]
 name = "terrano-core"
 version = "0.1.0"
-source = "git+https://github.com/GeoLang/terrano.git?branch=master#2d82c1ea02a59823a501752472bb739166348bfe"
+source = "git+https://github.com/GeoLang/terrano.git?branch=master#455a68cef0964729ca3fd06879cb00c594e8f897"
 dependencies = [
  "thiserror",
 ]

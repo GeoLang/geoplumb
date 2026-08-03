@@ -46,12 +46,12 @@ Engine caps are immutable per instance (solve happens in `Engine::new`), so cach
 
 Thin wrappers over sibling crates: terrano-core for kernels and GeoTIFF IO, projicio-core for CRS transforms. The engine repo carries orchestration, not math.
 
-`RasterSrc` holds the whole dataset resident and serves ladder levels by block-averaged decimation. True ranged COG reads need a windowed reader terrano does not have yet (its COG support is write-side only).
+Two sources. `RasterSrc` holds the whole dataset resident and serves ladder levels by block-averaged decimation. `CogSrc` reads windowed over terrano's `CogReader`: each pull fetches only the tiles it touches at the file overview nearest the requested ladder level, block-averaging the remainder when the file pyramid is shallower than the request. Its transport is the `RangeRead` seam, with a local file impl in terrano and a blocking-reqwest `HttpRange` here for remote files.
 
 ## Known limits
 
 - Fan-in is not modeled: no mosaic of multiple sources, no two-input algebra.
 - Reproject auto-plug (splicing on CRS mismatch) is deferred, graphs wire reproject explicitly.
 - The cache is in-memory only, a disk tier belongs behind the same map.
-- `RasterSrc` loads whole files, no ranged COG streaming, no time axis.
+- `CogSrc` covers the subset terrano writes (uncompressed single-band f64) and serializes range reads per source behind a mutex. No time axis.
 - Invalidation spread uses the coarsest cached level per node, over-invalidating slightly, never stale.

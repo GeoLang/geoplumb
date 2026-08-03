@@ -315,7 +315,7 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
-async fn offload<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+pub(crate) async fn offload<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(h) => h.spawn_blocking(f).await.expect("compute task panicked"),
         Err(_) => f(),

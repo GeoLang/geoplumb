@@ -1,7 +1,7 @@
 //! in-memory raster source. the whole dataset is held resident (a geotiff is
 //! fetched or read once at open) and windows are served by block-averaged
-//! decimation per ladder level. TODO: ranged cog reads once terrano grows a
-//! windowed reader, today its cog support is write-side only
+//! decimation per ladder level. for tiled cogs use CogSrc, which reads
+//! windows without holding the file
 
 use crate::caps::{CapsPattern, CapsSet, Constraint, Crs, RasterPattern, ResRange, SetField};
 use crate::chunk::RasterChunk;
