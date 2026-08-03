@@ -1,6 +1,7 @@
 //! pull dag: transforms have one upstream, fanin nodes several, fan-out is
-//! several nodes sharing one parent. nodes are added parents-first, so
-//! index order is a topological order
+//! several nodes sharing one parent. nodes are added parents-first, but
+//! auto-plugged reprojects are appended after their consumers, so walk in
+//! `topo_order`, not index order
 
 use crate::element::{Fanin, Source, Transform};
 
@@ -77,5 +78,25 @@ impl Graph {
 
     pub(crate) fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// parents-first order. the graph is acyclic by construction: an added
+    /// node only points at existing nodes, and a splice points the new node
+    /// at the old parent
+    pub(crate) fn topo_order(&self) -> Vec<usize> {
+        let n = self.nodes.len();
+        let mut order = Vec::with_capacity(n);
+        let mut placed = vec![false; n];
+        while order.len() < n {
+            let before = order.len();
+            for i in 0..n {
+                if !placed[i] && self.parents(NodeId(i)).iter().all(|p| placed[p.0]) {
+                    placed[i] = true;
+                    order.push(i);
+                }
+            }
+            assert!(order.len() > before, "graph has a cycle");
+        }
+        order
     }
 }

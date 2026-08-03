@@ -1,6 +1,5 @@
 # TODO
 
-- reproject auto-plug on CRS mismatch instead of failing negotiation
 - disk cache tier behind the same entry map
 - STAC collection source (open Landsat/Sentinel COG buckets), the highest-leverage step toward Earth Engine-shaped workloads
 - vector and point cloud chunk variants (nubis, the PDAL slot)

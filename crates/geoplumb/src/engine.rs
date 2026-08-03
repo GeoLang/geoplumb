@@ -63,20 +63,26 @@ struct CacheState {
 
 pub struct Engine {
     nodes: Vec<RtNode>,
+    topo: Vec<usize>,
     cache: Mutex<CacheState>,
     events: broadcast::Sender<Invalidation>,
     budget_bytes: usize,
 }
 
 impl Engine {
-    /// solve the graph, configure every transform with its fixated caps,
-    /// and derive each node's grid from its source up
+    /// solve the graph (splicing reprojects onto crs-mismatched edges),
+    /// configure every transform with its fixated caps, and derive each
+    /// node's grid from its source up. spliced nodes sit after their
+    /// consumers in index order, so construction walks the topo order
     pub fn new(graph: Graph, budget_bytes: usize) -> Result<Engine> {
-        let caps = solver::solve(&graph)?;
-        let mut nodes: Vec<RtNode> = Vec::with_capacity(graph.len());
-        let node_boxes: Vec<Node> = graph.nodes;
-        for (i, node) in node_boxes.into_iter().enumerate() {
-            let (elem, mut grid) = match node {
+        let mut graph = graph;
+        let caps = solver::solve(&mut graph)?;
+        let topo = graph.topo_order();
+        let mut boxes: Vec<Option<Node>> = graph.nodes.into_iter().map(Some).collect();
+        let mut nodes: Vec<Option<RtNode>> = (0..boxes.len()).map(|_| None).collect();
+        for &i in &topo {
+            let built = |p: usize| -> &RtNode { nodes[p].as_ref().expect("parents built first") };
+            let (elem, mut grid) = match boxes[i].take().expect("topo visits each node once") {
                 Node::Source(s) => {
                     let grid = s.grid();
                     (RtElem::Source(Arc::from(s)), grid)
@@ -86,7 +92,7 @@ impl Engine {
                     mut element,
                 } => {
                     element.configure(&caps[parent.0], &caps[i])?;
-                    let grid = element.output_grid(&nodes[parent.0].grid);
+                    let grid = element.output_grid(&built(parent.0).grid);
                     (
                         RtElem::Transform {
                             parent: parent.0,
@@ -101,7 +107,7 @@ impl Engine {
                 } => {
                     let input_caps: Vec<Caps> = parents.iter().map(|p| caps[p.0].clone()).collect();
                     element.configure(&input_caps, &caps[i])?;
-                    let grids: Vec<GridSpec> = parents.iter().map(|p| nodes[p.0].grid).collect();
+                    let grids: Vec<GridSpec> = parents.iter().map(|p| built(p.0).grid).collect();
                     let grid = element.output_grid(&grids);
                     (
                         RtElem::Fanin {
@@ -113,7 +119,7 @@ impl Engine {
                 }
             };
             grid.chunk_px = caps[i].raster().chunk_px;
-            nodes.push(RtNode {
+            nodes[i] = Some(RtNode {
                 elem,
                 caps: caps[i].clone(),
                 grid,
@@ -121,7 +127,8 @@ impl Engine {
         }
         let (events, _) = broadcast::channel(64);
         Ok(Engine {
-            nodes,
+            nodes: nodes.into_iter().map(|n| n.expect("all built")).collect(),
+            topo,
             cache: Mutex::new(CacheState::default()),
             events,
             budget_bytes,
@@ -151,17 +158,14 @@ impl Engine {
     pub fn invalidate(&self, node: NodeId, bbox: Bbox) {
         let mut dirty: Vec<Option<Bbox>> = vec![None; self.nodes.len()];
         dirty[node.0] = Some(bbox);
-        for i in node.0..self.nodes.len() {
-            let Some(d) = dirty[i] else { continue };
-            for (j, n) in self.nodes.iter().enumerate().skip(i + 1) {
-                let feeds = match &n.elem {
-                    RtElem::Source(_) => false,
-                    RtElem::Transform { parent, .. } => *parent == i,
-                    RtElem::Fanin { parents, .. } => parents.contains(&i),
-                };
-                if !feeds {
-                    continue;
-                }
+        for &j in &self.topo {
+            let n = &self.nodes[j];
+            let from_parents: Vec<Bbox> = match &n.elem {
+                RtElem::Source(_) => Vec::new(),
+                RtElem::Transform { parent, .. } => dirty[*parent].into_iter().collect(),
+                RtElem::Fanin { parents, .. } => parents.iter().filter_map(|p| dirty[*p]).collect(),
+            };
+            if !from_parents.is_empty() {
                 // spread at the coarsest cached level so a coarse chunk's
                 // wider halo is still covered
                 let max_level = {
@@ -175,21 +179,24 @@ impl Engine {
                         .unwrap_or(0)
                 };
                 let res = n.grid.resolution_at(max_level);
-                let spread = match &n.elem {
-                    RtElem::Source(_) => unreachable!("sources feed nothing"),
-                    RtElem::Transform { element, .. } => element.spread(&d, res),
-                    RtElem::Fanin { element, .. } => element.spread(&d, res),
-                };
-                dirty[j] = Some(match dirty[j] {
-                    None => spread,
-                    Some(prev) => union(prev, spread),
-                });
+                for d in from_parents {
+                    let spread = match &n.elem {
+                        RtElem::Source(_) => unreachable!("sources have no parents"),
+                        RtElem::Transform { element, .. } => element.spread(&d, res),
+                        RtElem::Fanin { element, .. } => element.spread(&d, res),
+                    };
+                    dirty[j] = Some(match dirty[j] {
+                        None => spread,
+                        Some(prev) => union(prev, spread),
+                    });
+                }
             }
-            let grid = self.nodes[i].grid;
+            let Some(d) = dirty[j] else { continue };
+            let grid = n.grid;
             let mut state = self.cache.lock().unwrap();
             let mut freed = 0usize;
             state.entries.retain(|(n_idx, key), entry| {
-                if *n_idx != i {
+                if *n_idx != j {
                     return true;
                 }
                 let keep = !grid.chunk_bbox(*key).intersects(&d);
@@ -203,7 +210,7 @@ impl Engine {
             state_bytes_sub(&mut state.bytes, freed);
             drop(state);
             let _ = self.events.send(Invalidation {
-                node: NodeId(i),
+                node: NodeId(j),
                 bbox: d,
             });
         }

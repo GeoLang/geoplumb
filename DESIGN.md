@@ -22,6 +22,8 @@ Adapted from glass2glass's CSP design (`src/caps.rs`, `src/solver.rs`, MPL-2.0).
 
 A fanin declares one `Constraint` that applies to every input link and the output link alike, so all pins negotiate to matching caps.
 
+A link that comes up empty only because of crs is not a failure: the solver splices a reproject onto the offending edge and re-solves, so mixed-crs graphs negotiate without explicit wiring. The target is the crs the demanding side prefers, at a fanin the first parent's. Spliced nodes are appended after their consumers, so the engine and solver walk `topo_order` rather than index order.
+
 Divergences from g2g, deliberate:
 
 - Resolution stays a range on fixated caps and is resolved per pull by ladder snapping, because in a pull engine resolution is request-time, not negotiation-time.
@@ -53,7 +55,6 @@ Two fanin elements. `Mosaic` takes the first input, wiring order, that has a val
 
 ## Known limits
 
-- Reproject auto-plug (splicing on CRS mismatch) is deferred, graphs wire reproject explicitly.
 - The cache is in-memory only, a disk tier belongs behind the same map.
 - `CogSrc` covers the subset terrano writes (uncompressed single-band f64) and serializes range reads per source behind a mutex. No time axis.
 - Invalidation spread uses the coarsest cached level per node, over-invalidating slightly, never stale.

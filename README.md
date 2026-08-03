@@ -13,7 +13,7 @@ Build a dag of sources and transforms, negotiate caps once, then pull windows: a
 - **Batch = pull** — materializing a pyramid is a driver loop over the chunk grid, the same graph the live server pulls.
 - **Live = invalidate + re-pull** — declare a window dirty and the engine drops overlapping cache downstream (halo-spread, projected across CRS changes) and publishes events for re-rendering.
 
-Elements in v1: in-memory GeoTIFF source, windowed COG source (only the tiles a pull touches are fetched, locally or over HTTP range requests, from the file overview nearest the request), reproject (projicio), hillshade, slope, map algebra and reclassify (terrano), mosaic and two-input algebra over fan-in nodes, an XYZ tile adapter, PNG and GeoTIFF encoders.
+Elements in v1: in-memory GeoTIFF source, windowed COG source (only the tiles a pull touches are fetched, locally or over HTTP range requests, from the file overview nearest the request), reproject (projicio, auto-plugged wherever a link disagrees only on CRS), hillshade, slope, map algebra and reclassify (terrano), mosaic and two-input algebra over fan-in nodes, an XYZ tile adapter, PNG and GeoTIFF encoders.
 
 ## Quick start
 
