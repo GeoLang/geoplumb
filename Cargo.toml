@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/GeoLang/geoplumb"
+authors = ["GeoLang <tiletopia@proton.me>"]
+description = "Pull-based geospatial compute pipeline with caps negotiation"
+rust-version = "1.85"
+
+[workspace.dependencies]
+terrano-core = { git = "https://github.com/GeoLang/terrano.git", branch = "master" }
+projicio-core = { git = "https://github.com/GeoLang/projicio.git", branch = "master" }
