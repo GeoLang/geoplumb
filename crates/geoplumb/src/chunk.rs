@@ -1,11 +1,17 @@
 //! self-describing chunks. a pull response carries its resolved grid rather
 //! than trusting the request, since snapping may widen or align the window
 
+use std::collections::HashMap;
+
 use crate::caps::Crs;
 use crate::error::{Error, Result};
 use crate::window::Bbox;
 use nubis_core::{Point3, PointCloud};
 use terrano_core::{BandedRaster, Raster};
+use topoi_core::geojson::FeatureGeometry;
+use topoi_core::{
+    LineString, MultiPolygon, Point, Polygon, Ring, clip_linestring_rect, clip_polygon_rect,
+};
 
 #[derive(Debug, Clone)]
 pub struct RasterChunk {
@@ -25,11 +31,33 @@ pub struct PointChunk {
     pub crs: Crs,
 }
 
-/// vector and tensor variants are reserved here
+/// one fragment of a source feature: the piece inside a tile window. `id`
+/// is the source-assigned feature identity, shared by every fragment of
+/// one feature, so a later dissolve can reassemble seam-split features
+#[derive(Debug, Clone)]
+pub struct VectorFeature {
+    pub id: u64,
+    pub geometry: FeatureGeometry,
+    pub properties: HashMap<String, serde_json::Value>,
+}
+
+/// features clipped to one tile window, simplified for the ladder level.
+/// resolution is the simplification tolerance the fragments were cut for
+#[derive(Debug, Clone)]
+pub struct VectorChunk {
+    pub features: Vec<VectorFeature>,
+    pub bbox: Bbox,
+    pub resolution: f64,
+    pub crs: Crs,
+    byte_size: usize,
+}
+
+/// the tensor variant is reserved here
 #[derive(Debug, Clone)]
 pub enum Chunk {
     Raster(RasterChunk),
     PointCloud(PointChunk),
+    Vector(VectorChunk),
 }
 
 impl Chunk {
@@ -61,10 +89,25 @@ impl Chunk {
         }
     }
 
+    pub fn vector(&self) -> Result<&VectorChunk> {
+        match self {
+            Chunk::Vector(v) => Ok(v),
+            _ => Err(Error::Kind("vector")),
+        }
+    }
+
+    pub fn into_vector(self) -> Result<VectorChunk> {
+        match self {
+            Chunk::Vector(v) => Ok(v),
+            _ => Err(Error::Kind("vector")),
+        }
+    }
+
     pub fn byte_size(&self) -> usize {
         match self {
             Chunk::Raster(r) => r.byte_size(),
             Chunk::PointCloud(p) => p.byte_size(),
+            Chunk::Vector(v) => v.byte_size(),
         }
     }
 }
@@ -98,6 +141,120 @@ impl PointChunk {
             crs: self.crs,
         }
     }
+}
+
+impl VectorChunk {
+    pub fn new(features: Vec<VectorFeature>, bbox: Bbox, resolution: f64, crs: Crs) -> VectorChunk {
+        let byte_size = features
+            .iter()
+            .map(|f| {
+                let coords = geometry_coord_count(&f.geometry);
+                let props = serde_json::to_string(&f.properties).map_or(0, |s| s.len());
+                16 + coords * 16 + props
+            })
+            .sum();
+        VectorChunk {
+            features,
+            bbox,
+            resolution,
+            crs,
+            byte_size,
+        }
+    }
+
+    pub fn byte_size(&self) -> usize {
+        self.byte_size
+    }
+
+    /// re-clip the fragments to a narrower window, dropping the ones that
+    /// fall out. fragments keep their source order
+    pub fn crop_to(&self, bbox: &Bbox) -> VectorChunk {
+        let mut kept = Vec::new();
+        for f in &self.features {
+            for geometry in clip_geometry(&f.geometry, bbox) {
+                kept.push(VectorFeature {
+                    id: f.id,
+                    geometry,
+                    properties: f.properties.clone(),
+                });
+            }
+        }
+        VectorChunk::new(kept, *bbox, self.resolution, self.crs)
+    }
+}
+
+fn geometry_coord_count(geometry: &FeatureGeometry) -> usize {
+    match geometry {
+        FeatureGeometry::Point(_) => 1,
+        FeatureGeometry::LineString(l) => l.coords().len(),
+        FeatureGeometry::Polygon(p) => polygon_coord_count(p),
+        FeatureGeometry::MultiPolygon(mp) => mp.polygons().iter().map(polygon_coord_count).sum(),
+    }
+}
+
+fn polygon_coord_count(p: &Polygon) -> usize {
+    p.exterior().coords().len()
+        + p.interiors()
+            .iter()
+            .map(|r| r.coords().len())
+            .sum::<usize>()
+}
+
+/// clip one geometry to a tile window. points use the tile membership
+/// convention, lines split into parts where they leave the window, polygon
+/// rings clip independently (Sutherland-Hodgman, exact float math), which
+/// keeps even-odd fill correct for pixel centers inside the window
+pub fn clip_geometry(geometry: &FeatureGeometry, bbox: &Bbox) -> Vec<FeatureGeometry> {
+    match geometry {
+        FeatureGeometry::Point(p) => {
+            if tile_contains(bbox, p.0.x, p.0.y) {
+                vec![FeatureGeometry::Point(Point(p.0))]
+            } else {
+                Vec::new()
+            }
+        }
+        FeatureGeometry::LineString(l) => {
+            clip_linestring_rect(l.coords(), bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)
+                .into_iter()
+                .map(|part| FeatureGeometry::LineString(LineString::new(part)))
+                .collect()
+        }
+        FeatureGeometry::Polygon(p) => clip_polygon_to(p, bbox)
+            .map(FeatureGeometry::Polygon)
+            .into_iter()
+            .collect(),
+        FeatureGeometry::MultiPolygon(mp) => {
+            let polys: Vec<Polygon> = mp
+                .polygons()
+                .iter()
+                .filter_map(|p| clip_polygon_to(p, bbox))
+                .collect();
+            if polys.is_empty() {
+                Vec::new()
+            } else {
+                vec![FeatureGeometry::MultiPolygon(MultiPolygon::new(polys))]
+            }
+        }
+    }
+}
+
+fn clip_polygon_to(p: &Polygon, bbox: &Bbox) -> Option<Polygon> {
+    let clip = |coords: &[topoi_core::Coord]| {
+        clip_polygon_rect(coords, bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)
+    };
+    let exterior = clip(p.exterior().coords());
+    if exterior.len() < 3 {
+        return None;
+    }
+    let holes = p
+        .interiors()
+        .iter()
+        .filter_map(|h| {
+            let c = clip(h.coords());
+            (c.len() >= 3).then(|| Ring::new(c))
+        })
+        .collect();
+    Some(Polygon::new(Ring::new(exterior), holes))
 }
 
 impl RasterChunk {

@@ -8,16 +8,24 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::caps::Crs;
-use crate::chunk::{Chunk, PointChunk, RasterChunk};
+use crate::chunk::{Chunk, PointChunk, RasterChunk, VectorChunk, VectorFeature};
 use crate::error::{Error, Result};
 use crate::window::{Bbox, ChunkKey};
 use nubis_core::{Classification, Point3, PointCloud};
 use terrano_core::{BandedRaster, Raster};
+use topoi_core::geojson::FeatureGeometry;
+use topoi_core::{Coord, LineString, MultiPolygon, Point, Polygon, Ring};
 
 const MAGIC: u32 = 0x47504C43;
 const VERSION: u16 = 2;
 const KIND_RASTER: u8 = 0;
 const KIND_POINTS: u8 = 1;
+const KIND_VECTOR: u8 = 2;
+
+const GEOM_POINT: u8 = 0;
+const GEOM_LINESTRING: u8 = 1;
+const GEOM_POLYGON: u8 = 2;
+const GEOM_MULTIPOLYGON: u8 = 3;
 
 pub(crate) struct SpillStore {
     dir: PathBuf,
@@ -82,8 +90,67 @@ pub(crate) fn write_chunk(path: &Path, chunk: &Chunk) -> Result<()> {
                 f.write_all(&[p.classification.to_u8()]).map_err(io)?;
             }
         }
+        Chunk::Vector(chunk) => {
+            f.write_all(&[KIND_VECTOR]).map_err(io)?;
+            f.write_all(&(chunk.features.len() as u64).to_le_bytes())
+                .map_err(io)?;
+            write_geo(&mut f, chunk.resolution, &chunk.bbox, chunk.crs).map_err(io)?;
+            for feature in &chunk.features {
+                f.write_all(&feature.id.to_le_bytes()).map_err(io)?;
+                write_geometry(&mut f, &feature.geometry).map_err(io)?;
+                let props = serde_json::to_vec(&feature.properties)
+                    .map_err(|e| Error::Source(format!("spill write: {e}")))?;
+                f.write_all(&(props.len() as u32).to_le_bytes())
+                    .map_err(io)?;
+                f.write_all(&props).map_err(io)?;
+            }
+        }
     }
     f.flush().map_err(io)
+}
+
+fn write_coords(f: &mut impl Write, coords: &[Coord]) -> std::io::Result<()> {
+    f.write_all(&(coords.len() as u32).to_le_bytes())?;
+    for c in coords {
+        f.write_all(&c.x.to_le_bytes())?;
+        f.write_all(&c.y.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_polygon(f: &mut impl Write, p: &Polygon) -> std::io::Result<()> {
+    f.write_all(&(1 + p.interiors().len() as u32).to_le_bytes())?;
+    write_coords(f, p.exterior().coords())?;
+    for hole in p.interiors() {
+        write_coords(f, hole.coords())?;
+    }
+    Ok(())
+}
+
+fn write_geometry(f: &mut impl Write, geometry: &FeatureGeometry) -> std::io::Result<()> {
+    match geometry {
+        FeatureGeometry::Point(p) => {
+            f.write_all(&[GEOM_POINT])?;
+            f.write_all(&p.0.x.to_le_bytes())?;
+            f.write_all(&p.0.y.to_le_bytes())
+        }
+        FeatureGeometry::LineString(l) => {
+            f.write_all(&[GEOM_LINESTRING])?;
+            write_coords(f, l.coords())
+        }
+        FeatureGeometry::Polygon(p) => {
+            f.write_all(&[GEOM_POLYGON])?;
+            write_polygon(f, p)
+        }
+        FeatureGeometry::MultiPolygon(mp) => {
+            f.write_all(&[GEOM_MULTIPOLYGON])?;
+            f.write_all(&(mp.polygons().len() as u32).to_le_bytes())?;
+            for p in mp.polygons() {
+                write_polygon(f, p)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn write_geo(f: &mut impl Write, resolution: f64, bbox: &Bbox, crs: Crs) -> std::io::Result<()> {
@@ -187,6 +254,74 @@ pub(crate) fn read_chunk(path: &Path) -> Result<Chunk> {
                 crs,
             }))
         }
+        KIND_VECTOR => {
+            let count = u64::from_le_bytes(rd(&mut f).map_err(io)?) as usize;
+            let (resolution, bbox, crs) = rd_geo(&mut f).map_err(io)?;
+            if count > (1 << 24) {
+                return Err(bad("feature count"));
+            }
+            let mut features = Vec::with_capacity(count);
+            for _ in 0..count {
+                let id = u64::from_le_bytes(rd(&mut f).map_err(io)?);
+                let geometry = read_geometry(&mut f)
+                    .map_err(io)?
+                    .ok_or(bad("geometry tag"))?;
+                let len = rd_u32(&mut f).map_err(io)? as usize;
+                if len > (1 << 24) {
+                    return Err(bad("properties length"));
+                }
+                let mut raw = vec![0u8; len];
+                f.read_exact(&mut raw).map_err(io)?;
+                let properties = serde_json::from_slice(&raw)
+                    .map_err(|e| Error::Source(format!("spill read: {e}")))?;
+                features.push(VectorFeature {
+                    id,
+                    geometry,
+                    properties,
+                });
+            }
+            Ok(Chunk::Vector(VectorChunk::new(
+                features, bbox, resolution, crs,
+            )))
+        }
         _ => Err(bad("kind")),
     }
+}
+
+fn read_coords(f: &mut impl Read) -> std::io::Result<Vec<Coord>> {
+    let n = rd_u32(f)? as usize;
+    let mut coords = Vec::with_capacity(n.min(1 << 20));
+    for _ in 0..n {
+        coords.push(Coord::new(rd_f64(f)?, rd_f64(f)?));
+    }
+    Ok(coords)
+}
+
+fn read_polygon(f: &mut impl Read) -> std::io::Result<Polygon> {
+    let rings = rd_u32(f)? as usize;
+    let exterior = Ring::new(read_coords(f)?);
+    let mut holes = Vec::with_capacity(rings.saturating_sub(1).min(1 << 16));
+    for _ in 1..rings {
+        holes.push(Ring::new(read_coords(f)?));
+    }
+    Ok(Polygon::new(exterior, holes))
+}
+
+fn read_geometry(f: &mut impl Read) -> std::io::Result<Option<FeatureGeometry>> {
+    Ok(match rd::<1>(f)?[0] {
+        GEOM_POINT => Some(FeatureGeometry::Point(Point::new(rd_f64(f)?, rd_f64(f)?))),
+        GEOM_LINESTRING => Some(FeatureGeometry::LineString(LineString::new(read_coords(
+            f,
+        )?))),
+        GEOM_POLYGON => Some(FeatureGeometry::Polygon(read_polygon(f)?)),
+        GEOM_MULTIPOLYGON => {
+            let n = rd_u32(f)? as usize;
+            let mut polys = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                polys.push(read_polygon(f)?);
+            }
+            Some(FeatureGeometry::MultiPolygon(MultiPolygon::new(polys)))
+        }
+        _ => None,
+    })
 }

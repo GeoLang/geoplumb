@@ -2,6 +2,7 @@
 
 ## 2026-08-03
 
+- vector as a chunk kind: `VecSrc` serves tile windows of feature fragments (simplify whole features per ladder level, drop sub-pixel features, clip to the tile, Sutherland-Hodgman per ring), fragments carry a stable feature id and full properties, `Rasterize` burns them to a raster by constant or numeric property over topoi's new `rasterize`, chunked output proven equal to whole-window rasterization and vector chunks proven to spill and reload
 - point cloud as a first-rate chunk kind: caps, chunks, spill format and the element traits are generic over kinds, cross-kind `Derived` constraints project the shared fields (crs, resolution, chunk px) so the solver stays kind-blind, `LasSrc` serves tile windows with per-level voxel thinning, `IdwGrid` grids points to a raster over nubis's new windowed idw, chunked output proven equal to whole-window gridding and point chunks proven to spill and reload
 
 - stac collection source: `StacSrc` searches a stac api at open and mosaics the matched items' cog assets most-recent-first over http range requests, items filtered to one crs, s3 hrefs rewritten to https. `examples/stac_tiles.rs` serves live Copernicus DEM hillshade from earth-search, validated against the real api. tests run against a mock stac server with deflate cogs

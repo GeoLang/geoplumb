@@ -172,12 +172,46 @@ impl PointPattern {
     }
 }
 
-/// caps pattern, one alternative per kind. vector and tensor variants land
-/// here later. cross-kind intersection is empty: a link has one kind
+/// negotiation-time pattern over vector link caps. resolution is the
+/// simplification ladder bound, chunk tiling works exactly as for rasters
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorPattern {
+    pub crs: SetField<Crs>,
+    pub resolution: ResRange,
+    pub chunk_px: SetField<u32>,
+}
+
+impl Default for VectorPattern {
+    fn default() -> Self {
+        VectorPattern {
+            crs: SetField::Any,
+            resolution: ResRange::ANY,
+            chunk_px: SetField::Any,
+        }
+    }
+}
+
+impl VectorPattern {
+    pub fn intersect(&self, other: &Self) -> Self {
+        VectorPattern {
+            crs: self.crs.intersect(&other.crs),
+            resolution: self.resolution.intersect(&other.resolution),
+            chunk_px: self.chunk_px.intersect(&other.chunk_px),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.crs.is_empty() || self.resolution.is_empty() || self.chunk_px.is_empty()
+    }
+}
+
+/// caps pattern, one alternative per kind. the tensor variant lands here
+/// later. cross-kind intersection is empty: a link has one kind
 #[derive(Debug, Clone, PartialEq)]
 pub enum CapsPattern {
     Raster(RasterPattern),
     PointCloud(PointPattern),
+    Vector(VectorPattern),
 }
 
 /// the fields every caps kind shares, the cross-kind projection surface of
@@ -199,6 +233,10 @@ impl CapsPattern {
                 let p = a.intersect(b);
                 (!p.is_empty()).then_some(CapsPattern::PointCloud(p))
             }
+            (CapsPattern::Vector(a), CapsPattern::Vector(b)) => {
+                let v = a.intersect(b);
+                (!v.is_empty()).then_some(CapsPattern::Vector(v))
+            }
             _ => None,
         }
     }
@@ -207,6 +245,7 @@ impl CapsPattern {
         match self {
             CapsPattern::Raster(r) => r.is_empty(),
             CapsPattern::PointCloud(p) => p.is_empty(),
+            CapsPattern::Vector(v) => v.is_empty(),
         }
     }
 
@@ -221,6 +260,11 @@ impl CapsPattern {
                 crs: p.crs.clone(),
                 resolution: p.resolution,
                 chunk_px: p.chunk_px.clone(),
+            },
+            CapsPattern::Vector(v) => CommonFields {
+                crs: v.crs.clone(),
+                resolution: v.resolution,
+                chunk_px: v.chunk_px.clone(),
             },
         }
     }
@@ -252,6 +296,17 @@ impl CapsPattern {
                     p.chunk_px = p.chunk_px.intersect(&from.chunk_px);
                 }
             }
+            CapsPattern::Vector(v) => {
+                if mask.crs {
+                    v.crs = v.crs.intersect(&from.crs);
+                }
+                if mask.resolution {
+                    v.resolution = v.resolution.intersect(&from.resolution);
+                }
+                if mask.chunk_px {
+                    v.chunk_px = v.chunk_px.intersect(&from.chunk_px);
+                }
+            }
         }
         out
     }
@@ -280,6 +335,7 @@ impl CapsSet {
             alternatives: vec![
                 CapsPattern::Raster(RasterPattern::default()),
                 CapsPattern::PointCloud(PointPattern::default()),
+                CapsPattern::Vector(VectorPattern::default()),
             ],
         }
     }
@@ -319,6 +375,11 @@ impl CapsSet {
                 resolution: first.resolution,
                 chunk_px: first.chunk_px.fixate().unwrap_or(256),
             })),
+            CapsPattern::Vector(first) => Some(Caps::Vector(VectorCaps {
+                crs: first.crs.fixate()?,
+                resolution: first.resolution,
+                chunk_px: first.chunk_px.fixate().unwrap_or(256),
+            })),
         }
     }
 }
@@ -328,6 +389,7 @@ impl CapsSet {
 pub enum Caps {
     Raster(RasterCaps),
     PointCloud(PointCaps),
+    Vector(VectorCaps),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -341,6 +403,13 @@ pub struct RasterCaps {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointCaps {
+    pub crs: Crs,
+    pub resolution: ResRange,
+    pub chunk_px: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorCaps {
     pub crs: Crs,
     pub resolution: ResRange,
     pub chunk_px: u32,
@@ -363,10 +432,19 @@ impl Caps {
         }
     }
 
+    /// panics on a non-vector link, negotiation guarantees an element's kind
+    pub fn vector(&self) -> &VectorCaps {
+        match self {
+            Caps::Vector(v) => v,
+            other => panic!("expected vector caps, got {other:?}"),
+        }
+    }
+
     pub fn crs(&self) -> Crs {
         match self {
             Caps::Raster(r) => r.crs,
             Caps::PointCloud(p) => p.crs,
+            Caps::Vector(v) => v.crs,
         }
     }
 
@@ -374,6 +452,7 @@ impl Caps {
         match self {
             Caps::Raster(r) => r.chunk_px,
             Caps::PointCloud(p) => p.chunk_px,
+            Caps::Vector(v) => v.chunk_px,
         }
     }
 
@@ -391,6 +470,11 @@ impl Caps {
                 crs: SetField::one(p.crs),
                 resolution: p.resolution,
                 chunk_px: SetField::one(p.chunk_px),
+            }),
+            Caps::Vector(v) => CapsPattern::Vector(VectorPattern {
+                crs: SetField::one(v.crs),
+                resolution: v.resolution,
+                chunk_px: SetField::one(v.chunk_px),
             }),
         }
     }
@@ -415,6 +499,13 @@ impl Caps {
                 p.chunk_px.hash(&mut h);
                 p.resolution.min.to_bits().hash(&mut h);
                 p.resolution.max.to_bits().hash(&mut h);
+            }
+            Caps::Vector(v) => {
+                2u8.hash(&mut h);
+                v.crs.hash(&mut h);
+                v.chunk_px.hash(&mut h);
+                v.resolution.min.to_bits().hash(&mut h);
+                v.resolution.max.to_bits().hash(&mut h);
             }
         }
         h.finish()

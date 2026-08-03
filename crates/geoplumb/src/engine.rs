@@ -11,7 +11,9 @@ use futures::future::BoxFuture;
 use tokio::sync::{broadcast, oneshot};
 
 use crate::caps::Caps;
-use crate::chunk::{Chunk, PointChunk, RasterChunk, tile_contains};
+use crate::chunk::{
+    Chunk, PointChunk, RasterChunk, VectorChunk, VectorFeature, clip_geometry, tile_contains,
+};
 use crate::element::{Fanin, Source, Transform};
 use crate::error::Result;
 use crate::graph::{Graph, Node, NodeId};
@@ -609,6 +611,27 @@ fn assemble(
                 resolution: res,
                 crs: p.crs,
             }))
+        }
+        Caps::Vector(v) => {
+            let mut features = Vec::new();
+            for chunk in chunks {
+                let vc = chunk.vector()?;
+                for f in &vc.features {
+                    for geometry in clip_geometry(&f.geometry, window) {
+                        features.push(VectorFeature {
+                            id: f.id,
+                            geometry,
+                            properties: f.properties.clone(),
+                        });
+                    }
+                }
+            }
+            // stable by id so burn order downstream matches source order
+            // even when a feature's fragments arrive from different tiles
+            features.sort_by_key(|f| f.id);
+            Ok(Chunk::Vector(VectorChunk::new(
+                features, *window, res, v.crs,
+            )))
         }
     }
 }
