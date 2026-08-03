@@ -51,12 +51,12 @@ Engine caps are immutable per instance (solve happens in `Engine::new`), so cach
 
 Thin wrappers over sibling crates: terrano-core for kernels and GeoTIFF IO, projicio-core for CRS transforms. The engine repo carries orchestration, not math.
 
-Two sources. `RasterSrc` holds the whole dataset resident and serves ladder levels by block-averaged decimation. `CogSrc` reads windowed over terrano's `CogReader`: each pull fetches only the tiles it touches at the file overview nearest the requested ladder level, block-averaging the remainder when the file pyramid is shallower than the request. Its transport is the `RangeRead` seam, with a local file impl in terrano and a blocking-reqwest `HttpRange` here for remote files.
+Three sources. `RasterSrc` holds the whole dataset resident and serves ladder levels by block-averaged decimation. `CogSrc` reads windowed over terrano's `CogReader`: each pull fetches only the tiles it touches at the file overview nearest the requested ladder level, block-averaging the remainder when the file pyramid is shallower than the request. Its transport is the `RangeRead` seam, with a local file impl in terrano and a blocking-reqwest `HttpRange` here for remote files. `StacSrc` searches a STAC api once at open, keeps the matched items' cog assets as lazily-opened `HttpRange` readers (s3 hrefs rewritten to their public https form), and serves pulls by mosaicking items most-recent-first, so a whole collection behaves as one raster with no local data.
 
 Two fanin elements. `Mosaic` takes the first input, wiring order, that has a value at each output pixel. `Combine` samples both inputs onto the output grid and runs terrano's binary op band by band.
 
 ## Known limits
 
 - The disk tier lives and dies with one engine instance. Cross-process reuse needs an element identity hash so a graph edit cannot serve stale files.
-- `CogSrc` covers the subset terrano writes (uncompressed single-band f64) and serializes range reads per source behind a mutex. No time axis.
+- `CogSrc` and `StacSrc` are single-band and serialize range reads per file behind a mutex. `StacSrc` uses only the first search page, keeps only items sharing the most recent item's crs, and assumes items share the grid alignment (mismatches land on the nearest pixel). No time axis on pulls, `datetime` filters at open.
 - Invalidation spread uses the coarsest cached level per node, over-invalidating slightly, never stale.

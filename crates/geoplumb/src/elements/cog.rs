@@ -73,7 +73,7 @@ impl<R: RangeRead + Send + 'static> Source for CogSrc<R> {
     }
 }
 
-fn read_chunk<R: RangeRead>(
+pub(crate) fn read_chunk<R: RangeRead>(
     reader: &mut CogReader<R>,
     req: &WindowReq,
     origin_x: f64,

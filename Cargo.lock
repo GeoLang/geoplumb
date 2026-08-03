@@ -315,6 +315,7 @@ dependencies = [
  "png",
  "projicio-core",
  "reqwest",
+ "serde_json",
  "terrano-core",
  "thiserror",
  "tokio",
@@ -1130,8 +1131,9 @@ dependencies = [
 [[package]]
 name = "terrano-core"
 version = "0.1.0"
-source = "git+https://github.com/GeoLang/terrano.git?branch=master#455a68cef0964729ca3fd06879cb00c594e8f897"
+source = "git+https://github.com/GeoLang/terrano.git?branch=master#8e1506d2a132c4471e879bcfe3076e7e36c86547"
 dependencies = [
+ "flate2",
  "thiserror",
 ]
 

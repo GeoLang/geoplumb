@@ -40,6 +40,7 @@ fn cog_bytes(overview_levels: u32) -> Vec<u8> {
         origin_y: ORIGIN_Y,
         pixel_width: CELL,
         pixel_height: CELL,
+        deflate: false,
     };
     let mut buf = std::io::Cursor::new(Vec::new());
     write_cog(&dem(), &params, &mut buf).unwrap();
