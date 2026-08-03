@@ -39,7 +39,9 @@ Each node's grid derives from its parent's through `output_grid`: identity for m
 
 ## Runtime
 
-One map per engine is both cache and coalescing table: a chunk entry is `Ready` (cached, LRU by tick, byte-budgeted) or `Pending` (in flight, with waiters). Concurrent pulls of one chunk share the computation. A cancelled computer's drop guard removes its `Pending` entry and wakes waiters, one of which takes over, so cancellation never wedges a chunk. Errors are not cached.
+One map per engine is both cache and coalescing table: a chunk entry is `Ready` (cached, LRU by tick, byte-budgeted), `Spilled` (on disk only), or `Pending` (in flight, with waiters). Concurrent pulls of one chunk share the computation. A cancelled computer's drop guard removes its `Pending` entry and wakes waiters, one of which takes over, so cancellation never wedges a chunk. Errors are not cached.
+
+The disk tier (`Engine::with_disk_cache`) writes every computed chunk through to a flat binary file and marks the entry spilled once the file is safely down, so memory eviction demotes to `Spilled` instead of dropping. A spilled hit reloads through the same pending machinery, coalescing concurrent readers. The disk budget counts cold bytes only and evicts files LRU. The store is a fresh subdir per engine, removed on drop, so files never outlive the caps and elements they were computed under, which is what makes persistence safe without an element identity hash.
 
 Transforms' `compute` is synchronous by contract, the engine offloads it to tokio's blocking pool when a runtime is present and runs inline otherwise. Source `read` is async for future ranged IO.
 
@@ -55,6 +57,6 @@ Two fanin elements. `Mosaic` takes the first input, wiring order, that has a val
 
 ## Known limits
 
-- The cache is in-memory only, a disk tier belongs behind the same map.
+- The disk tier lives and dies with one engine instance. Cross-process reuse needs an element identity hash so a graph edit cannot serve stale files.
 - `CogSrc` covers the subset terrano writes (uncompressed single-band f64) and serializes range reads per source behind a mutex. No time axis.
 - Invalidation spread uses the coarsest cached level per node, over-invalidating slightly, never stale.

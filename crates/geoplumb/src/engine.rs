@@ -16,6 +16,7 @@ use crate::element::{Fanin, Source, Transform};
 use crate::error::Result;
 use crate::graph::{Graph, Node, NodeId};
 use crate::solver;
+use crate::spill::{self, SpillStore};
 use crate::window::{Bbox, ChunkKey, GridSpec, WindowReq};
 use terrano_core::{BandedRaster, Raster};
 
@@ -48,6 +49,14 @@ enum Entry {
         chunk: Arc<RasterChunk>,
         bytes: usize,
         last_used: u64,
+        /// a copy of this chunk sits in the spill store, so memory
+        /// eviction demotes to `Spilled` instead of dropping
+        spilled: bool,
+    },
+    /// on disk only, reloaded through the pending machinery on a hit
+    Spilled {
+        bytes: usize,
+        last_used: u64,
     },
     Pending {
         waiters: Vec<oneshot::Sender<()>>,
@@ -58,7 +67,13 @@ enum Entry {
 struct CacheState {
     entries: HashMap<(usize, ChunkKey), Entry>,
     bytes: usize,
+    disk_bytes: usize,
     tick: u64,
+}
+
+struct SpillState {
+    store: SpillStore,
+    budget_bytes: usize,
 }
 
 pub struct Engine {
@@ -67,6 +82,7 @@ pub struct Engine {
     cache: Mutex<CacheState>,
     events: broadcast::Sender<Invalidation>,
     budget_bytes: usize,
+    spill: Option<SpillState>,
 }
 
 impl Engine {
@@ -75,6 +91,30 @@ impl Engine {
     /// node's grid from its source up. spliced nodes sit after their
     /// consumers in index order, so construction walks the topo order
     pub fn new(graph: Graph, budget_bytes: usize) -> Result<Engine> {
+        Engine::build(graph, budget_bytes, None)
+    }
+
+    /// like `new`, with evicted chunks demoted to a disk tier instead of
+    /// dropped. the engine owns a fresh subdir of `dir` and removes it on
+    /// drop, entries never outlive the engine that wrote them
+    pub fn with_disk_cache(
+        graph: Graph,
+        budget_bytes: usize,
+        dir: impl AsRef<std::path::Path>,
+        disk_budget_bytes: usize,
+    ) -> Result<Engine> {
+        let store = SpillStore::create(dir.as_ref())?;
+        Engine::build(
+            graph,
+            budget_bytes,
+            Some(SpillState {
+                store,
+                budget_bytes: disk_budget_bytes,
+            }),
+        )
+    }
+
+    fn build(graph: Graph, budget_bytes: usize, spill: Option<SpillState>) -> Result<Engine> {
         let mut graph = graph;
         let caps = solver::solve(&mut graph)?;
         let topo = graph.topo_order();
@@ -132,6 +172,7 @@ impl Engine {
             cache: Mutex::new(CacheState::default()),
             events,
             budget_bytes,
+            spill,
         })
     }
 
@@ -195,20 +236,34 @@ impl Engine {
             let grid = n.grid;
             let mut state = self.cache.lock().unwrap();
             let mut freed = 0usize;
+            let mut freed_disk = 0usize;
+            let mut deletions = Vec::new();
             state.entries.retain(|(n_idx, key), entry| {
                 if *n_idx != j {
                     return true;
                 }
                 let keep = !grid.chunk_bbox(*key).intersects(&d);
                 if !keep {
-                    if let Entry::Ready { bytes, .. } = entry {
-                        freed += *bytes;
+                    match entry {
+                        Entry::Ready { bytes, spilled, .. } => {
+                            freed += *bytes;
+                            if *spilled {
+                                deletions.push((*n_idx, *key));
+                            }
+                        }
+                        Entry::Spilled { bytes, .. } => {
+                            freed_disk += *bytes;
+                            deletions.push((*n_idx, *key));
+                        }
+                        Entry::Pending { .. } => {}
                     }
                 }
                 keep
             });
             state_bytes_sub(&mut state.bytes, freed);
+            state_bytes_sub(&mut state.disk_bytes, freed_disk);
             drop(state);
+            self.delete_spill_files(&deletions);
             let _ = self.events.send(Invalidation {
                 node: NodeId(j),
                 bbox: d,
@@ -241,8 +296,13 @@ impl Engine {
     }
 
     async fn chunk(&self, node: usize, key: ChunkKey) -> Result<Arc<RasterChunk>> {
+        enum Action {
+            Wait(oneshot::Receiver<()>),
+            Compute,
+            Load,
+        }
         loop {
-            let wait = {
+            let action = {
                 let mut state = self.cache.lock().unwrap();
                 state.tick += 1;
                 let tick = state.tick;
@@ -256,7 +316,18 @@ impl Engine {
                     Some(Entry::Pending { waiters }) => {
                         let (tx, rx) = oneshot::channel();
                         waiters.push(tx);
-                        Some(rx)
+                        Action::Wait(rx)
+                    }
+                    Some(Entry::Spilled { bytes, .. }) => {
+                        let bytes = *bytes;
+                        state.entries.insert(
+                            (node, key),
+                            Entry::Pending {
+                                waiters: Vec::new(),
+                            },
+                        );
+                        state_bytes_sub(&mut state.disk_bytes, bytes);
+                        Action::Load
                     }
                     None => {
                         state.entries.insert(
@@ -265,32 +336,77 @@ impl Engine {
                                 waiters: Vec::new(),
                             },
                         );
-                        None
+                        Action::Compute
                     }
                 }
             };
-            match wait {
-                Some(rx) => {
+            let guard = |done| PendingGuard {
+                cache: &self.cache,
+                key: (node, key),
+                done,
+            };
+            match action {
+                Action::Wait(rx) => {
                     // ok = computed, err = computer cancelled, retry either way
                     let _ = rx.await;
                 }
-                None => {
-                    let guard = PendingGuard {
-                        cache: &self.cache,
-                        key: (node, key),
-                        done: false,
+                Action::Load => {
+                    let guard = guard(false);
+                    let store = &self
+                        .spill
+                        .as_ref()
+                        .expect("spilled entries need a store")
+                        .store;
+                    let path = store.path(node, key);
+                    let read = path.clone();
+                    return match offload(move || spill::read_chunk(&read)).await {
+                        Ok(chunk) => self.finish_chunk(guard, Ok(chunk), true),
+                        Err(_) => {
+                            let _ = std::fs::remove_file(&path);
+                            let result = self.compute_chunk(node, key).await;
+                            self.finish_and_spill(guard, result, node, key).await
+                        }
                     };
+                }
+                Action::Compute => {
+                    let guard = guard(false);
                     let result = self.compute_chunk(node, key).await;
-                    return self.finish_chunk(guard, result);
+                    return self.finish_and_spill(guard, result, node, key).await;
                 }
             }
         }
+    }
+
+    /// cache a fresh chunk and write it through to the disk tier, marking
+    /// the entry spilled only once the file is safely on disk
+    async fn finish_and_spill(
+        &self,
+        guard: PendingGuard<'_>,
+        result: Result<RasterChunk>,
+        node: usize,
+        key: ChunkKey,
+    ) -> Result<Arc<RasterChunk>> {
+        let chunk = self.finish_chunk(guard, result, false)?;
+        if let Some(sp) = &self.spill {
+            let path = sp.store.path(node, key);
+            let c = chunk.clone();
+            if offload(move || spill::write_chunk(&path, &c)).await.is_ok() {
+                let mut state = self.cache.lock().unwrap();
+                if let Some(Entry::Ready { spilled, .. }) = state.entries.get_mut(&(node, key)) {
+                    *spilled = true;
+                }
+                // entry gone: the orphan file gets overwritten on the next
+                // compute of this key, the store dir dies with the engine
+            }
+        }
+        Ok(chunk)
     }
 
     fn finish_chunk(
         &self,
         mut guard: PendingGuard<'_>,
         result: Result<RasterChunk>,
+        spilled: bool,
     ) -> Result<Arc<RasterChunk>> {
         let chunk = Arc::new(result?);
         guard.done = true;
@@ -304,6 +420,7 @@ impl Engine {
                 chunk: chunk.clone(),
                 bytes,
                 last_used: tick,
+                spilled,
             },
         ) {
             for w in waiters {
@@ -311,8 +428,22 @@ impl Engine {
             }
         }
         state.bytes += bytes;
-        evict_over_budget(&mut state, self.budget_bytes);
+        let deletions = evict_over_budget(
+            &mut state,
+            self.budget_bytes,
+            self.spill.as_ref().map(|s| s.budget_bytes),
+        );
+        drop(state);
+        self.delete_spill_files(&deletions);
         Ok(chunk)
+    }
+
+    fn delete_spill_files(&self, keys: &[(usize, ChunkKey)]) {
+        if let Some(sp) = &self.spill {
+            for &(node, key) in keys {
+                let _ = std::fs::remove_file(sp.store.path(node, key));
+            }
+        }
     }
 
     async fn compute_chunk(&self, node: usize, key: ChunkKey) -> Result<RasterChunk> {
@@ -369,21 +500,61 @@ pub(crate) async fn offload<T: Send + 'static>(f: impl FnOnce() -> T + Send + 's
     }
 }
 
-fn evict_over_budget(state: &mut CacheState, budget: usize) {
+/// returns the keys whose spill files must be deleted, for the caller to
+/// remove outside the cache lock
+fn evict_over_budget(
+    state: &mut CacheState,
+    budget: usize,
+    disk_budget: Option<usize>,
+) -> Vec<(usize, ChunkKey)> {
+    let mut deletions = Vec::new();
     while state.bytes > budget {
         let oldest = state
             .entries
             .iter()
             .filter_map(|(k, e)| match e {
                 Entry::Ready { last_used, .. } => Some((*last_used, *k)),
-                Entry::Pending { .. } => None,
+                Entry::Spilled { .. } | Entry::Pending { .. } => None,
             })
             .min();
         let Some((_, key)) = oldest else { break };
-        if let Some(Entry::Ready { bytes, .. }) = state.entries.remove(&key) {
-            state_bytes_sub(&mut state.bytes, bytes);
+        let Some(Entry::Ready {
+            bytes,
+            last_used,
+            spilled,
+            ..
+        }) = state.entries.remove(&key)
+        else {
+            unreachable!("picked from ready entries");
+        };
+        state_bytes_sub(&mut state.bytes, bytes);
+        if spilled && disk_budget.is_some() {
+            state
+                .entries
+                .insert(key, Entry::Spilled { bytes, last_used });
+            state.disk_bytes += bytes;
+        } else if spilled {
+            deletions.push(key);
         }
     }
+    if let Some(disk_budget) = disk_budget {
+        while state.disk_bytes > disk_budget {
+            let oldest = state
+                .entries
+                .iter()
+                .filter_map(|(k, e)| match e {
+                    Entry::Spilled { last_used, .. } => Some((*last_used, *k)),
+                    Entry::Ready { .. } | Entry::Pending { .. } => None,
+                })
+                .min();
+            let Some((_, key)) = oldest else { break };
+            if let Some(Entry::Spilled { bytes, .. }) = state.entries.remove(&key) {
+                state_bytes_sub(&mut state.disk_bytes, bytes);
+                deletions.push(key);
+            }
+        }
+    }
+    deletions
 }
 
 fn state_bytes_sub(total: &mut usize, bytes: usize) {

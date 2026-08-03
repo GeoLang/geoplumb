@@ -16,6 +16,7 @@ pub mod error;
 pub mod graph;
 pub mod resample;
 pub mod solver;
+mod spill;
 pub mod tile;
 pub mod window;
 

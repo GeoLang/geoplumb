@@ -2,6 +2,7 @@
 
 ## 2026-08-03
 
+- disk cache tier behind the same entry map: `Engine::with_disk_cache` writes chunks through to a per-engine spill dir, memory eviction demotes entries to disk, spilled hits reload through the coalescing machinery, disk budget and invalidation delete files, drop removes the dir
 - auto-plug generalized to an adapter registry on the graph: elements declare what they bridge via a template constraint and the solver checks `output_set(offer) ∩ demand` with no field knowledge, reproject registered by default, `register_adapter` for user elements
 - reproject auto-plug: a link empty only because of crs gets a reproject spliced in during the solve (mixed-crs mosaic, crs-demanding consumer), spliced nodes break index-as-topo-order so the solver, engine construction, and invalidation now walk an explicit topo order
 - fan-in: `Fanin` nodes with several parents, solver reworked to iterated sweeps plus backtracking fixation (a diamond with disagreeing branch preferences now converges), `Mosaic` (first-wins stitching) and `Combine` (two-input per-cell algebra) elements, invalidation walks through fanin nodes, bilinear fallback now picks the nearest present neighbor instead of an arbitrary one
