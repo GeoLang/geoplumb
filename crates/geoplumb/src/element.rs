@@ -3,11 +3,22 @@
 //! compute chunks. compute is synchronous by contract, the engine offloads
 //! it to a blocking pool when a tokio runtime is present
 
-use crate::caps::{Caps, Constraint};
+use crate::caps::{Caps, Constraint, RasterPattern};
 use crate::chunk::RasterChunk;
 use crate::error::Result;
 use crate::window::{Bbox, GridSpec, WindowReq};
 use futures::future::BoxFuture;
+
+/// auto-plug candidate: a transform the solver may splice onto a link that
+/// fails negotiation. the template constraint leaves retargeted fields
+/// free, so the solver can check `output_set(offer) ∩ demand` without
+/// knowing which fields the element bridges. `build` gets the first
+/// pattern of that intersection and constructs the concrete element, or
+/// declines when the pattern leaves its retargeted field open
+pub struct Adapter {
+    pub template: Constraint,
+    pub build: fn(&RasterPattern) -> Option<Box<dyn Transform>>,
+}
 
 pub trait Source: Send + Sync {
     /// must be `Constraint::Produces`

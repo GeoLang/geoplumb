@@ -10,12 +10,14 @@
 //! fixation picks a jointly impossible combination. the greedy choice is
 //! tried first, so chains and plain fan-out fixate as before.
 //!
-//! a link empty only because of crs is not a failure: the solver splices a
-//! reproject onto the offending edge and re-solves, so mixed-crs graphs
-//! negotiate without explicit wiring
+//! an empty link is not always a failure: registered adapters (transforms
+//! whose template constraint leaves their retargeted fields free) are
+//! tried against the failing link, and one whose bridged output meets the
+//! demand is spliced in before re-solving. the solver never knows which
+//! caps field an adapter fixes, the element's constraint declares it
 
-use crate::caps::{Caps, CapsPattern, CapsSet, Constraint, Crs, RasterPattern, SetField};
-use crate::elements::Reproject;
+use crate::caps::{Caps, CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
+use crate::element::Adapter;
 use crate::error::{Error, Result};
 use crate::graph::{Graph, Node, NodeId};
 
@@ -27,8 +29,8 @@ fn constraint_of(graph: &Graph, id: NodeId) -> Constraint {
     }
 }
 
-/// one fixated caps per node's output link. splices reproject nodes into
-/// the graph wherever a link is empty only because of crs
+/// one fixated caps per node's output link. splices adapter elements into
+/// the graph wherever they bridge a link that fails negotiation
 pub fn solve(graph: &mut Graph) -> Result<Vec<Caps>> {
     let edges: usize = (0..graph.len())
         .map(|i| graph.parents(NodeId(i)).len())
@@ -39,26 +41,33 @@ pub fn solve(graph: &mut Graph) -> Result<Vec<Caps>> {
             Outcome::NeedsPlug {
                 parent,
                 child,
-                target,
-            } => splice(graph, parent, child, target),
+                element,
+            } => splice(graph, parent, child, element),
         }
     }
-    unreachable!("every splice satisfies one edge's crs for good");
+    Err(Error::InvalidGraph(
+        "auto-plug did not converge, an adapter keeps failing its own link".into(),
+    ))
 }
 
 enum Outcome {
     Solved(Vec<Caps>),
-    /// the child-input link is empty only because of crs: reprojecting
-    /// `parent` to `target` lets negotiation proceed
+    /// the child-input link is empty but `element` bridges it when spliced
+    /// between `parent` and `child`
     NeedsPlug {
         parent: usize,
         child: usize,
-        target: Crs,
+        element: Box<dyn crate::element::Transform>,
     },
 }
 
-fn splice(graph: &mut Graph, parent: usize, child: usize, target: Crs) {
-    let plug = graph.add_transform(NodeId(parent), Box::new(Reproject::new(target)));
+fn splice(
+    graph: &mut Graph,
+    parent: usize,
+    child: usize,
+    element: Box<dyn crate::element::Transform>,
+) {
+    let plug = graph.add_transform(NodeId(parent), element);
     match &mut graph.nodes[child] {
         Node::Transform { parent: p, .. } => *p = plug,
         Node::Fanin { parents, .. } => {
@@ -96,13 +105,19 @@ fn try_solve(graph: &Graph) -> Result<Outcome> {
                     for &p in &ps[1..] {
                         let joined = upstream.intersect(&links[p]);
                         if joined.is_empty() {
-                            return plug_or_fail(&upstream, &links[p], p, i);
+                            return plug_or_fail(&graph.adapters, &upstream, &links[p], p, i);
                         }
                         upstream = joined;
                     }
                     let accepted = upstream.intersect(&constraints[i].input_set());
                     if accepted.is_empty() {
-                        return plug_or_fail(&constraints[i].input_set(), &upstream, ps[0], i);
+                        return plug_or_fail(
+                            &graph.adapters,
+                            &constraints[i].input_set(),
+                            &upstream,
+                            ps[0],
+                            i,
+                        );
                     }
                     constraints[i].output_set(&accepted)
                 }
@@ -177,48 +192,35 @@ fn try_solve(graph: &Graph) -> Result<Outcome> {
     ))
 }
 
-/// a link empty only because of crs asks for a plug, anything else fails
-fn plug_or_fail(demand: &CapsSet, offer: &CapsSet, parent: usize, child: usize) -> Result<Outcome> {
-    if !without_crs(demand)
-        .intersect(&without_crs(offer))
-        .is_empty()
-    {
-        if let Some(target) = first_crs(demand) {
-            return Ok(Outcome::NeedsPlug {
-                parent,
-                child,
-                target,
-            });
+/// try each registered adapter against the failing link: one whose bridged
+/// output meets the demand gets spliced, in registration order, taking the
+/// bridged set's first pattern. otherwise the link fails as before
+fn plug_or_fail(
+    adapters: &[Adapter],
+    demand: &CapsSet,
+    offer: &CapsSet,
+    parent: usize,
+    child: usize,
+) -> Result<Outcome> {
+    for adapter in adapters {
+        let bridged = adapter.template.output_set(offer).intersect(demand);
+        for alt in &bridged.alternatives {
+            if let Some(element) = (adapter.build)(alt.raster()) {
+                return Ok(Outcome::NeedsPlug {
+                    parent,
+                    child,
+                    element,
+                });
+            }
         }
     }
     Err(Error::EmptyLink {
         upstream: NodeId(parent),
         downstream: NodeId(child),
         detail: format!(
-            "producer offers {:?}, consumer side needs {:?}",
+            "producer offers {:?}, consumer side needs {:?}, no adapter bridges it",
             offer.alternatives, demand.alternatives
         ),
-    })
-}
-
-fn without_crs(set: &CapsSet) -> CapsSet {
-    CapsSet {
-        alternatives: set
-            .alternatives
-            .iter()
-            .map(|p| {
-                let mut r = p.raster().clone();
-                r.crs = SetField::Any;
-                CapsPattern::Raster(r)
-            })
-            .collect(),
-    }
-}
-
-fn first_crs(set: &CapsSet) -> Option<Crs> {
-    set.alternatives.iter().find_map(|p| match &p.raster().crs {
-        SetField::OneOf(v) => v.first().copied(),
-        SetField::Any => None,
     })
 }
 

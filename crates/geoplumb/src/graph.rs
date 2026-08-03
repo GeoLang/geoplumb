@@ -3,7 +3,7 @@
 //! auto-plugged reprojects are appended after their consumers, so walk in
 //! `topo_order`, not index order
 
-use crate::element::{Fanin, Source, Transform};
+use crate::element::{Adapter, Fanin, Source, Transform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) usize);
@@ -20,14 +20,29 @@ pub(crate) enum Node {
     },
 }
 
-#[derive(Default)]
 pub struct Graph {
     pub(crate) nodes: Vec<Node>,
+    pub(crate) adapters: Vec<Adapter>,
+}
+
+impl Default for Graph {
+    fn default() -> Self {
+        Graph::new()
+    }
 }
 
 impl Graph {
+    /// starts with the crate's standard adapters registered (reproject)
     pub fn new() -> Self {
-        Graph::default()
+        Graph {
+            nodes: Vec::new(),
+            adapters: crate::elements::default_adapters(),
+        }
+    }
+
+    /// offer another transform to the solver for auto-plugging
+    pub fn register_adapter(&mut self, adapter: Adapter) {
+        self.adapters.push(adapter);
     }
 
     pub fn add_source(&mut self, source: Box<dyn Source>) -> NodeId {

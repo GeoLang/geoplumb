@@ -24,6 +24,24 @@ impl Reproject {
         }
     }
 
+    /// auto-plug template: like `constraint` but with the target crs left
+    /// free, so the solver retargets it to whatever the demanding side needs
+    pub fn adapter() -> crate::element::Adapter {
+        crate::element::Adapter {
+            template: Constraint::Derived {
+                input: CapsSet::any_raster(),
+                passthrough: FieldMask::without_crs_resolution(),
+                output: RasterPattern::default(),
+            },
+            build: |target| {
+                let SetField::OneOf(crss) = &target.crs else {
+                    return None;
+                };
+                Some(Box::new(Reproject::new(crss[0])))
+            },
+        }
+    }
+
     fn inv(&self) -> &projicio_core::Transform {
         self.inverse.as_ref().expect("configured")
     }

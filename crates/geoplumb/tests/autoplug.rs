@@ -1,9 +1,9 @@
 //! reproject auto-plug: a link empty only because of crs gets a reproject
 //! spliced in during the solve instead of failing negotiation
 
-use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
-use geoplumb::element::Transform;
-use geoplumb::elements::{Mosaic, RasterSrc};
+use geoplumb::caps::{CapsPattern, CapsSet, Constraint, FieldMask, RasterPattern, SetField};
+use geoplumb::element::{Adapter, Transform};
+use geoplumb::elements::{Hillshade, Mosaic, RasterSrc};
 use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, Result, WindowReq};
 use terrano_core::{BandedRaster, Raster};
 
@@ -171,6 +171,130 @@ async fn crs_demanding_transform_autoplugs_upstream() {
     };
     let got = engine.pull(t, req).await.unwrap();
     assert_matches_analytic(&got, &req.bbox, |x, y| inv.convert(x, y).unwrap(), 2.0);
+}
+
+/// user-defined adapter: keeps only the first band. proves the solver is
+/// generic over adapters rather than special-casing any caps field
+struct BandPick;
+
+impl Transform for BandPick {
+    fn constraint(&self) -> Constraint {
+        Constraint::Derived {
+            input: CapsSet::any_raster(),
+            passthrough: FieldMask {
+                bands: false,
+                ..FieldMask::ALL
+            },
+            output: RasterPattern {
+                bands: SetField::one(1),
+                ..RasterPattern::default()
+            },
+        }
+    }
+
+    fn plan(&self, out: &WindowReq) -> WindowReq {
+        *out
+    }
+
+    fn compute(&self, out: &WindowReq, input: &RasterChunk) -> Result<RasterChunk> {
+        let first = input.bands.band(0).expect("at least one band").clone();
+        Ok(RasterChunk {
+            bands: BandedRaster::new(vec![first]).expect("single band"),
+            bbox: input.bbox,
+            resolution: input.resolution,
+            crs: input.crs,
+        }
+        .crop_to(&out.bbox))
+    }
+}
+
+fn band_pick_adapter() -> Adapter {
+    Adapter {
+        template: Constraint::Derived {
+            input: CapsSet::any_raster(),
+            passthrough: FieldMask {
+                bands: false,
+                ..FieldMask::ALL
+            },
+            output: RasterPattern::default(),
+        },
+        build: |target| match &target.bands {
+            SetField::OneOf(v) if v.contains(&1) => Some(Box::new(BandPick)),
+            _ => None,
+        },
+    }
+}
+
+fn two_band_graph() -> (Graph, geoplumb::NodeId) {
+    let mut data = Vec::with_capacity(W * H);
+    for row in 0..H {
+        for col in 0..W {
+            let lon = ORIGIN_X + (col as f64 + 0.5) * CELL;
+            let lat = ORIGIN_Y - (row as f64 + 0.5) * CELL;
+            data.push(elevation(lon, lat));
+        }
+    }
+    let dem = Raster::from_vec(W, H, data.clone(), CELL, f64::NAN).unwrap();
+    let noise =
+        Raster::from_vec(W, H, data.iter().map(|v| v * 2.0).collect(), CELL, f64::NAN).unwrap();
+    let src = RasterSrc::new(
+        BandedRaster::new(vec![dem, noise]).unwrap(),
+        ORIGIN_X,
+        ORIGIN_Y,
+        Crs::WGS84,
+    );
+    let mut g = Graph::new();
+    let s = g.add_source(Box::new(src));
+    let hs = g.add_transform(s, Box::new(Hillshade::new(315.0, 45.0)));
+    (g, hs)
+}
+
+#[tokio::test]
+async fn registered_adapter_bridges_a_bands_mismatch() {
+    // without the adapter a two-band source into hillshade fails
+    let (g, _) = two_band_graph();
+    assert!(Engine::new(g, 64 << 20).is_err());
+
+    let (mut g, hs) = two_band_graph();
+    g.register_adapter(band_pick_adapter());
+    let engine = Engine::new(g, 64 << 20).unwrap();
+    assert_eq!(engine.caps(hs).raster().bands, 1);
+
+    // the plugged graph matches a hand-built single-band pipeline
+    let mut data = Vec::with_capacity(W * H);
+    for row in 0..H {
+        for col in 0..W {
+            let lon = ORIGIN_X + (col as f64 + 0.5) * CELL;
+            let lat = ORIGIN_Y - (row as f64 + 0.5) * CELL;
+            data.push(elevation(lon, lat));
+        }
+    }
+    let dem = Raster::from_vec(W, H, data, CELL, f64::NAN).unwrap();
+    let mut rg = Graph::new();
+    let rs = rg.add_source(Box::new(RasterSrc::new(
+        BandedRaster::new(vec![dem]).unwrap(),
+        ORIGIN_X,
+        ORIGIN_Y,
+        Crs::WGS84,
+    )));
+    let rhs = rg.add_transform(rs, Box::new(Hillshade::new(315.0, 45.0)));
+    let reference = Engine::new(rg, 64 << 20).unwrap();
+
+    let req = WindowReq {
+        bbox: Bbox {
+            min_x: 7.05,
+            max_x: 7.25,
+            max_y: 46.95,
+            min_y: 46.8,
+        },
+        resolution: CELL,
+    };
+    let a = engine.pull(hs, req).await.unwrap();
+    let b = reference.pull(rhs, req).await.unwrap();
+    let (ba, bb) = (a.bands.band(0).unwrap(), b.bands.band(0).unwrap());
+    for (i, (x, y)) in ba.data().iter().zip(bb.data()).enumerate() {
+        assert!((x - y).abs() < 1e-12, "pixel {i}: {x} vs {y}");
+    }
 }
 
 #[tokio::test]

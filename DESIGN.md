@@ -22,7 +22,7 @@ Adapted from glass2glass's CSP design (`src/caps.rs`, `src/solver.rs`, MPL-2.0).
 
 A fanin declares one `Constraint` that applies to every input link and the output link alike, so all pins negotiate to matching caps.
 
-A link that comes up empty only because of crs is not a failure: the solver splices a reproject onto the offending edge and re-solves, so mixed-crs graphs negotiate without explicit wiring. The target is the crs the demanding side prefers, at a fanin the first parent's. Spliced nodes are appended after their consumers, so the engine and solver walk `topo_order` rather than index order.
+An empty link is not always a failure. The graph carries a registry of `Adapter`s: a template constraint with the element's retargeted fields left free, plus a factory. On a failing link the solver checks each adapter generically, `template.output_set(offer) ∩ demand`, and splices the built element when the bridge is nonempty, so the solver never knows which caps field an adapter fixes. `Graph::new` registers reproject (bridging crs, the target being whatever the demanding side prefers, at a fanin the first parent's), `register_adapter` adds more. Spliced nodes are appended after their consumers, so the engine and solver walk `topo_order` rather than index order.
 
 Divergences from g2g, deliberate:
 
