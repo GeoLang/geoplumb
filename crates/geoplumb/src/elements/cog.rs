@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use crate::caps::{
     CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
 };
-use crate::chunk::RasterChunk;
+use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::error::Result;
 use crate::window::{GridSpec, WindowReq};
@@ -60,13 +60,14 @@ impl<R: RangeRead + Send + 'static> Source for CogSrc<R> {
         }
     }
 
-    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<RasterChunk>> {
+    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<Chunk>> {
         let reader = self.reader.clone();
         let req = *req;
         let (origin_x, origin_y, crs) = (self.origin_x, self.origin_y, self.crs);
         Box::pin(async move {
             crate::engine::offload(move || {
                 read_chunk(&mut reader.lock().unwrap(), &req, origin_x, origin_y, crs)
+                    .map(Chunk::Raster)
             })
             .await
         })

@@ -3,7 +3,7 @@
 //! crops it back off, which is what keeps chunk borders seam-free
 
 use crate::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
-use crate::chunk::RasterChunk;
+use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::error::{Error, Result};
 use crate::window::{Bbox, WindowReq};
@@ -25,14 +25,14 @@ fn plan_with_halo(out: &WindowReq) -> WindowReq {
     }
 }
 
-fn crop(result: Raster, input: &RasterChunk, out: &WindowReq) -> Result<RasterChunk> {
+fn crop(result: Raster, input: &RasterChunk, out: &WindowReq) -> Result<Chunk> {
     let full = RasterChunk {
         bands: BandedRaster::new(vec![result]).expect("one band"),
         bbox: input.bbox,
         resolution: input.resolution,
         crs: input.crs,
     };
-    Ok(full.crop_to(&out.bbox))
+    Ok(Chunk::Raster(full.crop_to(&out.bbox)))
 }
 
 fn dem_band(input: &RasterChunk) -> Result<&Raster> {
@@ -66,7 +66,8 @@ impl Transform for Hillshade {
         dirty.expand(HALO_CELLS * resolution)
     }
 
-    fn compute(&self, out: &WindowReq, input: &RasterChunk) -> Result<RasterChunk> {
+    fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
+        let input = input.raster()?;
         let shaded = terrano_core::hillshade(dem_band(input)?, self.azimuth, self.altitude);
         crop(shaded, input, out)
     }
@@ -87,7 +88,8 @@ impl Transform for Slope {
         dirty.expand(HALO_CELLS * resolution)
     }
 
-    fn compute(&self, out: &WindowReq, input: &RasterChunk) -> Result<RasterChunk> {
+    fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
+        let input = input.raster()?;
         let sloped = terrano_core::slope(dem_band(input)?);
         crop(sloped, input, out)
     }

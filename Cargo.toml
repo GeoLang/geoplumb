@@ -14,3 +14,4 @@ rust-version = "1.85"
 [workspace.dependencies]
 terrano-core = { git = "https://github.com/GeoLang/terrano.git", branch = "master" }
 projicio-core = { git = "https://github.com/GeoLang/projicio.git", branch = "master" }
+nubis-core = { git = "https://github.com/GeoLang/nubis.git", branch = "master" }

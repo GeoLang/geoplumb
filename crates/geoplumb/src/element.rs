@@ -3,8 +3,8 @@
 //! compute chunks. compute is synchronous by contract, the engine offloads
 //! it to a blocking pool when a tokio runtime is present
 
-use crate::caps::{Caps, Constraint, RasterPattern};
-use crate::chunk::RasterChunk;
+use crate::caps::{Caps, CapsPattern, Constraint};
+use crate::chunk::Chunk;
 use crate::error::Result;
 use crate::window::{Bbox, GridSpec, WindowReq};
 use futures::future::BoxFuture;
@@ -14,10 +14,11 @@ use futures::future::BoxFuture;
 /// free, so the solver can check `output_set(offer) ∩ demand` without
 /// knowing which fields the element bridges. `build` gets the first
 /// pattern of that intersection and constructs the concrete element, or
-/// declines when the pattern leaves its retargeted field open
+/// declines when the pattern leaves its retargeted field open or has the
+/// wrong kind
 pub struct Adapter {
     pub template: Constraint,
-    pub build: fn(&RasterPattern) -> Option<Box<dyn Transform>>,
+    pub build: fn(&CapsPattern) -> Option<Box<dyn Transform>>,
 }
 
 pub trait Source: Send + Sync {
@@ -29,7 +30,7 @@ pub trait Source: Send + Sync {
 
     /// req is chunk-aligned to `grid()` by the engine, the response must
     /// cover exactly that grid window
-    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<RasterChunk>>;
+    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<Chunk>>;
 }
 
 pub trait Transform: Send + Sync {
@@ -60,7 +61,7 @@ pub trait Transform: Send + Sync {
 
     /// produce exactly the `out` grid from an input chunk covering at
     /// least `plan(out)`
-    fn compute(&self, out: &WindowReq, input: &RasterChunk) -> Result<RasterChunk>;
+    fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk>;
 }
 
 pub trait Fanin: Send + Sync {
@@ -97,5 +98,5 @@ pub trait Fanin: Send + Sync {
 
     /// produce exactly the `out` grid from one chunk per input, wiring
     /// order, each covering at least `plan(out, k)` on its own alignment
-    fn compute(&self, out: &WindowReq, inputs: &[RasterChunk]) -> Result<RasterChunk>;
+    fn compute(&self, out: &WindowReq, inputs: &[Chunk]) -> Result<Chunk>;
 }

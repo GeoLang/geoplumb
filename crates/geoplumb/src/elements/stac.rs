@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use crate::caps::{
     CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
 };
-use crate::chunk::RasterChunk;
+use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::elements::cog::{HttpRange, read_chunk};
 use crate::error::{Error, Result};
@@ -269,9 +269,11 @@ impl Source for StacSrc {
         }
     }
 
-    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<RasterChunk>> {
+    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<Chunk>> {
         let inner = self.inner.clone();
         let req = *req;
-        Box::pin(async move { crate::engine::offload(move || inner.read_sync(&req)).await })
+        Box::pin(async move {
+            crate::engine::offload(move || inner.read_sync(&req).map(Chunk::Raster)).await
+        })
     }
 }

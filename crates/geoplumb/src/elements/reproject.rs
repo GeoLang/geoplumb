@@ -2,8 +2,10 @@
 //! window into the source crs, compute inverse-maps each output pixel
 //! center and samples the input bilinearly
 
-use crate::caps::{Caps, CapsSet, Constraint, Crs, FieldMask, RasterPattern, SetField};
-use crate::chunk::RasterChunk;
+use crate::caps::{
+    Caps, CapsPattern, CapsSet, Constraint, Crs, FieldMask, RasterPattern, SetField,
+};
+use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::error::{Error, Result};
 use crate::window::{Bbox, GridSpec, WindowReq};
@@ -31,9 +33,12 @@ impl Reproject {
             template: Constraint::Derived {
                 input: CapsSet::any_raster(),
                 passthrough: FieldMask::without_crs_resolution(),
-                output: RasterPattern::default(),
+                output: CapsPattern::Raster(RasterPattern::default()),
             },
             build: |target| {
+                let CapsPattern::Raster(target) = target else {
+                    return None;
+                };
                 let SetField::OneOf(crss) = &target.crs else {
                     return None;
                 };
@@ -98,10 +103,10 @@ impl Transform for Reproject {
         Constraint::Derived {
             input: CapsSet::any_raster(),
             passthrough: FieldMask::without_crs_resolution(),
-            output: RasterPattern {
+            output: CapsPattern::Raster(RasterPattern {
                 crs: SetField::one(self.to),
                 ..RasterPattern::default()
-            },
+            }),
         }
     }
 
@@ -164,7 +169,8 @@ impl Transform for Reproject {
             .unwrap_or(*dirty)
     }
 
-    fn compute(&self, out: &WindowReq, input: &RasterChunk) -> Result<RasterChunk> {
+    fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
+        let input = input.raster()?;
         let res = out.resolution;
         let cols = (out.bbox.width() / res).round() as usize;
         let rows = (out.bbox.height() / res).round() as usize;
@@ -196,11 +202,11 @@ impl Transform for Reproject {
                 Raster::from_vec(cols, rows, data, res, nodata).expect("reproject dims")
             })
             .collect();
-        Ok(RasterChunk {
+        Ok(Chunk::Raster(RasterChunk {
             bands: BandedRaster::new(bands).expect("uniform bands"),
             bbox: out.bbox,
             resolution: res,
             crs: self.to,
-        })
+        }))
     }
 }

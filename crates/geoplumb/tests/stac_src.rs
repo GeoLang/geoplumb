@@ -157,7 +157,7 @@ async fn recent_items_win_and_old_fills_their_holes() {
         },
         resolution: CELL,
     };
-    let chunk = engine.pull(n, req).await.unwrap();
+    let chunk = engine.pull(n, req).await.unwrap().into_raster().unwrap();
     let band = chunk.bands.band(0).unwrap();
     let res = chunk.resolution;
     for row in 0..band.height() {

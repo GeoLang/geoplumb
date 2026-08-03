@@ -4,7 +4,7 @@
 use geoplumb::caps::{CapsPattern, CapsSet, Constraint, FieldMask, RasterPattern, SetField};
 use geoplumb::element::{Adapter, Transform};
 use geoplumb::elements::{Hillshade, Mosaic, RasterSrc};
-use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, Result, WindowReq};
+use geoplumb::{Bbox, Chunk, Crs, Engine, Graph, RasterChunk, Result, WindowReq};
 use terrano_core::{BandedRaster, Raster};
 
 const W: usize = 600;
@@ -123,7 +123,7 @@ async fn mixed_crs_fanin_autoplugs_a_reproject() {
         },
         resolution: CELL,
     };
-    let got = engine.pull(m, req).await.unwrap();
+    let got = engine.pull(m, req).await.unwrap().into_raster().unwrap();
     assert_matches_analytic(&got, &req.bbox, |x, y| (x, y), 2.0);
 }
 
@@ -142,8 +142,8 @@ impl Transform for MercatorOnly {
         *out
     }
 
-    fn compute(&self, out: &WindowReq, input: &RasterChunk) -> Result<RasterChunk> {
-        Ok(input.crop_to(&out.bbox))
+    fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
+        Ok(Chunk::Raster(input.raster()?.crop_to(&out.bbox)))
     }
 }
 
@@ -169,7 +169,7 @@ async fn crs_demanding_transform_autoplugs_upstream() {
         },
         resolution: 200.0,
     };
-    let got = engine.pull(t, req).await.unwrap();
+    let got = engine.pull(t, req).await.unwrap().into_raster().unwrap();
     assert_matches_analytic(&got, &req.bbox, |x, y| inv.convert(x, y).unwrap(), 2.0);
 }
 
@@ -185,10 +185,10 @@ impl Transform for BandPick {
                 bands: false,
                 ..FieldMask::ALL
             },
-            output: RasterPattern {
+            output: CapsPattern::Raster(RasterPattern {
                 bands: SetField::one(1),
                 ..RasterPattern::default()
-            },
+            }),
         }
     }
 
@@ -196,15 +196,18 @@ impl Transform for BandPick {
         *out
     }
 
-    fn compute(&self, out: &WindowReq, input: &RasterChunk) -> Result<RasterChunk> {
+    fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
+        let input = input.raster()?;
         let first = input.bands.band(0).expect("at least one band").clone();
-        Ok(RasterChunk {
-            bands: BandedRaster::new(vec![first]).expect("single band"),
-            bbox: input.bbox,
-            resolution: input.resolution,
-            crs: input.crs,
-        }
-        .crop_to(&out.bbox))
+        Ok(Chunk::Raster(
+            RasterChunk {
+                bands: BandedRaster::new(vec![first]).expect("single band"),
+                bbox: input.bbox,
+                resolution: input.resolution,
+                crs: input.crs,
+            }
+            .crop_to(&out.bbox),
+        ))
     }
 }
 
@@ -216,11 +219,16 @@ fn band_pick_adapter() -> Adapter {
                 bands: false,
                 ..FieldMask::ALL
             },
-            output: RasterPattern::default(),
+            output: CapsPattern::Raster(RasterPattern::default()),
         },
-        build: |target| match &target.bands {
-            SetField::OneOf(v) if v.contains(&1) => Some(Box::new(BandPick)),
-            _ => None,
+        build: |target| {
+            let CapsPattern::Raster(target) = target else {
+                return None;
+            };
+            match &target.bands {
+                SetField::OneOf(v) if v.contains(&1) => Some(Box::new(BandPick)),
+                _ => None,
+            }
         },
     }
 }
@@ -289,8 +297,13 @@ async fn registered_adapter_bridges_a_bands_mismatch() {
         },
         resolution: CELL,
     };
-    let a = engine.pull(hs, req).await.unwrap();
-    let b = reference.pull(rhs, req).await.unwrap();
+    let a = engine.pull(hs, req).await.unwrap().into_raster().unwrap();
+    let b = reference
+        .pull(rhs, req)
+        .await
+        .unwrap()
+        .into_raster()
+        .unwrap();
     let (ba, bb) = (a.bands.band(0).unwrap(), b.bands.band(0).unwrap());
     for (i, (x, y)) in ba.data().iter().zip(bb.data()).enumerate() {
         assert!((x - y).abs() < 1e-12, "pixel {i}: {x} vs {y}");

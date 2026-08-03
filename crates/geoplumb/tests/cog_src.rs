@@ -113,8 +113,8 @@ async fn base_level_matches_in_memory_source() {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
     };
-    let a = cog.pull(cn, req).await.unwrap();
-    let b = mem.pull(mn, req).await.unwrap();
+    let a = cog.pull(cn, req).await.unwrap().into_raster().unwrap();
+    let b = mem.pull(mn, req).await.unwrap().into_raster().unwrap();
     assert_bands_close(&a, &b, 1e-12);
 }
 
@@ -128,8 +128,8 @@ async fn overview_pull_matches_and_fetches_less() {
         bbox: full,
         resolution: CELL * 2.0,
     };
-    let a = src.read(&coarse).await.unwrap();
-    let b = mem.pull(mn, coarse).await.unwrap();
+    let a = src.read(&coarse).await.unwrap().into_raster().unwrap();
+    let b = mem.pull(mn, coarse).await.unwrap().into_raster().unwrap();
     assert_bands_close(&a, &b, 1e-12);
 
     // the coarse read must come from the overview: reopen fresh so header
@@ -151,7 +151,7 @@ async fn tile_bytes_fetched(req: WindowReq) -> usize {
     let fetched = mem_range.fetched.clone();
     let src = CogSrc::open(mem_range).unwrap();
     let before = fetched.load(Ordering::SeqCst);
-    src.read(&req).await.unwrap();
+    src.read(&req).await.unwrap().into_raster().unwrap();
     fetched.load(Ordering::SeqCst) - before
 }
 
@@ -164,8 +164,8 @@ async fn pull_coarser_than_pyramid_decimates() {
         bbox: window(0, 0, 400, 400),
         resolution: CELL * 4.0,
     };
-    let a = src.read(&req).await.unwrap();
-    let b = mem.pull(mn, req).await.unwrap();
+    let a = src.read(&req).await.unwrap().into_raster().unwrap();
+    let b = mem.pull(mn, req).await.unwrap().into_raster().unwrap();
     assert_eq!(a.width(), 100);
     // average-of-averages vs one flat average differ only in rounding
     assert_bands_close(&a, &b, 1e-9);
@@ -184,7 +184,7 @@ async fn window_outside_the_file_pads_nan() {
         },
         resolution: CELL,
     };
-    let chunk = src.read(&req).await.unwrap();
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
     let band = chunk.bands.band(0).unwrap();
     assert_eq!(band.width(), 80);
     assert!(band.data()[0].is_nan(), "outside pixel not nan");
@@ -239,7 +239,7 @@ async fn http_transport_feeds_the_engine() {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
     };
-    let a = engine.pull(hs, req).await.unwrap();
-    let b = mem.pull(mhs, req).await.unwrap();
+    let a = engine.pull(hs, req).await.unwrap().into_raster().unwrap();
+    let b = mem.pull(mhs, req).await.unwrap().into_raster().unwrap();
     assert_bands_close(&a, &b, 1e-9);
 }

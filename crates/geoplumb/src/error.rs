@@ -23,6 +23,8 @@ pub enum Error {
     Compute { node: NodeId, detail: String },
     #[error("reprojection failed: {0}")]
     Projection(String),
+    #[error("chunk kind mismatch: expected {0}")]
+    Kind(&'static str),
     #[error(transparent)]
     Terrano(#[from] terrano_core::Error),
 }

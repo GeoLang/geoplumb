@@ -4,7 +4,7 @@
 //! windows without holding the file
 
 use crate::caps::{CapsPattern, CapsSet, Constraint, Crs, RasterPattern, ResRange, SetField};
-use crate::chunk::RasterChunk;
+use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::error::Result;
 use crate::window::{GridSpec, WindowReq};
@@ -111,7 +111,7 @@ impl Source for RasterSrc {
         }
     }
 
-    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<RasterChunk>> {
-        Box::pin(async move { Ok(self.sample_level(req)) })
+    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<Chunk>> {
+        Box::pin(async move { Ok(Chunk::Raster(self.sample_level(req))) })
     }
 }

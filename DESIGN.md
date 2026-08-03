@@ -18,7 +18,9 @@ Adapted from glass2glass's CSP design (`src/caps.rs`, `src/solver.rs`, MPL-2.0).
 - `Identity(CapsSet)` — pass-through, optionally narrowing
 - `Derived { input, passthrough, output }` — output derived from input, declarative: a `FieldMask` names the fields copied across, the override pattern pins retargeted fields (reproject pins `crs`)
 
-`CapsSet` is preference-ordered alternatives of field patterns (dtype, bands, crs, resolution range, chunk px). The solver alternates forward sweeps (narrow each output link through the node's constraint) and backward sweeps (consumers narrow producers, coupling backward through `Derived` only on passthrough fields) until the links stop changing: a fanin couples its input links through the shared consumer, so one sweep each way is no longer complete. Fixation then assigns concrete caps source-first by backtracking search, because a diamond can leave branch preference orders that disagree, where greedy per-link fixation picks a jointly impossible combination. The greedy choice is tried first, so chains and plain fan-out fixate as before. Failures are structured and name the link.
+Caps are kinded: a `CapsPattern` is a raster pattern (dtype, bands, crs, resolution range, chunk px) or a point cloud pattern (crs, resolution, chunk px), and cross-kind intersection is empty, so a link always negotiates to one kind and a point source wired straight into a raster consumer fails with the usual empty-link error. A `Derived` whose output pattern has a different kind than its input is a cross-kind transform (`IdwGrid`: points in, raster out). Its passthrough mask projects only the fields every kind shares, crs, resolution and chunk size, which is what lets a crs demand downstream of a gridder narrow the point link, and lets the raster-side reproject auto-plug fire downstream of it. New kinds (vector, tensor) extend the pattern enum and the common-field projection, the solver stays kind-blind.
+
+`CapsSet` is preference-ordered alternatives of patterns. The solver alternates forward sweeps (narrow each output link through the node's constraint) and backward sweeps (consumers narrow producers, coupling backward through `Derived` only on passthrough fields) until the links stop changing: a fanin couples its input links through the shared consumer, so one sweep each way is no longer complete. Fixation then assigns concrete caps source-first by backtracking search, because a diamond can leave branch preference orders that disagree, where greedy per-link fixation picks a jointly impossible combination. The greedy choice is tried first, so chains and plain fan-out fixate as before. Failures are structured and name the link.
 
 A fanin declares one `Constraint` that applies to every input link and the output link alike, so all pins negotiate to matching caps.
 
@@ -33,7 +35,7 @@ Divergences from g2g, deliberate:
 
 Requests snap to a per-node grid: a power-of-two resolution ladder anchored at the node's origin (`GridSpec`), tiled at the negotiated chunk size. Cache keys are `(node, level, ix, iy)`. A request finer than the ladder base clamps to level 0 and the driver upsamples, coarser requests snap to the finest level that is at least as coarse.
 
-Chunks are self-describing (`RasterChunk`: bands, resolved bbox, resolution, crs) because responses are addressed by request, not stream order, and snapping may widen the window. `Chunk` is an enum, vector and point cloud variants are reserved.
+Chunks are self-describing (`RasterChunk`: bands, resolved bbox, resolution, crs) because responses are addressed by request, not stream order, and snapping may widen the window. `Chunk` is an enum over kinds: `Raster` and `PointCloud`, with vector and tensor reserved. A point chunk is the points inside one tile window, thinned for its ladder level, and point tile membership is half-open (x in `[min, max)`, y in `(min, max]`, the top edge inclusive because tiles step down from the origin) so a point on a seam belongs to exactly one tile. The same pull, cache, coalescing, spill and invalidation machinery serves every kind, only assembly differs: rasters mosaic, point chunks concatenate and filter.
 
 Each node's grid derives from its parent's through `output_grid`: identity for most transforms, a reproject anchors the canonical origin for known CRS (web mercator, wgs84) and estimates base resolution from the local scale. A fanin takes its finest input grid by default, and its elements sample inputs bilinearly onto the output grid, exact when an input shares the output alignment.
 
@@ -55,8 +57,11 @@ Three sources. `RasterSrc` holds the whole dataset resident and serves ladder le
 
 Two fanin elements. `Mosaic` takes the first input, wiring order, that has a value at each output pixel. `Combine` samples both inputs onto the output grid and runs terrano's binary op band by band.
 
+The point cloud pair over nubis is the PDAL slot. `LasSrc` holds a cloud resident (LAS via nubis or in-memory), anchors its grid at the cloud bounds with base resolution estimated as the mean point spacing, and serves tile windows with per-level voxel thinning, one point per cell of the level's resolution, the point analogue of block-averaged decimation. `IdwGrid` is the cross-kind transform: it plans the upstream point window widened by its search radius (in output pixels, so every level sees a comparable neighborhood) and grids z by inverse distance weighting via nubis's windowed, radius-binned `idw_window`.
+
 ## Known limits
 
 - The disk tier lives and dies with one engine instance. Cross-process reuse needs an element identity hash so a graph edit cannot serve stale files.
 - `CogSrc` and `StacSrc` are single-band and serialize range reads per file behind a mutex. `StacSrc` uses only the first search page, keeps only items sharing the most recent item's crs, and assumes items share the grid alignment (mismatches land on the nearest pixel). No time axis on pulls, `datetime` filters at open.
 - Invalidation spread uses the coarsest cached level per node, over-invalidating slightly, never stale.
+- `LasSrc` holds the whole cloud resident and rescans it per tile read, there is no windowed LAS reader yet. `IdwGrid` grids only z, intensity and classification ride along in point chunks but no element consumes them.

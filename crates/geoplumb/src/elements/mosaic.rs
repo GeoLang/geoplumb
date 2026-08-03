@@ -3,7 +3,7 @@
 //! output grid, exact when an input shares the output alignment
 
 use crate::caps::{CapsSet, Constraint};
-use crate::chunk::RasterChunk;
+use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Fanin;
 use crate::error::Result;
 use crate::resample::sample_bilinear;
@@ -17,7 +17,8 @@ impl Fanin for Mosaic {
         Constraint::Identity(CapsSet::any_raster())
     }
 
-    fn compute(&self, out: &WindowReq, inputs: &[RasterChunk]) -> Result<RasterChunk> {
+    fn compute(&self, out: &WindowReq, inputs: &[Chunk]) -> Result<Chunk> {
+        let inputs: Vec<&RasterChunk> = inputs.iter().map(Chunk::raster).collect::<Result<_>>()?;
         let res = out.resolution;
         let cols = (out.bbox.width() / res).round() as usize;
         let rows = (out.bbox.height() / res).round() as usize;
@@ -47,11 +48,11 @@ impl Fanin for Mosaic {
                 Raster::from_vec(cols, rows, data, res, nodata).expect("mosaic dims")
             })
             .collect();
-        Ok(RasterChunk {
+        Ok(Chunk::Raster(RasterChunk {
             bands: BandedRaster::new(bands).expect("uniform bands"),
             bbox: out.bbox,
             resolution: res,
             crs: inputs[0].crs,
-        })
+        }))
     }
 }

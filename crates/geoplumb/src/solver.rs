@@ -16,7 +16,7 @@
 //! demand is spliced in before re-solving. the solver never knows which
 //! caps field an adapter fixes, the element's constraint declares it
 
-use crate::caps::{Caps, CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
+use crate::caps::{Caps, CapsSet, Constraint};
 use crate::element::Adapter;
 use crate::error::{Error, Result};
 use crate::graph::{Graph, Node, NodeId};
@@ -89,7 +89,7 @@ fn try_solve(graph: &Graph) -> Result<Outcome> {
         .map(|i| graph.parents(NodeId(i)).iter().map(|p| p.0).collect())
         .collect();
 
-    let mut links: Vec<CapsSet> = vec![CapsSet::any_raster(); n];
+    let mut links: Vec<CapsSet> = vec![CapsSet::any(); n];
     let max_iters = 8 * n + 4;
     for _ in 0..max_iters {
         let snapshot = links.clone();
@@ -99,7 +99,7 @@ fn try_solve(graph: &Graph) -> Result<Outcome> {
         // narrowing, so the sweep stays monotone
         for &i in &topo {
             let set = match parents[i].as_slice() {
-                [] => constraints[i].output_set(&CapsSet::any_raster()),
+                [] => constraints[i].output_set(&CapsSet::any()),
                 ps => {
                     let mut upstream = links[ps[0]].clone();
                     for &p in &ps[1..] {
@@ -205,7 +205,7 @@ fn plug_or_fail(
     for adapter in adapters {
         let bridged = adapter.template.output_set(offer).intersect(demand);
         for alt in &bridged.alternatives {
-            if let Some(element) = (adapter.build)(alt.raster()) {
+            if let Some(element) = (adapter.build)(alt) {
                 return Ok(Outcome::NeedsPlug {
                     parent,
                     child,
@@ -272,15 +272,20 @@ fn candidates_of(
     let set = match parents[i].as_slice() {
         [] => links[i].clone(),
         ps => {
-            let mut pat = pattern_of(fixed[ps[0]].as_ref().expect("parents fixed first"));
+            let mut pat = fixed[ps[0]]
+                .as_ref()
+                .expect("parents fixed first")
+                .pattern();
             for &q in &ps[1..] {
-                pat = pat.intersect(&pattern_of(fixed[q].as_ref().expect("parents fixed first")));
-            }
-            if pat.is_empty() {
-                return Vec::new();
+                let joined =
+                    pat.intersect(&fixed[q].as_ref().expect("parents fixed first").pattern());
+                match joined {
+                    Some(p) => pat = p,
+                    None => return Vec::new(),
+                }
             }
             constraints[i]
-                .output_set(&CapsSet::one(CapsPattern::Raster(pat)))
+                .output_set(&CapsSet::one(pat))
                 .intersect(&links[i])
         }
     };
@@ -293,16 +298,4 @@ fn candidates_of(
         }
     }
     out
-}
-
-/// concrete caps as a single-alternative pattern for downstream derivation
-fn pattern_of(caps: &Caps) -> RasterPattern {
-    let r = caps.raster();
-    RasterPattern {
-        dtype: SetField::one(r.dtype),
-        bands: SetField::one(r.bands),
-        crs: SetField::one(r.crs),
-        resolution: r.resolution,
-        chunk_px: SetField::one(r.chunk_px),
-    }
 }

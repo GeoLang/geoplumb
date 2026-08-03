@@ -139,26 +139,121 @@ impl RasterPattern {
     }
 }
 
-/// caps pattern, one alternative. vector and point cloud variants land here later
+/// negotiation-time pattern over point cloud link caps. resolution is the
+/// thinning ladder bound, chunk tiling works exactly as for rasters
 #[derive(Debug, Clone, PartialEq)]
-pub enum CapsPattern {
-    Raster(RasterPattern),
+pub struct PointPattern {
+    pub crs: SetField<Crs>,
+    pub resolution: ResRange,
+    pub chunk_px: SetField<u32>,
 }
 
-impl CapsPattern {
-    pub fn raster(&self) -> &RasterPattern {
-        match self {
-            CapsPattern::Raster(r) => r,
+impl Default for PointPattern {
+    fn default() -> Self {
+        PointPattern {
+            crs: SetField::Any,
+            resolution: ResRange::ANY,
+            chunk_px: SetField::Any,
+        }
+    }
+}
+
+impl PointPattern {
+    pub fn intersect(&self, other: &Self) -> Self {
+        PointPattern {
+            crs: self.crs.intersect(&other.crs),
+            resolution: self.resolution.intersect(&other.resolution),
+            chunk_px: self.chunk_px.intersect(&other.chunk_px),
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.crs.is_empty() || self.resolution.is_empty() || self.chunk_px.is_empty()
+    }
+}
+
+/// caps pattern, one alternative per kind. vector and tensor variants land
+/// here later. cross-kind intersection is empty: a link has one kind
+#[derive(Debug, Clone, PartialEq)]
+pub enum CapsPattern {
+    Raster(RasterPattern),
+    PointCloud(PointPattern),
+}
+
+/// the fields every caps kind shares, the cross-kind projection surface of
+/// a `Derived` constraint whose output kind differs from its input
+struct CommonFields {
+    crs: SetField<Crs>,
+    resolution: ResRange,
+    chunk_px: SetField<u32>,
+}
+
+impl CapsPattern {
     pub fn intersect(&self, other: &Self) -> Option<Self> {
         match (self, other) {
             (CapsPattern::Raster(a), CapsPattern::Raster(b)) => {
                 let r = a.intersect(b);
                 (!r.is_empty()).then_some(CapsPattern::Raster(r))
             }
+            (CapsPattern::PointCloud(a), CapsPattern::PointCloud(b)) => {
+                let p = a.intersect(b);
+                (!p.is_empty()).then_some(CapsPattern::PointCloud(p))
+            }
+            _ => None,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            CapsPattern::Raster(r) => r.is_empty(),
+            CapsPattern::PointCloud(p) => p.is_empty(),
+        }
+    }
+
+    fn common(&self) -> CommonFields {
+        match self {
+            CapsPattern::Raster(r) => CommonFields {
+                crs: r.crs.clone(),
+                resolution: r.resolution,
+                chunk_px: r.chunk_px.clone(),
+            },
+            CapsPattern::PointCloud(p) => CommonFields {
+                crs: p.crs.clone(),
+                resolution: p.resolution,
+                chunk_px: p.chunk_px.clone(),
+            },
+        }
+    }
+
+    /// intersect the masked common fields from `from` onto this pattern,
+    /// keeping kind-specific fields untouched
+    fn project_common(&self, from: &CommonFields, mask: FieldMask) -> CapsPattern {
+        let mut out = self.clone();
+        match &mut out {
+            CapsPattern::Raster(r) => {
+                if mask.crs {
+                    r.crs = r.crs.intersect(&from.crs);
+                }
+                if mask.resolution {
+                    r.resolution = r.resolution.intersect(&from.resolution);
+                }
+                if mask.chunk_px {
+                    r.chunk_px = r.chunk_px.intersect(&from.chunk_px);
+                }
+            }
+            CapsPattern::PointCloud(p) => {
+                if mask.crs {
+                    p.crs = p.crs.intersect(&from.crs);
+                }
+                if mask.resolution {
+                    p.resolution = p.resolution.intersect(&from.resolution);
+                }
+                if mask.chunk_px {
+                    p.chunk_px = p.chunk_px.intersect(&from.chunk_px);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -177,6 +272,16 @@ impl CapsSet {
 
     pub fn any_raster() -> Self {
         CapsSet::one(CapsPattern::Raster(RasterPattern::default()))
+    }
+
+    /// unconstrained across every kind, the solver's link seed
+    pub fn any() -> Self {
+        CapsSet {
+            alternatives: vec![
+                CapsPattern::Raster(RasterPattern::default()),
+                CapsPattern::PointCloud(PointPattern::default()),
+            ],
+        }
     }
 
     pub fn intersect(&self, other: &Self) -> Self {
@@ -201,14 +306,20 @@ impl CapsSet {
     /// ranged. dtype defaults to f64, bands and chunk size left `Any` by every
     /// constraint on the link fall back to 1 band and 256 px
     pub fn fixate(&self) -> Option<Caps> {
-        let first = self.alternatives.first()?.raster();
-        Some(Caps::Raster(RasterCaps {
-            dtype: first.dtype.fixate().unwrap_or(Dtype::F64),
-            bands: first.bands.fixate().unwrap_or(1),
-            crs: first.crs.fixate()?,
-            resolution: first.resolution,
-            chunk_px: first.chunk_px.fixate().unwrap_or(256),
-        }))
+        match self.alternatives.first()? {
+            CapsPattern::Raster(first) => Some(Caps::Raster(RasterCaps {
+                dtype: first.dtype.fixate().unwrap_or(Dtype::F64),
+                bands: first.bands.fixate().unwrap_or(1),
+                crs: first.crs.fixate()?,
+                resolution: first.resolution,
+                chunk_px: first.chunk_px.fixate().unwrap_or(256),
+            })),
+            CapsPattern::PointCloud(first) => Some(Caps::PointCloud(PointCaps {
+                crs: first.crs.fixate()?,
+                resolution: first.resolution,
+                chunk_px: first.chunk_px.fixate().unwrap_or(256),
+            })),
+        }
     }
 }
 
@@ -216,6 +327,7 @@ impl CapsSet {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Caps {
     Raster(RasterCaps),
+    PointCloud(PointCaps),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -227,29 +339,91 @@ pub struct RasterCaps {
     pub chunk_px: u32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointCaps {
+    pub crs: Crs,
+    pub resolution: ResRange,
+    pub chunk_px: u32,
+}
+
 impl Caps {
+    /// panics on a non-raster link, negotiation guarantees an element's kind
     pub fn raster(&self) -> &RasterCaps {
         match self {
             Caps::Raster(r) => r,
+            other => panic!("expected raster caps, got {other:?}"),
+        }
+    }
+
+    /// panics on a non-point link, negotiation guarantees an element's kind
+    pub fn point(&self) -> &PointCaps {
+        match self {
+            Caps::PointCloud(p) => p,
+            other => panic!("expected point cloud caps, got {other:?}"),
+        }
+    }
+
+    pub fn crs(&self) -> Crs {
+        match self {
+            Caps::Raster(r) => r.crs,
+            Caps::PointCloud(p) => p.crs,
+        }
+    }
+
+    pub fn chunk_px(&self) -> u32 {
+        match self {
+            Caps::Raster(r) => r.chunk_px,
+            Caps::PointCloud(p) => p.chunk_px,
+        }
+    }
+
+    /// these caps as a single-alternative pattern for downstream derivation
+    pub fn pattern(&self) -> CapsPattern {
+        match self {
+            Caps::Raster(r) => CapsPattern::Raster(RasterPattern {
+                dtype: SetField::one(r.dtype),
+                bands: SetField::one(r.bands),
+                crs: SetField::one(r.crs),
+                resolution: r.resolution,
+                chunk_px: SetField::one(r.chunk_px),
+            }),
+            Caps::PointCloud(p) => CapsPattern::PointCloud(PointPattern {
+                crs: SetField::one(p.crs),
+                resolution: p.resolution,
+                chunk_px: SetField::one(p.chunk_px),
+            }),
         }
     }
 
     /// discriminates cache entries when a node's caps change across re-solves
     pub fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
-        let r = self.raster();
         let mut h = std::hash::DefaultHasher::new();
-        r.dtype.hash(&mut h);
-        r.bands.hash(&mut h);
-        r.crs.hash(&mut h);
-        r.chunk_px.hash(&mut h);
-        r.resolution.min.to_bits().hash(&mut h);
-        r.resolution.max.to_bits().hash(&mut h);
+        match self {
+            Caps::Raster(r) => {
+                0u8.hash(&mut h);
+                r.dtype.hash(&mut h);
+                r.bands.hash(&mut h);
+                r.crs.hash(&mut h);
+                r.chunk_px.hash(&mut h);
+                r.resolution.min.to_bits().hash(&mut h);
+                r.resolution.max.to_bits().hash(&mut h);
+            }
+            Caps::PointCloud(p) => {
+                1u8.hash(&mut h);
+                p.crs.hash(&mut h);
+                p.chunk_px.hash(&mut h);
+                p.resolution.min.to_bits().hash(&mut h);
+                p.resolution.max.to_bits().hash(&mut h);
+            }
+        }
         h.finish()
     }
 }
 
-/// fields a derived transform passes through unchanged, used for backward narrowing
+/// fields a derived transform passes through unchanged, used for backward
+/// narrowing. dtype and bands only exist on raster links, so those bits are
+/// ignored when either side of a projection is another kind
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FieldMask {
     pub dtype: bool,
@@ -277,34 +451,39 @@ impl FieldMask {
     }
 }
 
-/// copy `from`'s masked fields onto `onto` by intersection, keep `onto` elsewhere
-pub fn mask_project(from: &RasterPattern, onto: &RasterPattern, mask: FieldMask) -> RasterPattern {
-    RasterPattern {
-        dtype: if mask.dtype {
-            onto.dtype.intersect(&from.dtype)
-        } else {
-            onto.dtype.clone()
-        },
-        bands: if mask.bands {
-            onto.bands.intersect(&from.bands)
-        } else {
-            onto.bands.clone()
-        },
-        crs: if mask.crs {
-            onto.crs.intersect(&from.crs)
-        } else {
-            onto.crs.clone()
-        },
-        resolution: if mask.resolution {
-            onto.resolution.intersect(&from.resolution)
-        } else {
-            onto.resolution
-        },
-        chunk_px: if mask.chunk_px {
-            onto.chunk_px.intersect(&from.chunk_px)
-        } else {
-            onto.chunk_px.clone()
-        },
+/// copy `from`'s masked fields onto `onto` by intersection, keep `onto`
+/// elsewhere. across kinds only the common fields (crs, resolution, chunk
+/// size) project, which is how a cross-kind `Derived` couples its links
+pub fn mask_project(from: &CapsPattern, onto: &CapsPattern, mask: FieldMask) -> CapsPattern {
+    match (from, onto) {
+        (CapsPattern::Raster(f), CapsPattern::Raster(o)) => CapsPattern::Raster(RasterPattern {
+            dtype: if mask.dtype {
+                o.dtype.intersect(&f.dtype)
+            } else {
+                o.dtype.clone()
+            },
+            bands: if mask.bands {
+                o.bands.intersect(&f.bands)
+            } else {
+                o.bands.clone()
+            },
+            crs: if mask.crs {
+                o.crs.intersect(&f.crs)
+            } else {
+                o.crs.clone()
+            },
+            resolution: if mask.resolution {
+                o.resolution.intersect(&f.resolution)
+            } else {
+                o.resolution
+            },
+            chunk_px: if mask.chunk_px {
+                o.chunk_px.intersect(&f.chunk_px)
+            } else {
+                o.chunk_px.clone()
+            },
+        }),
+        (from, onto) => onto.project_common(&from.common(), mask),
     }
 }
 
@@ -315,11 +494,13 @@ pub enum Constraint {
     /// pass-through transform, output equals input, optionally narrowed
     Identity(CapsSet),
     /// output derived from input: passthrough fields copy across, the
-    /// override pattern pins the retargeted fields (a reproject pins crs)
+    /// override pattern pins the retargeted fields (a reproject pins crs).
+    /// the output pattern's kind may differ from the input's, that is a
+    /// cross-kind transform (a gridder takes points and makes a raster)
     Derived {
         input: CapsSet,
         passthrough: FieldMask,
-        output: RasterPattern,
+        output: CapsPattern,
     },
 }
 
@@ -327,7 +508,7 @@ impl Constraint {
     /// the set this constraint accepts on its input link
     pub fn input_set(&self) -> CapsSet {
         match self {
-            Constraint::Produces(_) => CapsSet::any_raster(),
+            Constraint::Produces(_) => CapsSet::any(),
             Constraint::Identity(set) => set.clone(),
             Constraint::Derived { input, .. } => input.clone(),
         }
@@ -347,7 +528,7 @@ impl Constraint {
                 let alternatives = narrowed
                     .alternatives
                     .iter()
-                    .map(|p| CapsPattern::Raster(mask_project(p.raster(), output, *passthrough)))
+                    .map(|p| mask_project(p, output, *passthrough))
                     .collect();
                 CapsSet { alternatives }
             }
@@ -366,8 +547,8 @@ impl Constraint {
                     .iter()
                     .filter_map(|inp| {
                         output_pin.alternatives.iter().find_map(|pin| {
-                            let candidate = mask_project(pin.raster(), inp.raster(), *passthrough);
-                            (!candidate.is_empty()).then_some(CapsPattern::Raster(candidate))
+                            let candidate = mask_project(pin, inp, *passthrough);
+                            (!candidate.is_empty()).then_some(candidate)
                         })
                     })
                     .collect();

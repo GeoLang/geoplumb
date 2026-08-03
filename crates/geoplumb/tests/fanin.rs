@@ -6,7 +6,7 @@ use geoplumb::caps::{CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, Res
 use geoplumb::element::Source;
 use geoplumb::elements::{Combine, Hillshade, Mosaic, RasterSrc, Slope};
 use geoplumb::window::GridSpec;
-use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, WindowReq};
+use geoplumb::{Bbox, Chunk, Crs, Engine, Graph, RasterChunk, WindowReq};
 use terrano_core::{BandedRaster, BinaryOp, Raster};
 
 const W: usize = 600;
@@ -72,7 +72,7 @@ async fn mosaic_stitches_sources_with_offset_origins() {
         bbox: window(0, 0, W, H),
         resolution: CELL,
     };
-    let got = engine.pull(m, req).await.unwrap();
+    let got = engine.pull(m, req).await.unwrap().into_raster().unwrap();
     assert_close(&got, &dem_patch(0, 0, W, H), 1e-9);
 }
 
@@ -88,7 +88,7 @@ async fn combine_subtracts_per_cell() {
         bbox: window(10, 10, 500, 300),
         resolution: CELL,
     };
-    let got = engine.pull(c, req).await.unwrap();
+    let got = engine.pull(c, req).await.unwrap().into_raster().unwrap();
     let band = got.bands.band(0).unwrap();
     for (i, v) in band.data().iter().enumerate() {
         assert!(v.abs() < 1e-12, "pixel {i}: {v} should be zero");
@@ -108,9 +108,9 @@ async fn diamond_pull_combines_branches() {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
     };
-    let sum = engine.pull(c, req).await.unwrap();
-    let h = engine.pull(hs, req).await.unwrap();
-    let s = engine.pull(sl, req).await.unwrap();
+    let sum = engine.pull(c, req).await.unwrap().into_raster().unwrap();
+    let h = engine.pull(hs, req).await.unwrap().into_raster().unwrap();
+    let s = engine.pull(sl, req).await.unwrap().into_raster().unwrap();
     let (sb, hb, slb) = (
         sum.bands.band(0).unwrap(),
         h.bands.band(0).unwrap(),
@@ -159,19 +159,19 @@ impl Source for PrefSrc {
         }
     }
 
-    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, geoplumb::Result<RasterChunk>> {
+    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, geoplumb::Result<Chunk>> {
         Box::pin(async move {
             let cols = (req.bbox.width() / req.resolution).round() as usize;
             let rows = (req.bbox.height() / req.resolution).round() as usize;
             let band =
                 Raster::from_vec(cols, rows, vec![1.0; cols * rows], req.resolution, f64::NAN)
                     .unwrap();
-            Ok(RasterChunk {
+            Ok(Chunk::Raster(RasterChunk {
                 bands: BandedRaster::new(vec![band]).unwrap(),
                 bbox: req.bbox,
                 resolution: req.resolution,
                 crs: self.crss[0],
-            })
+            }))
         })
     }
 }
@@ -219,7 +219,7 @@ async fn invalidation_crosses_the_fanin() {
         bbox: window(0, 0, 200, 200),
         resolution: CELL,
     };
-    engine.pull(m, req).await.unwrap();
+    engine.pull(m, req).await.unwrap().into_raster().unwrap();
 
     engine.invalidate(left, window(0, 0, 50, 50));
     let ev = events.try_recv().expect("source event");

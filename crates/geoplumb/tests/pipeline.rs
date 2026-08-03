@@ -56,10 +56,7 @@ impl Source for CountingSrc {
         self.inner.grid()
     }
 
-    fn read<'a>(
-        &'a self,
-        req: &'a WindowReq,
-    ) -> BoxFuture<'a, geoplumb::Result<geoplumb::RasterChunk>> {
+    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, geoplumb::Result<geoplumb::Chunk>> {
         Box::pin(async move {
             self.reads.fetch_add(1, Ordering::SeqCst);
             if !self.delay.is_zero() {
@@ -136,7 +133,7 @@ async fn hillshade_is_seam_free_across_chunks() {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
     };
-    let got = engine.pull(hs, req).await.unwrap();
+    let got = engine.pull(hs, req).await.unwrap().into_raster().unwrap();
 
     // reference: hillshade over the padded window in one piece, pad cropped
     let pad = 4usize;
@@ -215,11 +212,11 @@ async fn cache_serves_repeat_pulls_and_invalidation_clears() {
         bbox: window(10, 10, 200, 200),
         resolution: CELL,
     };
-    engine.pull(hs, req).await.unwrap();
+    engine.pull(hs, req).await.unwrap().into_raster().unwrap();
     let after_first = reads.load(Ordering::SeqCst);
     assert!(after_first > 0);
 
-    engine.pull(hs, req).await.unwrap();
+    engine.pull(hs, req).await.unwrap().into_raster().unwrap();
     assert_eq!(
         reads.load(Ordering::SeqCst),
         after_first,
@@ -228,7 +225,7 @@ async fn cache_serves_repeat_pulls_and_invalidation_clears() {
 
     // disjoint dirty window leaves the cache alone
     engine.invalidate(src, window(500, 300, 590, 390));
-    engine.pull(hs, req).await.unwrap();
+    engine.pull(hs, req).await.unwrap().into_raster().unwrap();
     assert_eq!(
         reads.load(Ordering::SeqCst),
         after_first,
@@ -241,7 +238,7 @@ async fn cache_serves_repeat_pulls_and_invalidation_clears() {
     assert_eq!(ev.node, src);
     let ev2 = events.try_recv().expect("downstream event");
     assert_eq!(ev2.node, hs);
-    engine.pull(hs, req).await.unwrap();
+    engine.pull(hs, req).await.unwrap().into_raster().unwrap();
     assert!(
         reads.load(Ordering::SeqCst) > after_first,
         "stale cache after invalidation"
@@ -272,6 +269,8 @@ async fn cancelled_pull_leaves_no_wedged_chunk() {
     let chunk = tokio::time::timeout(Duration::from_secs(5), engine.pull(src, req))
         .await
         .expect("second pull wedged")
+        .unwrap()
+        .into_raster()
         .unwrap();
     assert_eq!(chunk.bands.band_count(), 1);
 }
@@ -285,7 +284,7 @@ async fn batch_materialize_walks_the_pyramid() {
     let extent = window(0, 0, W, H);
     let mut seen = 0;
     let count = geoplumb::materialize(&engine, hs, extent, 2, |_k, chunk| {
-        assert!(chunk.width() > 0);
+        assert!(chunk.raster().unwrap().width() > 0);
         seen += 1;
     })
     .await

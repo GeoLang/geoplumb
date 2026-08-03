@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use tokio::sync::{broadcast, oneshot};
 
 use crate::caps::Caps;
-use crate::chunk::RasterChunk;
+use crate::chunk::{Chunk, PointChunk, RasterChunk, tile_contains};
 use crate::element::{Fanin, Source, Transform};
 use crate::error::Result;
 use crate::graph::{Graph, Node, NodeId};
@@ -46,7 +46,7 @@ pub struct Invalidation {
 
 enum Entry {
     Ready {
-        chunk: Arc<RasterChunk>,
+        chunk: Arc<Chunk>,
         bytes: usize,
         last_used: u64,
         /// a copy of this chunk sits in the spill store, so memory
@@ -158,7 +158,7 @@ impl Engine {
                     )
                 }
             };
-            grid.chunk_px = caps[i].raster().chunk_px;
+            grid.chunk_px = caps[i].chunk_px();
             nodes[i] = Some(RtNode {
                 elem,
                 caps: caps[i].clone(),
@@ -190,7 +190,7 @@ impl Engine {
 
     /// pull a window from a node: snap to the node's ladder, pull the
     /// covering chunks concurrently, mosaic, crop to the aligned window
-    pub async fn pull(&self, node: NodeId, req: WindowReq) -> Result<RasterChunk> {
+    pub async fn pull(&self, node: NodeId, req: WindowReq) -> Result<Chunk> {
         self.pull_assembled(node.0, req).await
     }
 
@@ -271,11 +271,7 @@ impl Engine {
         }
     }
 
-    fn pull_assembled<'a>(
-        &'a self,
-        node: usize,
-        req: WindowReq,
-    ) -> BoxFuture<'a, Result<RasterChunk>> {
+    fn pull_assembled<'a>(&'a self, node: usize, req: WindowReq) -> BoxFuture<'a, Result<Chunk>> {
         Box::pin(async move {
             let grid = self.nodes[node].grid;
             let level = grid.snap_level(req.resolution);
@@ -284,18 +280,11 @@ impl Engine {
             let keys = grid.cover(&aligned, level);
             let chunks =
                 futures::future::try_join_all(keys.iter().map(|k| self.chunk(node, *k))).await?;
-            Ok(assemble(
-                &grid,
-                &keys,
-                &chunks,
-                &aligned,
-                res,
-                &self.nodes[node].caps,
-            ))
+            assemble(&grid, &keys, &chunks, &aligned, res, &self.nodes[node].caps)
         })
     }
 
-    async fn chunk(&self, node: usize, key: ChunkKey) -> Result<Arc<RasterChunk>> {
+    async fn chunk(&self, node: usize, key: ChunkKey) -> Result<Arc<Chunk>> {
         enum Action {
             Wait(oneshot::Receiver<()>),
             Compute,
@@ -382,10 +371,10 @@ impl Engine {
     async fn finish_and_spill(
         &self,
         guard: PendingGuard<'_>,
-        result: Result<RasterChunk>,
+        result: Result<Chunk>,
         node: usize,
         key: ChunkKey,
-    ) -> Result<Arc<RasterChunk>> {
+    ) -> Result<Arc<Chunk>> {
         let chunk = self.finish_chunk(guard, result, false)?;
         if let Some(sp) = &self.spill {
             let path = sp.store.path(node, key);
@@ -405,9 +394,9 @@ impl Engine {
     fn finish_chunk(
         &self,
         mut guard: PendingGuard<'_>,
-        result: Result<RasterChunk>,
+        result: Result<Chunk>,
         spilled: bool,
-    ) -> Result<Arc<RasterChunk>> {
+    ) -> Result<Arc<Chunk>> {
         let chunk = Arc::new(result?);
         guard.done = true;
         let bytes = chunk.byte_size();
@@ -446,7 +435,7 @@ impl Engine {
         }
     }
 
-    async fn compute_chunk(&self, node: usize, key: ChunkKey) -> Result<RasterChunk> {
+    async fn compute_chunk(&self, node: usize, key: ChunkKey) -> Result<Chunk> {
         let grid = self.nodes[node].grid;
         let out = WindowReq {
             bbox: grid.chunk_bbox(key),
@@ -585,11 +574,50 @@ fn align_outward(bbox: &Bbox, grid: &GridSpec, res: f64) -> Bbox {
     }
 }
 
-/// mosaic same-level chunks into one raster covering `window`
+/// stitch same-level chunks into one chunk covering `window`, per kind
 fn assemble(
     grid: &GridSpec,
     keys: &[ChunkKey],
-    chunks: &[Arc<RasterChunk>],
+    chunks: &[Arc<Chunk>],
+    window: &Bbox,
+    res: f64,
+    caps: &Caps,
+) -> Result<Chunk> {
+    match caps {
+        Caps::Raster(_) => {
+            let rasters: Vec<&RasterChunk> =
+                chunks.iter().map(|c| c.raster()).collect::<Result<_>>()?;
+            Ok(Chunk::Raster(assemble_raster(
+                grid, keys, &rasters, window, res, caps,
+            )))
+        }
+        Caps::PointCloud(p) => {
+            let mut pts = Vec::new();
+            for chunk in chunks {
+                let pc = chunk.points()?;
+                pts.extend(
+                    pc.points
+                        .points()
+                        .iter()
+                        .filter(|pt| tile_contains(window, pt.x, pt.y))
+                        .copied(),
+                );
+            }
+            Ok(Chunk::PointCloud(PointChunk {
+                points: nubis_core::PointCloud::from_points(pts),
+                bbox: *window,
+                resolution: res,
+                crs: p.crs,
+            }))
+        }
+    }
+}
+
+/// mosaic same-level raster chunks into one raster covering `window`
+fn assemble_raster(
+    grid: &GridSpec,
+    keys: &[ChunkKey],
+    chunks: &[&RasterChunk],
     window: &Bbox,
     res: f64,
     caps: &Caps,
@@ -650,7 +678,7 @@ pub async fn materialize(
     node: NodeId,
     extent: Bbox,
     max_level: u8,
-    mut per_chunk: impl FnMut(ChunkKey, &RasterChunk),
+    mut per_chunk: impl FnMut(ChunkKey, &Chunk),
 ) -> Result<usize> {
     let grid = *engine.grid(node);
     let mut count = 0;

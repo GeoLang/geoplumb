@@ -1,7 +1,7 @@
 //! per-cell map algebra and reclassification over terrano ops
 
 use crate::caps::{Caps, CapsSet, Constraint};
-use crate::chunk::RasterChunk;
+use crate::chunk::{Chunk, RasterChunk};
 use crate::element::{Fanin, Transform};
 use crate::error::{Error, Result};
 use crate::resample::sample_bilinear;
@@ -33,7 +33,8 @@ impl Transform for MapAlgebra {
         *out
     }
 
-    fn compute(&self, out: &WindowReq, input: &RasterChunk) -> Result<RasterChunk> {
+    fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
+        let input = input.raster()?;
         let bands = input
             .bands
             .bands()
@@ -49,7 +50,7 @@ impl Transform for MapAlgebra {
             resolution: input.resolution,
             crs: input.crs,
         };
-        Ok(full.crop_to(&out.bbox))
+        Ok(Chunk::Raster(full.crop_to(&out.bbox)))
     }
 }
 
@@ -80,7 +81,8 @@ impl Fanin for Combine {
         Ok(())
     }
 
-    fn compute(&self, out: &WindowReq, inputs: &[RasterChunk]) -> Result<RasterChunk> {
+    fn compute(&self, out: &WindowReq, inputs: &[Chunk]) -> Result<Chunk> {
+        let inputs: Vec<&RasterChunk> = inputs.iter().map(Chunk::raster).collect::<Result<_>>()?;
         let res = out.resolution;
         let cols = (out.bbox.width() / res).round() as usize;
         let rows = (out.bbox.height() / res).round() as usize;
@@ -98,16 +100,16 @@ impl Fanin for Combine {
         };
         let bands: Vec<Raster> = (0..inputs[0].bands.band_count())
             .map(|bi| {
-                on_grid(&inputs[0], bi)
-                    .apply_binary(&on_grid(&inputs[1], bi), &self.op)
+                on_grid(inputs[0], bi)
+                    .apply_binary(&on_grid(inputs[1], bi), &self.op)
                     .expect("equal dims by construction")
             })
             .collect();
-        Ok(RasterChunk {
+        Ok(Chunk::Raster(RasterChunk {
             bands: BandedRaster::new(bands).expect("uniform bands"),
             bbox: out.bbox,
             resolution: res,
             crs: inputs[0].crs,
-        })
+        }))
     }
 }

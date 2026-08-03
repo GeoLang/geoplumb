@@ -312,6 +312,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures",
+ "nubis-core",
  "png",
  "projicio-core",
  "reqwest",
@@ -649,6 +650,14 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nubis-core"
+version = "0.1.0"
+source = "git+https://github.com/GeoLang/nubis.git?branch=master#1339e313b513f89a184e47d118b6648e06c25dd7"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

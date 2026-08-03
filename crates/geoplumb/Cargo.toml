@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 terrano-core.workspace = true
 projicio-core.workspace = true
+nubis-core.workspace = true
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 futures = "0.3"

@@ -2,6 +2,8 @@
 
 ## 2026-08-03
 
+- point cloud as a first-rate chunk kind: caps, chunks, spill format and the element traits are generic over kinds, cross-kind `Derived` constraints project the shared fields (crs, resolution, chunk px) so the solver stays kind-blind, `LasSrc` serves tile windows with per-level voxel thinning, `IdwGrid` grids points to a raster over nubis's new windowed idw, chunked output proven equal to whole-window gridding and point chunks proven to spill and reload
+
 - stac collection source: `StacSrc` searches a stac api at open and mosaics the matched items' cog assets most-recent-first over http range requests, items filtered to one crs, s3 hrefs rewritten to https. `examples/stac_tiles.rs` serves live Copernicus DEM hillshade from earth-search, validated against the real api. tests run against a mock stac server with deflate cogs
 - disk cache tier behind the same entry map: `Engine::with_disk_cache` writes chunks through to a per-engine spill dir, memory eviction demotes entries to disk, spilled hits reload through the coalescing machinery, disk budget and invalidation delete files, drop removes the dir
 - auto-plug generalized to an adapter registry on the graph: elements declare what they bridge via a template constraint and the solver checks `output_set(offer) ∩ demand` with no field knowledge, reproject registered by default, `register_adapter` for user elements

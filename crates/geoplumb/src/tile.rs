@@ -47,5 +47,5 @@ pub async fn render_tile(engine: &Engine, node: NodeId, tile: XyzTile) -> Result
             },
         )
         .await?;
-    Ok(resample_to_grid(&pulled, &bbox, TILE_PX, TILE_PX))
+    Ok(resample_to_grid(pulled.raster()?, &bbox, TILE_PX, TILE_PX))
 }

@@ -1,6 +1,7 @@
 pub mod algebra;
 pub mod cog;
 pub mod mosaic;
+pub mod points;
 pub mod reproject;
 pub mod source;
 pub mod stac;
@@ -9,6 +10,7 @@ pub mod terrain;
 pub use algebra::{Combine, MapAlgebra};
 pub use cog::{CogSrc, HttpRange};
 pub use mosaic::Mosaic;
+pub use points::{IdwGrid, LasSrc};
 pub use reproject::Reproject;
 pub use source::RasterSrc;
 pub use stac::{StacSearch, StacSrc};

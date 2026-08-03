@@ -52,10 +52,7 @@ impl Source for CountingSrc {
         self.inner.grid()
     }
 
-    fn read<'a>(
-        &'a self,
-        req: &'a WindowReq,
-    ) -> BoxFuture<'a, geoplumb::Result<geoplumb::RasterChunk>> {
+    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, geoplumb::Result<geoplumb::Chunk>> {
         Box::pin(async move {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.inner.read(req).await
@@ -117,12 +114,12 @@ async fn evicted_chunk_is_served_from_disk() {
 
     // this chunk spans the raster edge, so the roundtrip also covers nan
     let a = window(512, 0, 600, 224);
-    let first = engine.pull(src, a).await.unwrap();
+    let first = engine.pull(src, a).await.unwrap().into_raster().unwrap();
     let after_first = reads.load(Ordering::SeqCst);
 
     // a different chunk evicts the first from memory to disk
     engine.pull(src, window(0, 0, 224, 224)).await.unwrap();
-    let again = engine.pull(src, a).await.unwrap();
+    let again = engine.pull(src, a).await.unwrap().into_raster().unwrap();
     assert_eq!(
         reads.load(Ordering::SeqCst),
         after_first + 1,
@@ -145,14 +142,14 @@ async fn disk_budget_drops_the_oldest_file() {
         window(256, 0, 480, 224),
         window(0, 256, 224, 400),
     );
-    engine.pull(src, a).await.unwrap();
-    engine.pull(src, b).await.unwrap();
-    engine.pull(src, c).await.unwrap();
+    engine.pull(src, a).await.unwrap().into_raster().unwrap();
+    engine.pull(src, b).await.unwrap().into_raster().unwrap();
+    engine.pull(src, c).await.unwrap().into_raster().unwrap();
     // memory holds c, disk holds b, a's file fell over the disk budget
     let settled = reads.load(Ordering::SeqCst);
-    engine.pull(src, b).await.unwrap();
+    engine.pull(src, b).await.unwrap().into_raster().unwrap();
     assert_eq!(reads.load(Ordering::SeqCst), settled, "b was on disk");
-    engine.pull(src, a).await.unwrap();
+    engine.pull(src, a).await.unwrap().into_raster().unwrap();
     assert!(
         reads.load(Ordering::SeqCst) > settled,
         "a should have been dropped from the disk tier"
@@ -168,12 +165,12 @@ async fn invalidation_reaches_spilled_entries() {
     let engine = Engine::with_disk_cache(g, ONE_CHUNK, &base, 64 << 20).unwrap();
 
     let a = window(0, 0, 224, 224);
-    engine.pull(src, a).await.unwrap();
+    engine.pull(src, a).await.unwrap().into_raster().unwrap();
     engine.pull(src, window(256, 0, 480, 224)).await.unwrap();
     // a is on disk now, and dirty
     let settled = reads.load(Ordering::SeqCst);
     engine.invalidate(src, window(10, 10, 50, 50).bbox);
-    engine.pull(src, a).await.unwrap();
+    engine.pull(src, a).await.unwrap().into_raster().unwrap();
     assert!(
         reads.load(Ordering::SeqCst) > settled,
         "invalidated spilled chunk served stale data"
