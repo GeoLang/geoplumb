@@ -256,10 +256,7 @@ impl Engine {
         mut guard: PendingGuard<'_>,
         result: Result<RasterChunk>,
     ) -> Result<Arc<RasterChunk>> {
-        let chunk = match result {
-            Ok(c) => Arc::new(c),
-            Err(e) => return Err(e),
-        };
+        let chunk = Arc::new(result?);
         guard.done = true;
         let bytes = chunk.byte_size();
         let mut state = self.cache.lock().unwrap();
