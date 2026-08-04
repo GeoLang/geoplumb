@@ -414,6 +414,10 @@ impl CapsSet {
         CapsSet::one(CapsPattern::Raster(RasterPattern::default()))
     }
 
+    pub fn any_vector() -> Self {
+        CapsSet::one(CapsPattern::Vector(VectorPattern::default()))
+    }
+
     /// unconstrained across every kind, the solver's link seed
     pub fn any() -> Self {
         CapsSet {

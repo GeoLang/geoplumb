@@ -10,7 +10,7 @@ use nubis_core::{Point3, PointCloud};
 use terrano_core::{BandedRaster, Raster};
 use topoi_core::geojson::FeatureGeometry;
 use topoi_core::{
-    LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon, Ring,
+    Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon, Ring,
     clip_linestring_rect, clip_polygon_rect,
 };
 
@@ -195,6 +195,38 @@ impl VectorChunk {
         self.byte_size
     }
 
+    /// merge the fragments of each source feature back into one feature,
+    /// the inverse of tile clipping. one feature per id, ordered by id,
+    /// properties from the first fragment.
+    ///
+    /// this is a driver-side call, not a graph element: a transform computes
+    /// one tile of its own grid at a time and only ever sees the fragments
+    /// inside that tile, so no in-graph element can see two fragments of one
+    /// feature. dissolve after an assembled pull instead
+    pub fn dissolve(&self) -> VectorChunk {
+        let mut groups: Vec<(u64, Vec<&VectorFeature>)> = Vec::new();
+        for f in &self.features {
+            match groups.iter_mut().find(|(id, _)| *id == f.id) {
+                Some((_, group)) => group.push(f),
+                None => groups.push((f.id, vec![f])),
+            }
+        }
+        groups.sort_by_key(|(id, _)| *id);
+        let features = groups
+            .iter()
+            .filter_map(|(id, group)| {
+                let parts: Vec<&FeatureGeometry> = group.iter().map(|f| &f.geometry).collect();
+                let geometry = merge_fragments(&parts)?;
+                Some(VectorFeature {
+                    id: *id,
+                    geometry,
+                    properties: group[0].properties.clone(),
+                })
+            })
+            .collect();
+        VectorChunk::new(features, self.bbox, self.resolution, self.crs)
+    }
+
     /// re-clip the fragments to a narrower window, dropping the ones that
     /// fall out. fragments keep their source order
     pub fn crop_to(&self, bbox: &Bbox) -> VectorChunk {
@@ -317,7 +349,7 @@ pub fn clip_geometry(geometry: &FeatureGeometry, bbox: &Bbox) -> Vec<FeatureGeom
 }
 
 fn clip_polygon_to(p: &Polygon, bbox: &Bbox) -> Option<Polygon> {
-    let clip = |coords: &[topoi_core::Coord]| {
+    let clip = |coords: &[Coord]| {
         clip_polygon_rect(coords, bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)
     };
     let exterior = clip(p.exterior().coords());
@@ -333,6 +365,164 @@ fn clip_polygon_to(p: &Polygon, bbox: &Bbox) -> Option<Polygon> {
         })
         .collect();
     Some(Polygon::new(Ring::new(exterior), holes))
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Class {
+    Point,
+    Line,
+    Polygon,
+    Collection,
+}
+
+fn class(geometry: &FeatureGeometry) -> Class {
+    match geometry {
+        FeatureGeometry::Point(_) | FeatureGeometry::MultiPoint(_) => Class::Point,
+        FeatureGeometry::LineString(_) | FeatureGeometry::MultiLineString(_) => Class::Line,
+        FeatureGeometry::Polygon(_) | FeatureGeometry::MultiPolygon(_) => Class::Polygon,
+        FeatureGeometry::GeometryCollection(_) => Class::Collection,
+    }
+}
+
+/// merge one feature's fragments. a lone fragment passes through untouched,
+/// so an unsplit feature comes back exactly as it went in
+fn merge_fragments(parts: &[&FeatureGeometry]) -> Option<FeatureGeometry> {
+    match parts {
+        [] => None,
+        [single] => Some((*single).clone()),
+        _ => merge_class(parts),
+    }
+}
+
+fn merge_class(parts: &[&FeatureGeometry]) -> Option<FeatureGeometry> {
+    match class(parts.first()?) {
+        Class::Polygon => merge_polygonal(parts),
+        Class::Line => merge_lineal(parts),
+        Class::Point => merge_puntal(parts),
+        Class::Collection => merge_collection(parts),
+    }
+}
+
+fn merge_polygonal(parts: &[&FeatureGeometry]) -> Option<FeatureGeometry> {
+    let mut polys: Vec<&Polygon> = Vec::new();
+    for part in parts {
+        match part {
+            FeatureGeometry::Polygon(p) => polys.push(p),
+            FeatureGeometry::MultiPolygon(mp) => polys.extend(mp.polygons()),
+            _ => {}
+        }
+    }
+    let (first, rest) = polys.split_first()?;
+    let mut merged = MultiPolygon::new(vec![(*first).clone()]);
+    for p in rest {
+        merged = topoi_core::union(&merged, *p);
+    }
+    match merged.polygons() {
+        [] => None,
+        [single] => Some(FeatureGeometry::Polygon(single.clone())),
+        _ => Some(FeatureGeometry::MultiPolygon(merged.clone())),
+    }
+}
+
+fn merge_lineal(parts: &[&FeatureGeometry]) -> Option<FeatureGeometry> {
+    let mut pieces: Vec<Vec<Coord>> = Vec::new();
+    for part in parts {
+        match part {
+            FeatureGeometry::LineString(l) => pieces.push(l.coords().to_vec()),
+            FeatureGeometry::MultiLineString(mls) => {
+                pieces.extend(mls.linestrings().iter().map(|l| l.coords().to_vec()))
+            }
+            _ => {}
+        }
+    }
+    let stitched = stitch(pieces);
+    match stitched.len() {
+        0 => None,
+        1 => Some(FeatureGeometry::LineString(LineString::new(
+            stitched.into_iter().next().expect("one piece"),
+        ))),
+        _ => Some(FeatureGeometry::MultiLineString(MultiLineString::new(
+            stitched.into_iter().map(LineString::new).collect(),
+        ))),
+    }
+}
+
+/// join pieces whose endpoints meet. adjacent tiles solve the same
+/// Liang-Barsky ratio for a seam crossing, so the two seam vertices start
+/// out identical, but re-clipping rebuilds a kept endpoint as start plus
+/// (end - start) and that can land an ulp away, hence the ulp-scale match
+fn stitch(pieces: Vec<Vec<Coord>>) -> Vec<Vec<Coord>> {
+    let meets = |a: Option<&Coord>, b: Option<&Coord>| match (a, b) {
+        (Some(a), Some(b)) => same_coord(a.x, b.x) && same_coord(a.y, b.y),
+        _ => false,
+    };
+    let mut pending = pieces;
+    let mut out: Vec<Vec<Coord>> = Vec::new();
+    while !pending.is_empty() {
+        let mut piece = pending.remove(0);
+        loop {
+            if let Some(k) = pending.iter().position(|p| meets(p.first(), piece.last())) {
+                let next = pending.remove(k);
+                piece.extend_from_slice(&next[1..]);
+                continue;
+            }
+            if let Some(k) = pending.iter().position(|p| meets(p.last(), piece.first())) {
+                let mut prev = pending.remove(k);
+                prev.extend_from_slice(&piece[1..]);
+                piece = prev;
+                continue;
+            }
+            break;
+        }
+        out.push(piece);
+    }
+    out
+}
+
+fn same_coord(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 8.0 * f64::EPSILON * a.abs().max(b.abs()).max(1.0)
+}
+
+/// tile membership gives each point to exactly one tile, so members concat
+/// without dedupe
+fn merge_puntal(parts: &[&FeatureGeometry]) -> Option<FeatureGeometry> {
+    let mut points: Vec<Point> = Vec::new();
+    for part in parts {
+        match part {
+            FeatureGeometry::Point(p) => points.push(*p),
+            FeatureGeometry::MultiPoint(mp) => points.extend(mp.points()),
+            _ => {}
+        }
+    }
+    match points.len() {
+        0 => None,
+        1 => Some(FeatureGeometry::Point(points[0])),
+        _ => Some(FeatureGeometry::MultiPoint(MultiPoint::new(points))),
+    }
+}
+
+/// collection fragments merge classwise: every member of every fragment
+/// joins the bucket for its geometry class, buckets keep first-seen order
+fn merge_collection(parts: &[&FeatureGeometry]) -> Option<FeatureGeometry> {
+    let mut buckets: Vec<(Class, Vec<&FeatureGeometry>)> = Vec::new();
+    for part in parts {
+        let members: &[FeatureGeometry] = match part {
+            FeatureGeometry::GeometryCollection(m) => m,
+            other => std::slice::from_ref(*other),
+        };
+        for m in members {
+            let c = class(m);
+            match buckets.iter_mut().find(|(bc, _)| *bc == c) {
+                Some((_, bucket)) => bucket.push(m),
+                None => buckets.push((c, vec![m])),
+            }
+        }
+    }
+    let merged: Vec<FeatureGeometry> = buckets
+        .iter()
+        .filter_map(|(_, bucket)| merge_class(bucket))
+        .collect();
+    (!merged.is_empty()).then_some(FeatureGeometry::GeometryCollection(merged))
 }
 
 impl RasterChunk {
