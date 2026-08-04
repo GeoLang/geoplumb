@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub struct Crs(pub u32);
 
 impl Crs {
@@ -22,24 +22,27 @@ impl fmt::Display for Crs {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub enum Dtype {
     F64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub enum TensorDtype {
     F32,
 }
 
-/// preference-ordered set pattern for one caps field
+/// preference-ordered set pattern for one caps field. `AtLeast` is an open
+/// lower bound, for demands like "at least n bands" that have no ceiling to
+/// enumerate. construct it only where the order means something
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetField<T> {
     Any,
     OneOf(Vec<T>),
+    AtLeast(T),
 }
 
-impl<T: PartialEq + Clone> SetField<T> {
+impl<T: PartialOrd + Clone> SetField<T> {
     pub fn one(v: T) -> Self {
         SetField::OneOf(vec![v])
     }
@@ -51,6 +54,13 @@ impl<T: PartialEq + Clone> SetField<T> {
             (SetField::OneOf(a), SetField::OneOf(b)) => {
                 SetField::OneOf(a.iter().filter(|v| b.contains(v)).cloned().collect())
             }
+            (SetField::AtLeast(a), SetField::AtLeast(b)) => {
+                SetField::AtLeast(if a >= b { a.clone() } else { b.clone() })
+            }
+            (SetField::AtLeast(n), SetField::OneOf(vs))
+            | (SetField::OneOf(vs), SetField::AtLeast(n)) => {
+                SetField::OneOf(vs.iter().filter(|v| *v >= n).cloned().collect())
+            }
         }
     }
 
@@ -58,10 +68,12 @@ impl<T: PartialEq + Clone> SetField<T> {
         matches!(self, SetField::OneOf(v) if v.is_empty())
     }
 
+    /// a bound nothing narrowed to concrete offers fixates to the bound itself
     fn fixate(&self) -> Option<T> {
         match self {
             SetField::Any => None,
             SetField::OneOf(v) => v.first().cloned(),
+            SetField::AtLeast(n) => Some(n.clone()),
         }
     }
 }

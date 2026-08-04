@@ -2,9 +2,7 @@
 //! bands through an expression parsed at construction. window-local on an
 //! identity plan, so chunked output equals whole-window output
 
-use crate::caps::{
-    Caps, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField,
-};
+use crate::caps::{CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::error::{Error, Result};
@@ -296,7 +294,11 @@ impl BandMath {
 impl Transform for BandMath {
     fn constraint(&self) -> Constraint {
         Constraint::Derived {
-            input: CapsSet::any_raster(),
+            input: CapsSet::one(CapsPattern::Raster(RasterPattern {
+                // a band index past u16 just demands more than any link carries
+                bands: SetField::AtLeast(u16::try_from(self.bands).unwrap_or(u16::MAX)),
+                ..RasterPattern::default()
+            })),
             passthrough: FieldMask {
                 dtype: false,
                 bands: false,
@@ -310,21 +312,6 @@ impl Transform for BandMath {
                 ..RasterPattern::default()
             }),
         }
-    }
-
-    /// the band count cannot be a caps demand: `SetField` states exact sets,
-    /// and "at least n bands" would have to be enumerated to some arbitrary
-    /// ceiling, so a link carrying more bands than the expression names is
-    /// checked here instead, once the solve has fixated it
-    fn configure(&mut self, input: &Caps, _output: &Caps) -> Result<()> {
-        let have = usize::from(input.raster().bands);
-        if have < self.bands {
-            return Err(Error::InvalidGraph(format!(
-                "band math: expression reads {} bands, its input link carries {have}",
-                self.bands
-            )));
-        }
-        Ok(())
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {

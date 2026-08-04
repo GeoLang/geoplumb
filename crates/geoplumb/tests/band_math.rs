@@ -5,7 +5,7 @@
 use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
 use geoplumb::element::Transform;
 use geoplumb::elements::{BandMath, RasterSrc};
-use geoplumb::{Bbox, Chunk, Crs, Engine, Graph, RasterChunk, WindowReq};
+use geoplumb::{Bbox, Chunk, Crs, Engine, Error, Graph, RasterChunk, WindowReq};
 use terrano_core::{BandedRaster, Raster};
 
 const W: usize = 320;
@@ -239,18 +239,27 @@ fn parse_failures_name_the_offending_token() {
 }
 
 #[test]
-fn a_band_the_source_lacks_fails_the_engine_build() {
+fn a_band_the_source_lacks_fails_negotiation() {
     let mut g = Graph::new();
     let s = g.add_source(Box::new(src()));
-    g.add_transform(s, Box::new(BandMath::new("b0 + b2").unwrap()));
+    let bm = g.add_transform(s, Box::new(BandMath::new("b0 + b2").unwrap()));
     let err = Engine::new(g, 64 << 20)
         .err()
         .expect("two bands cannot feed an expression naming b2");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("reads 3 bands") && msg.contains("carries 2"),
-        "unexpected error: {msg}"
-    );
+    match &err {
+        Error::EmptyLink {
+            upstream,
+            downstream,
+            detail,
+        } => {
+            assert_eq!((*upstream, *downstream), (s, bm));
+            assert!(
+                detail.contains("AtLeast(3)") && detail.contains("OneOf([2])"),
+                "unexpected detail: {detail}"
+            );
+        }
+        other => panic!("expected EmptyLink, got {other:?}"),
+    }
 }
 
 #[test]
