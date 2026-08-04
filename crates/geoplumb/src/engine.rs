@@ -16,12 +16,16 @@ use crate::chunk::{
     tile_contains,
 };
 use crate::element::{Fanin, Source, Transform};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::graph::{Graph, Node, NodeId};
 use crate::solver;
 use crate::spill::{self, SpillStore};
 use crate::window::{Bbox, ChunkKey, GridSpec, WindowReq};
 use terrano_core::{BandedRaster, Raster};
+
+/// generous per-pull bound: a million 256 px tiles is far past what
+/// assembly could hold in memory anyway
+const MAX_TILES_PER_PULL: i128 = 1 << 20;
 
 enum RtElem {
     Source(Arc<dyn Source>),
@@ -280,6 +284,19 @@ impl Engine {
             let level = grid.snap_level(req.resolution);
             let res = grid.resolution_at(level);
             let aligned = align_outward(&req.bbox, &grid, res);
+            // a mis-scaled source grid (base resolution far finer than the
+            // request) would enumerate an astronomical key vector and abort,
+            // so refuse before allocating. i128 keeps saturated index bounds
+            // from overflowing the product
+            let (ix0, ix1, iy0, iy1) = grid.tile_range(&aligned, level);
+            let tiles =
+                (i128::from(ix1) - i128::from(ix0) + 1) * (i128::from(iy1) - i128::from(iy0) + 1);
+            if tiles > MAX_TILES_PER_PULL {
+                return Err(Error::PullTooLarge {
+                    tiles,
+                    cap: MAX_TILES_PER_PULL,
+                });
+            }
             let keys = grid.cover(&aligned, level);
             let chunks =
                 futures::future::try_join_all(keys.iter().map(|k| self.chunk(node, *k))).await?;

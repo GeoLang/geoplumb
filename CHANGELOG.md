@@ -8,6 +8,7 @@
 - `VecSrc` indexes its features in an R-tree at open and clips only the candidates a tile read can reach, instead of scanning the whole collection per tile. The filter is exact: simplification only removes vertices, so a feature whose raw envelope misses the window has no fragment of it to give
 - `VecClip` delegates the cut to topoi's `clip_to_boundary`, the same code moved upstream so geodukt's clip can converge on it, no behaviour change here
 - lines now follow the half-open tile membership rule points already followed: rect clipping is closed on all four edges, so a line lying exactly on a seam used to land in both neighbouring tiles and come back from a full-extent pull doubled, as a multilinestring of two identical parts. a clipped part sitting entirely on an excluded edge (max_x or min_y) now goes to the neighbour that owns that edge
+- a pull whose window implies more than 2^20 tiles fails with `PullTooLarge` instead of enumerating the key vector, which on a mis-scaled source grid could abort the process before any other bound applied
 
 ## 2026-08-03
 

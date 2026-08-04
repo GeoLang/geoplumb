@@ -103,14 +103,20 @@ impl GridSpec {
         }
     }
 
-    /// chunk keys covering the bbox at the given level, row-major
-    pub fn cover(&self, bbox: &Bbox, level: u8) -> Vec<ChunkKey> {
+    /// tile index bounds covering the bbox at a level, inclusive
+    pub(crate) fn tile_range(&self, bbox: &Bbox, level: u8) -> (i64, i64, i64, i64) {
         let size = self.chunk_ground_size(level);
         let eps = size * 1e-9;
         let ix0 = ((bbox.min_x - self.origin_x + eps) / size).floor() as i64;
         let ix1 = ((bbox.max_x - self.origin_x - eps) / size).floor() as i64;
         let iy0 = ((self.origin_y - bbox.max_y + eps) / size).floor() as i64;
         let iy1 = ((self.origin_y - bbox.min_y - eps) / size).floor() as i64;
+        (ix0, ix1, iy0, iy1)
+    }
+
+    /// chunk keys covering the bbox at the given level, row-major
+    pub fn cover(&self, bbox: &Bbox, level: u8) -> Vec<ChunkKey> {
+        let (ix0, ix1, iy0, iy1) = self.tile_range(bbox, level);
         let mut keys = Vec::new();
         for iy in iy0..=iy1 {
             for ix in ix0..=ix1 {

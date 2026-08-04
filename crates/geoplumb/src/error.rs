@@ -25,6 +25,8 @@ pub enum Error {
     Projection(String),
     #[error("chunk kind mismatch: expected {0}")]
     Kind(&'static str),
+    #[error("pull covers {tiles} tiles, over the {cap} cap")]
+    PullTooLarge { tiles: i128, cap: i128 },
     #[error(transparent)]
     Terrano(#[from] terrano_core::Error),
 }

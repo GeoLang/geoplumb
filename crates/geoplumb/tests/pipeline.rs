@@ -331,3 +331,27 @@ async fn reprojected_tile_matches_source_values() {
         "tile center {center} vs analytic {expected}"
     );
 }
+
+#[tokio::test]
+async fn an_absurd_pull_fails_instead_of_enumerating() {
+    let cell = 1e-12;
+    let px = Raster::from_vec(1, 1, vec![0.0], cell, f64::NAN).unwrap();
+    let src = RasterSrc::new(BandedRaster::new(vec![px]).unwrap(), 0.0, 1.0, Crs::WGS84);
+    let mut g = Graph::new();
+    let s = g.add_source(Box::new(src));
+    let engine = Engine::new(g, 16 << 20).unwrap();
+    let err = engine
+        .pull(
+            s,
+            WindowReq {
+                bbox: Bbox::new(0.0, 0.0, 1.0, 1.0),
+                resolution: cell,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, geoplumb::Error::PullTooLarge { .. }),
+        "unexpected error: {err}"
+    );
+}
