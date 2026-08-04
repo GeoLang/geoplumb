@@ -268,11 +268,12 @@ fn polygon_coord_count(p: &Polygon) -> usize {
             .sum::<usize>()
 }
 
-/// clip one geometry to a tile window. points use the tile membership
-/// convention, lines split into parts where they leave the window, polygon
-/// rings clip independently (Sutherland-Hodgman, exact float math), which
-/// keeps even-odd fill correct for pixel centers inside the window. multi
-/// geometries and collections stay one fragment, holding whatever survived
+/// clip one geometry to a tile window. points and lines use the tile
+/// membership convention, lines splitting into parts where they leave the
+/// window, polygon rings clip independently (Sutherland-Hodgman, exact
+/// float math), which keeps even-odd fill correct for pixel centers inside
+/// the window. multi geometries and collections stay one fragment, holding
+/// whatever survived
 pub fn clip_geometry(geometry: &FeatureGeometry, bbox: &Bbox) -> Vec<FeatureGeometry> {
     match geometry {
         FeatureGeometry::Point(p) => {
@@ -295,19 +296,15 @@ pub fn clip_geometry(geometry: &FeatureGeometry, bbox: &Bbox) -> Vec<FeatureGeom
                 vec![FeatureGeometry::MultiPoint(MultiPoint::new(kept))]
             }
         }
-        FeatureGeometry::LineString(l) => {
-            clip_linestring_rect(l.coords(), bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)
-                .into_iter()
-                .map(|part| FeatureGeometry::LineString(LineString::new(part)))
-                .collect()
-        }
+        FeatureGeometry::LineString(l) => clip_line_parts(l.coords(), bbox)
+            .into_iter()
+            .map(|part| FeatureGeometry::LineString(LineString::new(part)))
+            .collect(),
         FeatureGeometry::MultiLineString(mls) => {
             let parts: Vec<LineString> = mls
                 .linestrings()
                 .iter()
-                .flat_map(|l| {
-                    clip_linestring_rect(l.coords(), bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)
-                })
+                .flat_map(|l| clip_line_parts(l.coords(), bbox))
                 .map(LineString::new)
                 .collect();
             if parts.is_empty() {
@@ -346,6 +343,23 @@ pub fn clip_geometry(geometry: &FeatureGeometry, bbox: &Bbox) -> Vec<FeatureGeom
             }
         }
     }
+}
+
+/// tile membership for lines, the half-open rule points already follow.
+/// rect clipping is closed on all four sides, so a line lying exactly on a
+/// seam survives in both neighbouring tiles: drop the parts that sit
+/// entirely on an excluded edge, since the neighbour holds that edge as its
+/// min_x or max_y and keeps them. parts of fewer than two coords carry no
+/// length and go too
+fn clip_line_parts(coords: &[Coord], bbox: &Bbox) -> Vec<Vec<Coord>> {
+    clip_linestring_rect(coords, bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)
+        .into_iter()
+        .filter(|part| {
+            part.len() >= 2
+                && !part.iter().all(|c| c.x == bbox.max_x)
+                && !part.iter().all(|c| c.y == bbox.min_y)
+        })
+        .collect()
 }
 
 fn clip_polygon_to(p: &Polygon, bbox: &Bbox) -> Option<Polygon> {

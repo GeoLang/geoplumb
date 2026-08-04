@@ -211,6 +211,120 @@ async fn pull_window(chunk_px: u32) -> VectorChunk {
         .unwrap()
 }
 
+/// an anchor polygon fixing the grid at (0, 32) plus three lines that lie
+/// exactly on a seam: one on the interior x=8 seam, one along the
+/// envelope's east edge, one along its south edge
+fn seam_collection() -> FeatureCollection {
+    FeatureCollection {
+        features: vec![
+            feature(
+                FeatureGeometry::Polygon(Polygon::new(rect(0.0, 8.0, 16.0, 32.0), vec![])),
+                props(&[("kind", json!("anchor"))]),
+            ),
+            feature(
+                FeatureGeometry::LineString(LineString::new(along(&[(8.0, 12.0), (8.0, 28.0)]))),
+                props(&[("kind", json!("seam"))]),
+            ),
+            feature(
+                FeatureGeometry::LineString(LineString::new(along(&[(16.0, 12.0), (16.0, 28.0)]))),
+                props(&[("kind", json!("east"))]),
+            ),
+            feature(
+                FeatureGeometry::LineString(LineString::new(along(&[(2.0, 8.0), (14.0, 8.0)]))),
+                props(&[("kind", json!("south"))]),
+            ),
+        ],
+    }
+}
+
+async fn seam_pull(window: Bbox) -> VectorChunk {
+    let mut g = Graph::new();
+    let vec = g.add_source(Box::new(
+        VecSrc::new(seam_collection(), Crs::WGS84).unwrap(),
+    ));
+    g.add_transform(vec, Box::new(VecChunks(8)));
+    let engine = Engine::new(g, 64 << 20).unwrap();
+    assert_eq!(engine.grid(vec).base_resolution, 1.0);
+    assert_eq!(engine.grid(vec).origin_x, 0.0);
+    assert_eq!(engine.grid(vec).origin_y, 32.0);
+    engine
+        .pull(
+            vec,
+            WindowReq {
+                bbox: window,
+                resolution: 1.0,
+            },
+        )
+        .await
+        .unwrap()
+        .into_vector()
+        .unwrap()
+}
+
+fn one_line(chunk: &VectorChunk, id: u64) -> Vec<Coord> {
+    let merged = chunk.dissolve();
+    let feature = merged
+        .features
+        .iter()
+        .find(|f| f.id == id)
+        .unwrap_or_else(|| panic!("feature {id} is missing from the pull"));
+    match &feature.geometry {
+        FeatureGeometry::LineString(l) => l.coords().to_vec(),
+        other => panic!("feature {id} came back as {other:?}, not one linestring"),
+    }
+}
+
+/// a line lying along a seam is inside both neighbouring tiles as far as
+/// rect clipping is concerned, so without the membership rule it comes back
+/// doubled: two identical parts the stitch cannot join head to tail
+#[tokio::test]
+async fn a_line_on_an_interior_seam_is_not_duplicated() {
+    let pulled = seam_pull(Bbox::new(0.0, 8.0, 16.0, 32.0)).await;
+    assert_eq!(
+        pulled.features.iter().filter(|f| f.id == 1).count(),
+        3,
+        "one fragment per tile row, not one per row and column"
+    );
+    assert_eq!(one_line(&pulled, 1), along(&[(8.0, 12.0), (8.0, 28.0)]));
+}
+
+/// the geodukt driver widens a full-extent window past max_x and min_y to
+/// take in the features on those edges, which must not double them
+#[tokio::test]
+async fn a_line_on_a_widened_window_edge_appears_once() {
+    let east = seam_pull(Bbox::new(0.0, 8.0, 17.0, 32.0)).await;
+    assert_eq!(
+        east.features.iter().filter(|f| f.id == 2).count(),
+        3,
+        "the east edge line belongs to the tiles starting at x=16"
+    );
+    assert_eq!(one_line(&east, 2), along(&[(16.0, 12.0), (16.0, 28.0)]));
+
+    let south = seam_pull(Bbox::new(0.0, 7.0, 17.0, 32.0)).await;
+    assert_eq!(
+        south.features.iter().filter(|f| f.id == 3).count(),
+        2,
+        "the south edge line belongs to the tile row ending at y=8"
+    );
+    assert_eq!(one_line(&south, 3), along(&[(2.0, 8.0), (14.0, 8.0)]));
+}
+
+/// same rule seen from the window: a line on the excluded edge belongs to
+/// the neighbouring tile, exactly as a point there does
+#[tokio::test]
+async fn a_line_on_the_windows_excluded_edge_is_absent() {
+    let clipped_at_the_seam = seam_pull(Bbox::new(0.0, 8.0, 8.0, 32.0)).await;
+    assert!(
+        !clipped_at_the_seam.features.iter().any(|f| f.id == 1),
+        "the line on the window's max_x edge is the neighbour's"
+    );
+    let clipped_at_the_south = seam_pull(Bbox::new(0.0, 8.0, 17.0, 32.0)).await;
+    assert!(
+        !clipped_at_the_south.features.iter().any(|f| f.id == 3),
+        "the line on the window's min_y edge is the neighbour's"
+    );
+}
+
 #[tokio::test]
 async fn dissolve_merges_the_fragments_of_each_feature() {
     let fragments = pull_window(8).await;
