@@ -1,4 +1,5 @@
 pub mod algebra;
+pub mod band_math;
 pub mod cog;
 pub mod mosaic;
 pub mod points;
@@ -11,6 +12,7 @@ pub mod vec_ops;
 pub mod vector;
 
 pub use algebra::{Combine, MapAlgebra};
+pub use band_math::BandMath;
 pub use cog::{CogSrc, HttpRange};
 pub use mosaic::Mosaic;
 pub use points::{IdwGrid, LasSrc};
