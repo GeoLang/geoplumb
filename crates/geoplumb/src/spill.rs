@@ -14,7 +14,9 @@ use crate::window::{Bbox, ChunkKey};
 use nubis_core::{Classification, Point3, PointCloud};
 use terrano_core::{BandedRaster, Raster};
 use topoi_core::geojson::FeatureGeometry;
-use topoi_core::{Coord, LineString, MultiPolygon, Point, Polygon, Ring};
+use topoi_core::{
+    Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon, Ring,
+};
 
 const MAGIC: u32 = 0x47504C43;
 const VERSION: u16 = 2;
@@ -26,6 +28,9 @@ const GEOM_POINT: u8 = 0;
 const GEOM_LINESTRING: u8 = 1;
 const GEOM_POLYGON: u8 = 2;
 const GEOM_MULTIPOLYGON: u8 = 3;
+const GEOM_MULTIPOINT: u8 = 4;
+const GEOM_MULTILINESTRING: u8 = 5;
+const GEOM_COLLECTION: u8 = 6;
 
 pub(crate) struct SpillStore {
     dir: PathBuf,
@@ -134,9 +139,26 @@ fn write_geometry(f: &mut impl Write, geometry: &FeatureGeometry) -> std::io::Re
             f.write_all(&p.0.x.to_le_bytes())?;
             f.write_all(&p.0.y.to_le_bytes())
         }
+        FeatureGeometry::MultiPoint(mp) => {
+            f.write_all(&[GEOM_MULTIPOINT])?;
+            f.write_all(&(mp.points().len() as u32).to_le_bytes())?;
+            for p in mp.points() {
+                f.write_all(&p.0.x.to_le_bytes())?;
+                f.write_all(&p.0.y.to_le_bytes())?;
+            }
+            Ok(())
+        }
         FeatureGeometry::LineString(l) => {
             f.write_all(&[GEOM_LINESTRING])?;
             write_coords(f, l.coords())
+        }
+        FeatureGeometry::MultiLineString(mls) => {
+            f.write_all(&[GEOM_MULTILINESTRING])?;
+            f.write_all(&(mls.linestrings().len() as u32).to_le_bytes())?;
+            for l in mls.linestrings() {
+                write_coords(f, l.coords())?;
+            }
+            Ok(())
         }
         FeatureGeometry::Polygon(p) => {
             f.write_all(&[GEOM_POLYGON])?;
@@ -147,6 +169,14 @@ fn write_geometry(f: &mut impl Write, geometry: &FeatureGeometry) -> std::io::Re
             f.write_all(&(mp.polygons().len() as u32).to_le_bytes())?;
             for p in mp.polygons() {
                 write_polygon(f, p)?;
+            }
+            Ok(())
+        }
+        FeatureGeometry::GeometryCollection(members) => {
+            f.write_all(&[GEOM_COLLECTION])?;
+            f.write_all(&(members.len() as u32).to_le_bytes())?;
+            for m in members {
+                write_geometry(f, m)?;
             }
             Ok(())
         }
@@ -310,9 +340,27 @@ fn read_polygon(f: &mut impl Read) -> std::io::Result<Polygon> {
 fn read_geometry(f: &mut impl Read) -> std::io::Result<Option<FeatureGeometry>> {
     Ok(match rd::<1>(f)?[0] {
         GEOM_POINT => Some(FeatureGeometry::Point(Point::new(rd_f64(f)?, rd_f64(f)?))),
+        GEOM_MULTIPOINT => {
+            let n = rd_u32(f)? as usize;
+            let mut points = Vec::with_capacity(n.min(1 << 20));
+            for _ in 0..n {
+                points.push(Point::new(rd_f64(f)?, rd_f64(f)?));
+            }
+            Some(FeatureGeometry::MultiPoint(MultiPoint::new(points)))
+        }
         GEOM_LINESTRING => Some(FeatureGeometry::LineString(LineString::new(read_coords(
             f,
         )?))),
+        GEOM_MULTILINESTRING => {
+            let n = rd_u32(f)? as usize;
+            let mut lines = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                lines.push(LineString::new(read_coords(f)?));
+            }
+            Some(FeatureGeometry::MultiLineString(MultiLineString::new(
+                lines,
+            )))
+        }
         GEOM_POLYGON => Some(FeatureGeometry::Polygon(read_polygon(f)?)),
         GEOM_MULTIPOLYGON => {
             let n = rd_u32(f)? as usize;
@@ -321,6 +369,17 @@ fn read_geometry(f: &mut impl Read) -> std::io::Result<Option<FeatureGeometry>> 
                 polys.push(read_polygon(f)?);
             }
             Some(FeatureGeometry::MultiPolygon(MultiPolygon::new(polys)))
+        }
+        GEOM_COLLECTION => {
+            let n = rd_u32(f)? as usize;
+            let mut members = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                match read_geometry(f)? {
+                    Some(m) => members.push(m),
+                    None => return Ok(None),
+                }
+            }
+            Some(FeatureGeometry::GeometryCollection(members))
         }
         _ => None,
     })

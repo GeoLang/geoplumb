@@ -16,7 +16,10 @@ use crate::window::{GridSpec, WindowReq};
 use futures::future::BoxFuture;
 use terrano_core::{BandedRaster, Raster};
 use topoi_core::geojson::{FeatureCollection, FeatureGeometry};
-use topoi_core::{Coord, GridWindow, LineString, MultiPolygon, Polygon, Ring, rasterize, simplify};
+use topoi_core::{
+    Coord, GridWindow, LineString, MultiLineString, MultiPolygon, Polygon, Ring, rasterize,
+    simplify,
+};
 
 /// in-memory feature source. a level simplifies whole features first
 /// (douglas-peucker at the level's resolution, deterministic, so every tile
@@ -154,10 +157,19 @@ fn geometry_envelope(geometry: &FeatureGeometry) -> (f64, f64, f64, f64) {
 fn all_coords(geometry: &FeatureGeometry) -> Vec<Coord> {
     match geometry {
         FeatureGeometry::Point(p) => vec![p.0],
+        FeatureGeometry::MultiPoint(mp) => mp.points().iter().map(|p| p.0).collect(),
         FeatureGeometry::LineString(l) => l.coords().to_vec(),
+        FeatureGeometry::MultiLineString(mls) => mls
+            .linestrings()
+            .iter()
+            .flat_map(|l| l.coords().iter().copied())
+            .collect(),
         FeatureGeometry::Polygon(p) => polygon_coords(p),
         FeatureGeometry::MultiPolygon(mp) => {
             mp.polygons().iter().flat_map(polygon_coords).collect()
+        }
+        FeatureGeometry::GeometryCollection(members) => {
+            members.iter().flat_map(all_coords).collect()
         }
     }
 }
@@ -172,10 +184,16 @@ fn polygon_coords(p: &Polygon) -> Vec<Coord> {
 
 fn segment_lengths(geometry: &FeatureGeometry) -> Vec<f64> {
     let rings: Vec<&[Coord]> = match geometry {
-        FeatureGeometry::Point(_) => Vec::new(),
+        FeatureGeometry::Point(_) | FeatureGeometry::MultiPoint(_) => Vec::new(),
         FeatureGeometry::LineString(l) => vec![l.coords()],
+        FeatureGeometry::MultiLineString(mls) => {
+            mls.linestrings().iter().map(|l| l.coords()).collect()
+        }
         FeatureGeometry::Polygon(p) => polygon_rings(p),
         FeatureGeometry::MultiPolygon(mp) => mp.polygons().iter().flat_map(polygon_rings).collect(),
+        FeatureGeometry::GeometryCollection(members) => {
+            return members.iter().flat_map(segment_lengths).collect();
+        }
     };
     rings
         .iter()
@@ -190,19 +208,38 @@ fn polygon_rings(p: &Polygon) -> Vec<&[Coord]> {
 }
 
 /// simplify whole features for a ladder level, dropping features smaller
-/// than a pixel. points are exempt from the drop
+/// than a pixel. points and multipoints are exempt from the drop, and a
+/// collection is measured whole, so a small member rides along with a big one
 fn simplify_geometry(geometry: &FeatureGeometry, resolution: f64) -> Option<FeatureGeometry> {
-    if !matches!(geometry, FeatureGeometry::Point(_)) {
+    if !matches!(
+        geometry,
+        FeatureGeometry::Point(_) | FeatureGeometry::MultiPoint(_)
+    ) {
         let env = geometry_envelope(geometry);
         if (env.2 - env.0).max(env.3 - env.1) < resolution {
             return None;
         }
     }
+    simplify_parts(geometry, resolution)
+}
+
+fn simplify_parts(geometry: &FeatureGeometry, resolution: f64) -> Option<FeatureGeometry> {
     match geometry {
         FeatureGeometry::Point(p) => Some(FeatureGeometry::Point(*p)),
+        FeatureGeometry::MultiPoint(mp) => Some(FeatureGeometry::MultiPoint(mp.clone())),
         FeatureGeometry::LineString(l) => Some(FeatureGeometry::LineString(LineString::new(
             simplify(l.coords(), resolution),
         ))),
+        FeatureGeometry::MultiLineString(mls) => {
+            let lines = mls
+                .linestrings()
+                .iter()
+                .map(|l| LineString::new(simplify(l.coords(), resolution)))
+                .collect();
+            Some(FeatureGeometry::MultiLineString(MultiLineString::new(
+                lines,
+            )))
+        }
         FeatureGeometry::Polygon(p) => {
             simplify_polygon(p, resolution).map(FeatureGeometry::Polygon)
         }
@@ -213,6 +250,13 @@ fn simplify_geometry(geometry: &FeatureGeometry, resolution: f64) -> Option<Feat
                 .filter_map(|p| simplify_polygon(p, resolution))
                 .collect();
             (!polys.is_empty()).then(|| FeatureGeometry::MultiPolygon(MultiPolygon::new(polys)))
+        }
+        FeatureGeometry::GeometryCollection(members) => {
+            let kept: Vec<FeatureGeometry> = members
+                .iter()
+                .filter_map(|m| simplify_parts(m, resolution))
+                .collect();
+            (!kept.is_empty()).then_some(FeatureGeometry::GeometryCollection(kept))
         }
     }
 }

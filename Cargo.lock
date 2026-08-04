@@ -1282,7 +1282,7 @@ dependencies = [
 [[package]]
 name = "topoi-core"
 version = "0.1.0"
-source = "git+https://github.com/GeoLang/topoi.git?branch=master#7b23cf2e7a003ed65c1840d9a6f8dbdcbde45f68"
+source = "git+https://github.com/GeoLang/topoi.git?branch=master#945a63e37f7f01c5e75572a3ce92f83330d2b9d3"
 dependencies = [
  "i_overlay",
  "serde",

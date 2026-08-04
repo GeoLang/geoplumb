@@ -11,7 +11,7 @@ use geoplumb::element::{Source, Transform};
 use geoplumb::elements::{Burn, Hillshade, Rasterize, VecSrc};
 use geoplumb::{Bbox, Caps, Chunk, Crs, Engine, Error, Graph, WindowReq};
 use topoi_core::geojson::{Feature, FeatureCollection, FeatureGeometry};
-use topoi_core::{Coord, LineString, Point, Polygon, Ring};
+use topoi_core::{Coord, LineString, MultiLineString, MultiPoint, Point, Polygon, Ring};
 
 /// insert vertices every ~0.9 units so the median segment length, and with
 /// it the source's base resolution, is well below the feature sizes
@@ -49,7 +49,8 @@ fn feature(geometry: FeatureGeometry, properties: HashMap<String, serde_json::Va
 }
 
 /// polygon with a hole, a bent line, a point, a value-less polygon the burn
-/// skips, and a sub-pixel square that coarse levels drop
+/// skips, a sub-pixel square that coarse levels drop, then one feature per
+/// multi kind and a mixed collection
 fn collection() -> FeatureCollection {
     let holed = Polygon::new(
         ring(&[(4.3, 4.2), (40.7, 4.2), (40.7, 30.6), (4.3, 30.6)]),
@@ -71,6 +72,18 @@ fn collection() -> FeatureCollection {
         ]),
         vec![],
     );
+    let strands = MultiLineString::new(vec![
+        LineString::new(densify(&[(5.3, 12.7), (30.1, 20.3)])),
+        LineString::new(densify(&[(8.4, 38.6), (46.2, 41.1)])),
+    ]);
+    let scatter = MultiPoint::new(vec![Point::new(15.3, 25.7), Point::new(38.9, 51.3)]);
+    let mixed = vec![
+        FeatureGeometry::Polygon(Polygon::new(
+            ring(&[(44.1, 12.3), (51.7, 12.3), (51.7, 19.9), (44.1, 19.9)]),
+            vec![],
+        )),
+        FeatureGeometry::LineString(LineString::new(densify(&[(34.2, 24.6), (52.6, 30.4)]))),
+    ];
     FeatureCollection {
         features: vec![
             feature(FeatureGeometry::Polygon(holed), props(3.0)),
@@ -84,6 +97,9 @@ fn collection() -> FeatureCollection {
                 HashMap::new(),
             ),
             feature(FeatureGeometry::Polygon(tiny), props(1.0)),
+            feature(FeatureGeometry::MultiLineString(strands), props(7.0)),
+            feature(FeatureGeometry::MultiPoint(scatter), props(6.0)),
+            feature(FeatureGeometry::GeometryCollection(mixed), props(2.0)),
         ],
     }
 }
@@ -130,15 +146,24 @@ fn fragment_coord_count(chunk: &geoplumb::VectorChunk) -> usize {
     chunk
         .features
         .iter()
-        .map(|f| match &f.geometry {
-            FeatureGeometry::Point(_) => 1,
-            FeatureGeometry::LineString(l) => l.coords().len(),
-            FeatureGeometry::Polygon(p) => polygon_coord_count(p),
-            FeatureGeometry::MultiPolygon(mp) => {
-                mp.polygons().iter().map(polygon_coord_count).sum()
-            }
-        })
+        .map(|f| geometry_coord_count(&f.geometry))
         .sum()
+}
+
+fn geometry_coord_count(geometry: &FeatureGeometry) -> usize {
+    match geometry {
+        FeatureGeometry::Point(_) => 1,
+        FeatureGeometry::MultiPoint(mp) => mp.points().len(),
+        FeatureGeometry::LineString(l) => l.coords().len(),
+        FeatureGeometry::MultiLineString(mls) => {
+            mls.linestrings().iter().map(|l| l.coords().len()).sum()
+        }
+        FeatureGeometry::Polygon(p) => polygon_coord_count(p),
+        FeatureGeometry::MultiPolygon(mp) => mp.polygons().iter().map(polygon_coord_count).sum(),
+        FeatureGeometry::GeometryCollection(members) => {
+            members.iter().map(geometry_coord_count).sum()
+        }
+    }
 }
 
 fn polygon_coord_count(p: &Polygon) -> usize {
@@ -285,6 +310,9 @@ async fn chunked_rasterize_matches_the_whole_window_reference() {
     }
     assert!(band.data().contains(&3.0), "polygon fill must appear");
     assert!(band.data().contains(&9.0), "line burn must appear");
+    assert!(band.data().contains(&7.0), "multilinestring must appear");
+    assert!(band.data().contains(&6.0), "multipoint must appear");
+    assert!(band.data().contains(&2.0), "collection must appear");
 }
 
 /// counts source reads so the spill test can tell a disk reload from a
@@ -311,8 +339,8 @@ impl Source for CountingVec {
 
 #[tokio::test]
 async fn vector_chunks_spill_to_disk_and_reload() {
-    // size the budget between one level-0 chunk and two pulls, forcing a
-    // demotion to disk
+    // the budget holds the level-0 chunk and nothing more, so the coarse
+    // pull evicts it and the second fine pull has to come off disk
     let probe = src();
     let bbox = Bbox::new(2.2, 4.2, 60.1, 60.2);
     let base = probe.grid().base_resolution;
@@ -320,7 +348,7 @@ async fn vector_chunks_spill_to_disk_and_reload() {
         bbox,
         resolution: base,
     };
-    let budget = probe.read(&fine).await.unwrap().byte_size() + 512;
+    let budget = probe.read(&fine).await.unwrap().byte_size();
 
     let reads = Arc::new(AtomicUsize::new(0));
     let mut g = Graph::new();
@@ -345,25 +373,60 @@ async fn vector_chunks_spill_to_disk_and_reload() {
     );
 
     let key = |f: &geoplumb::VectorFeature| {
-        let coords: Vec<(u64, u64)> = match &f.geometry {
-            FeatureGeometry::Point(p) => vec![(p.0.x.to_bits(), p.0.y.to_bits())],
-            FeatureGeometry::LineString(l) => l
-                .coords()
-                .iter()
-                .map(|c| (c.x.to_bits(), c.y.to_bits()))
-                .collect(),
-            FeatureGeometry::Polygon(p) => polygon_bits(p),
-            FeatureGeometry::MultiPolygon(mp) => {
-                mp.polygons().iter().flat_map(polygon_bits).collect()
-            }
-        };
-        (f.id, coords, f.properties.len())
+        (
+            f.id,
+            geometry_shape(&f.geometry),
+            geometry_bits(&f.geometry),
+            f.properties.len(),
+        )
     };
     let mut a: Vec<_> = first.features.iter().map(key).collect();
     let mut b: Vec<_> = again.features.iter().map(key).collect();
     a.sort();
     b.sort();
     assert_eq!(a, b, "reloaded fragments differ from the computed ones");
+}
+
+fn geometry_bits(geometry: &FeatureGeometry) -> Vec<(u64, u64)> {
+    let bits = |c: &Coord| (c.x.to_bits(), c.y.to_bits());
+    match geometry {
+        FeatureGeometry::Point(p) => vec![bits(&p.0)],
+        FeatureGeometry::MultiPoint(mp) => mp.points().iter().map(|p| bits(&p.0)).collect(),
+        FeatureGeometry::LineString(l) => l.coords().iter().map(bits).collect(),
+        FeatureGeometry::MultiLineString(mls) => mls
+            .linestrings()
+            .iter()
+            .flat_map(|l| l.coords().iter().map(bits))
+            .collect(),
+        FeatureGeometry::Polygon(p) => polygon_bits(p),
+        FeatureGeometry::MultiPolygon(mp) => mp.polygons().iter().flat_map(polygon_bits).collect(),
+        FeatureGeometry::GeometryCollection(members) => {
+            members.iter().flat_map(geometry_bits).collect()
+        }
+    }
+}
+
+/// variant and part counts, so a spill roundtrip that reloads the right
+/// coordinates under the wrong geometry kind still fails
+fn geometry_shape(geometry: &FeatureGeometry) -> String {
+    match geometry {
+        FeatureGeometry::Point(_) => "point".to_string(),
+        FeatureGeometry::MultiPoint(mp) => format!("multipoint{}", mp.points().len()),
+        FeatureGeometry::LineString(_) => "linestring".to_string(),
+        FeatureGeometry::MultiLineString(mls) => {
+            format!("multilinestring{}", mls.linestrings().len())
+        }
+        FeatureGeometry::Polygon(p) => format!("polygon{}", p.interiors().len()),
+        FeatureGeometry::MultiPolygon(mp) => format!("multipolygon{}", mp.polygons().len()),
+        FeatureGeometry::GeometryCollection(members) => format!(
+            "collection[{}]",
+            members
+                .iter()
+                .map(geometry_shape)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
 }
 
 fn polygon_bits(p: &Polygon) -> Vec<(u64, u64)> {

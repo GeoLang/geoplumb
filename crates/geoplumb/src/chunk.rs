@@ -10,7 +10,8 @@ use nubis_core::{Point3, PointCloud};
 use terrano_core::{BandedRaster, Raster};
 use topoi_core::geojson::FeatureGeometry;
 use topoi_core::{
-    LineString, MultiPolygon, Point, Polygon, Ring, clip_linestring_rect, clip_polygon_rect,
+    LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon, Ring,
+    clip_linestring_rect, clip_polygon_rect,
 };
 
 #[derive(Debug, Clone)]
@@ -186,9 +187,16 @@ impl VectorChunk {
 fn geometry_coord_count(geometry: &FeatureGeometry) -> usize {
     match geometry {
         FeatureGeometry::Point(_) => 1,
+        FeatureGeometry::MultiPoint(mp) => mp.points().len(),
         FeatureGeometry::LineString(l) => l.coords().len(),
+        FeatureGeometry::MultiLineString(mls) => {
+            mls.linestrings().iter().map(|l| l.coords().len()).sum()
+        }
         FeatureGeometry::Polygon(p) => polygon_coord_count(p),
         FeatureGeometry::MultiPolygon(mp) => mp.polygons().iter().map(polygon_coord_count).sum(),
+        FeatureGeometry::GeometryCollection(members) => {
+            members.iter().map(geometry_coord_count).sum()
+        }
     }
 }
 
@@ -203,7 +211,8 @@ fn polygon_coord_count(p: &Polygon) -> usize {
 /// clip one geometry to a tile window. points use the tile membership
 /// convention, lines split into parts where they leave the window, polygon
 /// rings clip independently (Sutherland-Hodgman, exact float math), which
-/// keeps even-odd fill correct for pixel centers inside the window
+/// keeps even-odd fill correct for pixel centers inside the window. multi
+/// geometries and collections stay one fragment, holding whatever survived
 pub fn clip_geometry(geometry: &FeatureGeometry, bbox: &Bbox) -> Vec<FeatureGeometry> {
     match geometry {
         FeatureGeometry::Point(p) => {
@@ -213,11 +222,41 @@ pub fn clip_geometry(geometry: &FeatureGeometry, bbox: &Bbox) -> Vec<FeatureGeom
                 Vec::new()
             }
         }
+        FeatureGeometry::MultiPoint(mp) => {
+            let kept: Vec<Point> = mp
+                .points()
+                .iter()
+                .filter(|p| tile_contains(bbox, p.0.x, p.0.y))
+                .copied()
+                .collect();
+            if kept.is_empty() {
+                Vec::new()
+            } else {
+                vec![FeatureGeometry::MultiPoint(MultiPoint::new(kept))]
+            }
+        }
         FeatureGeometry::LineString(l) => {
             clip_linestring_rect(l.coords(), bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)
                 .into_iter()
                 .map(|part| FeatureGeometry::LineString(LineString::new(part)))
                 .collect()
+        }
+        FeatureGeometry::MultiLineString(mls) => {
+            let parts: Vec<LineString> = mls
+                .linestrings()
+                .iter()
+                .flat_map(|l| {
+                    clip_linestring_rect(l.coords(), bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)
+                })
+                .map(LineString::new)
+                .collect();
+            if parts.is_empty() {
+                Vec::new()
+            } else {
+                vec![FeatureGeometry::MultiLineString(MultiLineString::new(
+                    parts,
+                ))]
+            }
         }
         FeatureGeometry::Polygon(p) => clip_polygon_to(p, bbox)
             .map(FeatureGeometry::Polygon)
@@ -233,6 +272,17 @@ pub fn clip_geometry(geometry: &FeatureGeometry, bbox: &Bbox) -> Vec<FeatureGeom
                 Vec::new()
             } else {
                 vec![FeatureGeometry::MultiPolygon(MultiPolygon::new(polys))]
+            }
+        }
+        FeatureGeometry::GeometryCollection(members) => {
+            let kept: Vec<FeatureGeometry> = members
+                .iter()
+                .flat_map(|m| clip_geometry(m, bbox))
+                .collect();
+            if kept.is_empty() {
+                Vec::new()
+            } else {
+                vec![FeatureGeometry::GeometryCollection(kept)]
             }
         }
     }
