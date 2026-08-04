@@ -209,6 +209,65 @@ async fn range_handler(
     )
 }
 
+async fn flaky_handler(
+    State((bytes, hits)): State<(Arc<Vec<u8>>, Arc<AtomicUsize>)>,
+    headers: HeaderMap,
+) -> (StatusCode, Vec<u8>) {
+    if hits.fetch_add(1, Ordering::SeqCst) < 2 {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Vec::new());
+    }
+    range_handler(State(bytes), headers).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_transport_retries_transient_faults() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route("/dem.tif", get(flaky_handler))
+        .with_state((Arc::new(cog_bytes(2)), hits.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let url = format!("http://{addr}/dem.tif");
+    let src = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(url)))
+        .await
+        .unwrap()
+        .unwrap();
+    let req = WindowReq {
+        bbox: window(20, 20, 340, 230),
+        resolution: CELL,
+    };
+    let a = src.read(&req).await.unwrap().into_raster().unwrap();
+    let (mem, mn) = engine_of(mem_src());
+    let b = mem.pull(mn, req).await.unwrap().into_raster().unwrap();
+    assert_bands_close(&a, &b, 1e-12);
+    assert!(hits.load(Ordering::SeqCst) > 2, "server never recovered");
+}
+
+async fn missing_handler(State(hits): State<Arc<AtomicUsize>>) -> StatusCode {
+    hits.fetch_add(1, Ordering::SeqCst);
+    StatusCode::NOT_FOUND
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_transport_does_not_retry_client_errors() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route("/dem.tif", get(missing_handler))
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let url = format!("http://{addr}/dem.tif");
+    let opened = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(url)))
+        .await
+        .unwrap();
+    assert!(opened.is_err());
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "404 must not retry");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_transport_feeds_the_engine() {
     let bytes = Arc::new(cog_bytes(2));

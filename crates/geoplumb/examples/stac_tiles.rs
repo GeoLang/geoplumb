@@ -1,7 +1,8 @@
 //! live hillshade tiles from a public stac collection, no local data:
 //! Copernicus DEM cogs stream in over http range requests as tiles are
-//! viewed. needs network. override the area with GEOPLUMB_BBOX
-//! (minlon,minlat,maxlon,maxlat), the api and collection with
+//! viewed. needs network. override the anchor area with GEOPLUMB_BBOX
+//! (minlon,minlat,maxlon,maxlat), tiles past it search lazily. set the
+//! api and collection with
 //! GEOPLUMB_STAC_API / GEOPLUMB_STAC_COLLECTION / GEOPLUMB_STAC_ASSET.
 
 use std::sync::Arc;

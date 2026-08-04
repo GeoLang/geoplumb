@@ -148,11 +148,15 @@ fn decimate(fine: &[f64], cols: usize, rows: usize, factor: usize) -> Vec<f64> {
 }
 
 /// range-request transport for remote cogs. blocking, so it must run off
-/// the async runtime, which `CogSrc::read` already does
+/// the async runtime, which `CogSrc::read` already does. transient faults
+/// (send errors, 5xx, 429, short or failed bodies) retry with backoff
 pub struct HttpRange {
     client: reqwest::blocking::Client,
     url: String,
 }
+
+const RANGE_ATTEMPTS: u32 = 3;
+const RANGE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
 impl HttpRange {
     pub fn new(url: impl Into<String>) -> Self {
@@ -160,6 +164,39 @@ impl HttpRange {
             client: reqwest::blocking::Client::new(),
             url: url.into(),
         }
+    }
+
+    /// one fetch attempt, the bool says whether the failure is transient
+    fn fetch(&self, offset: u64, len: u64) -> core::result::Result<Vec<u8>, (bool, String)> {
+        let end = offset + len - 1;
+        let resp = self
+            .client
+            .get(&self.url)
+            .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
+            .send()
+            .map_err(|e| (true, format!("range request failed: {e}")))?;
+        let status = resp.status();
+        if status.is_client_error() || status.is_server_error() {
+            let transient =
+                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            return Err((transient, format!("range request failed: status {status}")));
+        }
+        if status != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err((
+                false,
+                format!("server ignored the range header (status {status})"),
+            ));
+        }
+        let bytes = resp
+            .bytes()
+            .map_err(|e| (true, format!("range body read failed: {e}")))?;
+        if bytes.len() as u64 != len {
+            return Err((
+                true,
+                format!("range returned {} bytes, wanted {len}", bytes.len()),
+            ));
+        }
+        Ok(bytes.to_vec())
     }
 }
 
@@ -169,30 +206,20 @@ impl RangeRead for HttpRange {
         offset: u64,
         len: u64,
     ) -> core::result::Result<Vec<u8>, terrano_core::Error> {
-        let fail = |detail: String| terrano_core::Error::Format(detail);
-        let end = offset + len - 1;
-        let resp = self
-            .client
-            .get(&self.url)
-            .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
-            .send()
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| fail(format!("range request failed: {e}")))?;
-        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(fail(format!(
-                "server ignored the range header (status {})",
-                resp.status()
-            )));
+        let mut attempts = 0;
+        let mut delay = RANGE_BACKOFF;
+        loop {
+            match self.fetch(offset, len) {
+                Ok(bytes) => return Ok(bytes),
+                Err((transient, detail)) => {
+                    attempts += 1;
+                    if !transient || attempts == RANGE_ATTEMPTS {
+                        return Err(terrano_core::Error::Format(detail));
+                    }
+                    std::thread::sleep(delay);
+                    delay *= 4;
+                }
+            }
         }
-        let bytes = resp
-            .bytes()
-            .map_err(|e| fail(format!("range body read failed: {e}")))?;
-        if bytes.len() as u64 != len {
-            return Err(fail(format!(
-                "range returned {} bytes, wanted {len}",
-                bytes.len()
-            )));
-        }
-        Ok(bytes.to_vec())
     }
 }

@@ -2,6 +2,8 @@
 
 ## 2026-08-04
 
+- `StacSrc` searches lazily per pull in two-degree lon/lat blocks cached for the source's lifetime, items deduped by href across blocks, so coverage follows the pulls instead of the bbox given at open, which now only anchors the grid and crs. A block search filling a whole page fails rather than serving partial coverage, and a pull needing more than 32 cold block searches fails rather than mosaicking thousands of items
+- `HttpRange` retries transient faults (send errors, 5xx, 429, short or failed bodies) up to three attempts with 200ms/800ms backoff, permanent failures like 4xx still fail on the first attempt. Covers the observed S3 faults that 500ed a cold tile and succeeded on manual retry
 - geodukt executor prerequisites: `VectorChunk::dissolve` merges a pull's fragments back per feature id at the driver boundary (polygons unioned through topoi, lines stitched at their seam vertices, points and collection members merged classwise), proven against a polygon with a hole straddling two seams, a line that comes back with its source vertices and a multipoint split across three tiles
 - window-local vector to vector elements `VecFilter`, `VecSchema` and `VecClip`, each per fragment on an identity plan, with chunked output proven equal to whole-window output. `VecClip` cuts lines at their boundary crossings and drops points outside it rather than passing them through as geodukt's clip does
 - `VecReproject` and its adapter, registered alongside the raster one, so a crs demand on a vector link splices a vector reproject instead of failing negotiation. vertices project without densification, matching geodukt
