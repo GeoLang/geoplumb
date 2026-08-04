@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use tokio::sync::{broadcast, oneshot};
 
-use crate::caps::Caps;
+use crate::caps::{Caps, TensorCaps};
 use crate::chunk::{
-    Chunk, PointChunk, RasterChunk, VectorChunk, VectorFeature, clip_geometry, tile_contains,
+    Chunk, PointChunk, RasterChunk, TensorChunk, VectorChunk, VectorFeature, clip_geometry,
+    tile_contains,
 };
 use crate::element::{Fanin, Source, Transform};
 use crate::error::Result;
@@ -633,6 +634,13 @@ fn assemble(
                 features, *window, res, v.crs,
             )))
         }
+        Caps::Tensor(t) => {
+            let tensors: Vec<&TensorChunk> =
+                chunks.iter().map(|c| c.tensor()).collect::<Result<_>>()?;
+            Ok(Chunk::Tensor(assemble_tensor(
+                grid, keys, &tensors, window, res, t,
+            )))
+        }
     }
 }
 
@@ -691,6 +699,56 @@ fn assemble_raster(
         bbox: *window,
         resolution: res,
         crs: caps.raster().crs,
+    }
+}
+
+/// mosaic same-level tensor chunks into one tensor covering `window`
+fn assemble_tensor(
+    grid: &GridSpec,
+    keys: &[ChunkKey],
+    chunks: &[&TensorChunk],
+    window: &Bbox,
+    res: f64,
+    caps: &TensorCaps,
+) -> TensorChunk {
+    let cols = (window.width() / res).round() as usize;
+    let rows = (window.height() / res).round() as usize;
+    let channels = chunks.first().map_or(caps.channels, |c| c.channels) as usize;
+    let mut data = vec![f32::NAN; channels * cols * rows];
+    for (key, chunk) in keys.iter().zip(chunks) {
+        let cb = grid.chunk_bbox(*key);
+        let (w, h) = (chunk.width(), chunk.height());
+        for row in 0..h {
+            let y = cb.max_y - (row as f64 + 0.5) * res;
+            if y > window.max_y || y < window.min_y {
+                continue;
+            }
+            let out_row = ((window.max_y - y) / res).floor() as usize;
+            if out_row >= rows {
+                continue;
+            }
+            for col in 0..w {
+                let x = cb.min_x + (col as f64 + 0.5) * res;
+                if x < window.min_x || x > window.max_x {
+                    continue;
+                }
+                let out_col = ((x - window.min_x) / res).floor() as usize;
+                if out_col >= cols {
+                    continue;
+                }
+                for c in 0..channels {
+                    data[c * cols * rows + out_row * cols + out_col] =
+                        chunk.data[c * w * h + row * w + col];
+                }
+            }
+        }
+    }
+    TensorChunk {
+        data,
+        channels: channels as u16,
+        bbox: *window,
+        resolution: res,
+        crs: caps.crs,
     }
 }
 

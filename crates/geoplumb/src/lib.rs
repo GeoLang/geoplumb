@@ -21,7 +21,7 @@ pub mod tile;
 pub mod window;
 
 pub use caps::{Caps, CapsSet, Constraint, Crs};
-pub use chunk::{Chunk, PointChunk, RasterChunk, VectorChunk, VectorFeature};
+pub use chunk::{Chunk, PointChunk, RasterChunk, TensorChunk, VectorChunk, VectorFeature};
 pub use element::{Adapter, Fanin, Source, Transform};
 pub use engine::{Engine, Invalidation, materialize};
 pub use error::{Error, Result};

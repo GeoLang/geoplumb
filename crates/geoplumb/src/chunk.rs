@@ -53,12 +53,25 @@ pub struct VectorChunk {
     byte_size: usize,
 }
 
-/// the tensor variant is reserved here
+/// a georeferenced tensor over one tile window. `data` is contiguous CHW:
+/// channel-major, and inside a channel row-major with rows growing down
+/// from the top of the bbox, the raster order. its length is always
+/// channels * width * height, both derived from the bbox and resolution
+#[derive(Debug, Clone)]
+pub struct TensorChunk {
+    pub data: Vec<f32>,
+    pub channels: u16,
+    pub bbox: Bbox,
+    pub resolution: f64,
+    pub crs: Crs,
+}
+
 #[derive(Debug, Clone)]
 pub enum Chunk {
     Raster(RasterChunk),
     PointCloud(PointChunk),
     Vector(VectorChunk),
+    Tensor(TensorChunk),
 }
 
 impl Chunk {
@@ -104,11 +117,26 @@ impl Chunk {
         }
     }
 
+    pub fn tensor(&self) -> Result<&TensorChunk> {
+        match self {
+            Chunk::Tensor(t) => Ok(t),
+            _ => Err(Error::Kind("tensor")),
+        }
+    }
+
+    pub fn into_tensor(self) -> Result<TensorChunk> {
+        match self {
+            Chunk::Tensor(t) => Ok(t),
+            _ => Err(Error::Kind("tensor")),
+        }
+    }
+
     pub fn byte_size(&self) -> usize {
         match self {
             Chunk::Raster(r) => r.byte_size(),
             Chunk::PointCloud(p) => p.byte_size(),
             Chunk::Vector(v) => v.byte_size(),
+            Chunk::Tensor(t) => t.byte_size(),
         }
     }
 }
@@ -344,6 +372,56 @@ impl RasterChunk {
             .collect();
         RasterChunk {
             bands: BandedRaster::new(bands).expect("uniform crop"),
+            bbox: Bbox {
+                min_x: self.bbox.min_x + col0 as f64 * res,
+                max_y: self.bbox.max_y - row0 as f64 * res,
+                max_x: self.bbox.min_x + (col0 + cols) as f64 * res,
+                min_y: self.bbox.max_y - (row0 + rows) as f64 * res,
+            },
+            resolution: res,
+            crs: self.crs,
+        }
+    }
+}
+
+impl TensorChunk {
+    pub fn width(&self) -> usize {
+        (self.bbox.width() / self.resolution).round() as usize
+    }
+
+    pub fn height(&self) -> usize {
+        (self.bbox.height() / self.resolution).round() as usize
+    }
+
+    pub fn byte_size(&self) -> usize {
+        self.data.len() * size_of::<f32>()
+    }
+
+    /// the row-major plane of one channel
+    pub fn channel(&self, c: usize) -> &[f32] {
+        let plane = self.width() * self.height();
+        &self.data[c * plane..(c + 1) * plane]
+    }
+
+    /// crop to a bbox that must lie on this chunk's pixel grid
+    pub fn crop_to(&self, bbox: &Bbox) -> TensorChunk {
+        let res = self.resolution;
+        let (width, height) = (self.width(), self.height());
+        let col0 = ((bbox.min_x - self.bbox.min_x) / res).round().max(0.0) as usize;
+        let row0 = ((self.bbox.max_y - bbox.max_y) / res).round().max(0.0) as usize;
+        let cols = ((bbox.width() / res).round() as usize).min(width.saturating_sub(col0));
+        let rows = ((bbox.height() / res).round() as usize).min(height.saturating_sub(row0));
+        let mut data = Vec::with_capacity(self.channels as usize * cols * rows);
+        for c in 0..self.channels as usize {
+            let plane = c * width * height;
+            for r in 0..rows {
+                let src = plane + (row0 + r) * width + col0;
+                data.extend_from_slice(&self.data[src..src + cols]);
+            }
+        }
+        TensorChunk {
+            data,
+            channels: self.channels,
             bbox: Bbox {
                 min_x: self.bbox.min_x + col0 as f64 * res,
                 max_y: self.bbox.max_y - row0 as f64 * res,

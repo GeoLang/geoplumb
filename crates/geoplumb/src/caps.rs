@@ -27,6 +27,11 @@ pub enum Dtype {
     F64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TensorDtype {
+    F32,
+}
+
 /// preference-ordered set pattern for one caps field
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetField<T> {
@@ -205,21 +210,70 @@ impl VectorPattern {
     }
 }
 
-/// caps pattern, one alternative per kind. the tensor variant lands here
-/// later. cross-kind intersection is empty: a link has one kind
+/// negotiation-time pattern over tensor link caps. channels is the CHW
+/// channel count, chunk tiling works exactly as for rasters and carries a
+/// model's input size when one is on the link
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorPattern {
+    pub dtype: SetField<TensorDtype>,
+    pub channels: SetField<u16>,
+    pub crs: SetField<Crs>,
+    pub resolution: ResRange,
+    pub chunk_px: SetField<u32>,
+}
+
+impl Default for TensorPattern {
+    fn default() -> Self {
+        TensorPattern {
+            dtype: SetField::Any,
+            channels: SetField::Any,
+            crs: SetField::Any,
+            resolution: ResRange::ANY,
+            chunk_px: SetField::Any,
+        }
+    }
+}
+
+impl TensorPattern {
+    pub fn intersect(&self, other: &Self) -> Self {
+        TensorPattern {
+            dtype: self.dtype.intersect(&other.dtype),
+            channels: self.channels.intersect(&other.channels),
+            crs: self.crs.intersect(&other.crs),
+            resolution: self.resolution.intersect(&other.resolution),
+            chunk_px: self.chunk_px.intersect(&other.chunk_px),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dtype.is_empty()
+            || self.channels.is_empty()
+            || self.crs.is_empty()
+            || self.resolution.is_empty()
+            || self.chunk_px.is_empty()
+    }
+}
+
+/// caps pattern, one alternative per kind. cross-kind intersection is
+/// empty: a link has one kind
 #[derive(Debug, Clone, PartialEq)]
 pub enum CapsPattern {
     Raster(RasterPattern),
     PointCloud(PointPattern),
     Vector(VectorPattern),
+    Tensor(TensorPattern),
 }
 
 /// the fields every caps kind shares, the cross-kind projection surface of
-/// a `Derived` constraint whose output kind differs from its input
+/// a `Derived` constraint whose output kind differs from its input. planes
+/// is the plane count where the kind has one (raster bands, tensor
+/// channels), `Any` elsewhere, so a band demand can narrow a channel count
+/// and vice versa
 struct CommonFields {
     crs: SetField<Crs>,
     resolution: ResRange,
     chunk_px: SetField<u32>,
+    planes: SetField<u16>,
 }
 
 impl CapsPattern {
@@ -237,6 +291,10 @@ impl CapsPattern {
                 let v = a.intersect(b);
                 (!v.is_empty()).then_some(CapsPattern::Vector(v))
             }
+            (CapsPattern::Tensor(a), CapsPattern::Tensor(b)) => {
+                let t = a.intersect(b);
+                (!t.is_empty()).then_some(CapsPattern::Tensor(t))
+            }
             _ => None,
         }
     }
@@ -246,6 +304,7 @@ impl CapsPattern {
             CapsPattern::Raster(r) => r.is_empty(),
             CapsPattern::PointCloud(p) => p.is_empty(),
             CapsPattern::Vector(v) => v.is_empty(),
+            CapsPattern::Tensor(t) => t.is_empty(),
         }
     }
 
@@ -255,16 +314,25 @@ impl CapsPattern {
                 crs: r.crs.clone(),
                 resolution: r.resolution,
                 chunk_px: r.chunk_px.clone(),
+                planes: r.bands.clone(),
             },
             CapsPattern::PointCloud(p) => CommonFields {
                 crs: p.crs.clone(),
                 resolution: p.resolution,
                 chunk_px: p.chunk_px.clone(),
+                planes: SetField::Any,
             },
             CapsPattern::Vector(v) => CommonFields {
                 crs: v.crs.clone(),
                 resolution: v.resolution,
                 chunk_px: v.chunk_px.clone(),
+                planes: SetField::Any,
+            },
+            CapsPattern::Tensor(t) => CommonFields {
+                crs: t.crs.clone(),
+                resolution: t.resolution,
+                chunk_px: t.chunk_px.clone(),
+                planes: t.channels.clone(),
             },
         }
     }
@@ -283,6 +351,9 @@ impl CapsPattern {
                 }
                 if mask.chunk_px {
                     r.chunk_px = r.chunk_px.intersect(&from.chunk_px);
+                }
+                if mask.bands {
+                    r.bands = r.bands.intersect(&from.planes);
                 }
             }
             CapsPattern::PointCloud(p) => {
@@ -305,6 +376,20 @@ impl CapsPattern {
                 }
                 if mask.chunk_px {
                     v.chunk_px = v.chunk_px.intersect(&from.chunk_px);
+                }
+            }
+            CapsPattern::Tensor(t) => {
+                if mask.crs {
+                    t.crs = t.crs.intersect(&from.crs);
+                }
+                if mask.resolution {
+                    t.resolution = t.resolution.intersect(&from.resolution);
+                }
+                if mask.chunk_px {
+                    t.chunk_px = t.chunk_px.intersect(&from.chunk_px);
+                }
+                if mask.bands {
+                    t.channels = t.channels.intersect(&from.planes);
                 }
             }
         }
@@ -336,6 +421,7 @@ impl CapsSet {
                 CapsPattern::Raster(RasterPattern::default()),
                 CapsPattern::PointCloud(PointPattern::default()),
                 CapsPattern::Vector(VectorPattern::default()),
+                CapsPattern::Tensor(TensorPattern::default()),
             ],
         }
     }
@@ -359,8 +445,9 @@ impl CapsSet {
     }
 
     /// fixate the first alternative to concrete link caps, resolution stays
-    /// ranged. dtype defaults to f64, bands and chunk size left `Any` by every
-    /// constraint on the link fall back to 1 band and 256 px
+    /// ranged. dtype defaults to the kind's only choice, bands, channels and
+    /// chunk size left `Any` by every constraint on the link fall back to one
+    /// band or channel and 256 px
     pub fn fixate(&self) -> Option<Caps> {
         match self.alternatives.first()? {
             CapsPattern::Raster(first) => Some(Caps::Raster(RasterCaps {
@@ -380,6 +467,13 @@ impl CapsSet {
                 resolution: first.resolution,
                 chunk_px: first.chunk_px.fixate().unwrap_or(256),
             })),
+            CapsPattern::Tensor(first) => Some(Caps::Tensor(TensorCaps {
+                dtype: first.dtype.fixate().unwrap_or(TensorDtype::F32),
+                channels: first.channels.fixate().unwrap_or(1),
+                crs: first.crs.fixate()?,
+                resolution: first.resolution,
+                chunk_px: first.chunk_px.fixate().unwrap_or(256),
+            })),
         }
     }
 }
@@ -390,6 +484,7 @@ pub enum Caps {
     Raster(RasterCaps),
     PointCloud(PointCaps),
     Vector(VectorCaps),
+    Tensor(TensorCaps),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -410,6 +505,15 @@ pub struct PointCaps {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorCaps {
+    pub crs: Crs,
+    pub resolution: ResRange,
+    pub chunk_px: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorCaps {
+    pub dtype: TensorDtype,
+    pub channels: u16,
     pub crs: Crs,
     pub resolution: ResRange,
     pub chunk_px: u32,
@@ -440,11 +544,20 @@ impl Caps {
         }
     }
 
+    /// panics on a non-tensor link, negotiation guarantees an element's kind
+    pub fn tensor(&self) -> &TensorCaps {
+        match self {
+            Caps::Tensor(t) => t,
+            other => panic!("expected tensor caps, got {other:?}"),
+        }
+    }
+
     pub fn crs(&self) -> Crs {
         match self {
             Caps::Raster(r) => r.crs,
             Caps::PointCloud(p) => p.crs,
             Caps::Vector(v) => v.crs,
+            Caps::Tensor(t) => t.crs,
         }
     }
 
@@ -453,6 +566,7 @@ impl Caps {
             Caps::Raster(r) => r.chunk_px,
             Caps::PointCloud(p) => p.chunk_px,
             Caps::Vector(v) => v.chunk_px,
+            Caps::Tensor(t) => t.chunk_px,
         }
     }
 
@@ -475,6 +589,13 @@ impl Caps {
                 crs: SetField::one(v.crs),
                 resolution: v.resolution,
                 chunk_px: SetField::one(v.chunk_px),
+            }),
+            Caps::Tensor(t) => CapsPattern::Tensor(TensorPattern {
+                dtype: SetField::one(t.dtype),
+                channels: SetField::one(t.channels),
+                crs: SetField::one(t.crs),
+                resolution: t.resolution,
+                chunk_px: SetField::one(t.chunk_px),
             }),
         }
     }
@@ -507,14 +628,25 @@ impl Caps {
                 v.resolution.min.to_bits().hash(&mut h);
                 v.resolution.max.to_bits().hash(&mut h);
             }
+            Caps::Tensor(t) => {
+                3u8.hash(&mut h);
+                t.dtype.hash(&mut h);
+                t.channels.hash(&mut h);
+                t.crs.hash(&mut h);
+                t.chunk_px.hash(&mut h);
+                t.resolution.min.to_bits().hash(&mut h);
+                t.resolution.max.to_bits().hash(&mut h);
+            }
         }
         h.finish()
     }
 }
 
 /// fields a derived transform passes through unchanged, used for backward
-/// narrowing. dtype and bands only exist on raster links, so those bits are
-/// ignored when either side of a projection is another kind
+/// narrowing. dtype is a raster field and its bit is ignored when either
+/// side of a projection is another kind. bands is the plane count: across
+/// the raster and tensor kinds it couples bands to channels, and is ignored
+/// where a side has no plane count (points, vectors)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FieldMask {
     pub dtype: bool,

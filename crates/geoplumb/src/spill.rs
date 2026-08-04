@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::caps::Crs;
-use crate::chunk::{Chunk, PointChunk, RasterChunk, VectorChunk, VectorFeature};
+use crate::chunk::{Chunk, PointChunk, RasterChunk, TensorChunk, VectorChunk, VectorFeature};
 use crate::error::{Error, Result};
 use crate::window::{Bbox, ChunkKey};
 use nubis_core::{Classification, Point3, PointCloud};
@@ -23,6 +23,7 @@ const VERSION: u16 = 2;
 const KIND_RASTER: u8 = 0;
 const KIND_POINTS: u8 = 1;
 const KIND_VECTOR: u8 = 2;
+const KIND_TENSOR: u8 = 3;
 
 const GEOM_POINT: u8 = 0;
 const GEOM_LINESTRING: u8 = 1;
@@ -108,6 +109,18 @@ pub(crate) fn write_chunk(path: &Path, chunk: &Chunk) -> Result<()> {
                 f.write_all(&(props.len() as u32).to_le_bytes())
                     .map_err(io)?;
                 f.write_all(&props).map_err(io)?;
+            }
+        }
+        Chunk::Tensor(chunk) => {
+            f.write_all(&[KIND_TENSOR]).map_err(io)?;
+            f.write_all(&chunk.channels.to_le_bytes()).map_err(io)?;
+            f.write_all(&(chunk.width() as u32).to_le_bytes())
+                .map_err(io)?;
+            f.write_all(&(chunk.height() as u32).to_le_bytes())
+                .map_err(io)?;
+            write_geo(&mut f, chunk.resolution, &chunk.bbox, chunk.crs).map_err(io)?;
+            for v in &chunk.data {
+                f.write_all(&v.to_le_bytes()).map_err(io)?;
             }
         }
     }
@@ -313,6 +326,31 @@ pub(crate) fn read_chunk(path: &Path) -> Result<Chunk> {
             Ok(Chunk::Vector(VectorChunk::new(
                 features, bbox, resolution, crs,
             )))
+        }
+        KIND_TENSOR => {
+            let channels = u16::from_le_bytes(rd(&mut f).map_err(io)?);
+            let cols = rd_u32(&mut f).map_err(io)? as usize;
+            let rows = rd_u32(&mut f).map_err(io)? as usize;
+            let (resolution, bbox, crs) = rd_geo(&mut f).map_err(io)?;
+            let len = (channels as usize)
+                .saturating_mul(cols)
+                .saturating_mul(rows);
+            if channels == 0 || cols == 0 || rows == 0 || len > (1 << 28) {
+                return Err(bad("geometry"));
+            }
+            let mut raw = vec![0u8; len * 4];
+            f.read_exact(&mut raw).map_err(io)?;
+            let data: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().expect("4-byte chunks")))
+                .collect();
+            Ok(Chunk::Tensor(TensorChunk {
+                data,
+                channels,
+                bbox,
+                resolution,
+                crs,
+            }))
         }
         _ => Err(bad("kind")),
     }

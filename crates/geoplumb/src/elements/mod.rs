@@ -5,6 +5,7 @@ pub mod points;
 pub mod reproject;
 pub mod source;
 pub mod stac;
+pub mod tensor;
 pub mod terrain;
 pub mod vector;
 
@@ -15,6 +16,7 @@ pub use points::{IdwGrid, LasSrc};
 pub use reproject::Reproject;
 pub use source::RasterSrc;
 pub use stac::{StacSearch, StacSrc};
+pub use tensor::{TensorConv, ToRaster, ToTensor};
 pub use vector::{Burn, Rasterize, VecSrc};
 
 /// adapters every graph starts with, see `Graph::register_adapter`
