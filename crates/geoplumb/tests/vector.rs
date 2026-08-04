@@ -473,3 +473,140 @@ fn crs_demand_downstream_of_the_burn_autoplugs_a_reproject() {
     assert_eq!(engine.caps(grid).raster().crs, Crs::WGS84);
     assert_eq!(engine.caps(t).raster().crs, Crs::WEB_MERCATOR);
 }
+
+/// square with a vertex every unit, so a collection of these has a median
+/// segment length, and with it a base resolution, of exactly 1.0
+fn unit_square(min_x: f64, min_y: f64, side: usize) -> Polygon {
+    let s = side as f64;
+    let mut coords = Vec::new();
+    for i in 0..side {
+        coords.push(Coord::new(min_x + i as f64, min_y));
+    }
+    for i in 0..side {
+        coords.push(Coord::new(min_x + s, min_y + i as f64));
+    }
+    for i in 0..side {
+        coords.push(Coord::new(min_x + s - i as f64, min_y + s));
+    }
+    for i in 0..side {
+        coords.push(Coord::new(min_x, min_y + s - i as f64));
+    }
+    coords.push(Coord::new(min_x, min_y));
+    Polygon::new(Ring::new(coords), vec![])
+}
+
+/// four squares far enough apart to sit in four different 256 px tiles,
+/// anchoring the grid at (0, 604)
+fn spread_collection() -> FeatureCollection {
+    FeatureCollection {
+        features: vec![
+            feature(
+                FeatureGeometry::Polygon(unit_square(0.0, 0.0, 4)),
+                props(1.0),
+            ),
+            feature(
+                FeatureGeometry::Polygon(unit_square(600.0, 0.0, 4)),
+                props(2.0),
+            ),
+            feature(
+                FeatureGeometry::Polygon(unit_square(1200.0, 0.0, 4)),
+                props(3.0),
+            ),
+            feature(
+                FeatureGeometry::Polygon(unit_square(600.0, 600.0, 4)),
+                props(4.0),
+            ),
+        ],
+    }
+}
+
+/// a tile read clips only the features the spatial index hands back, so a
+/// wrong candidate set shows up as the wrong feature in a tile, or none
+#[tokio::test]
+async fn a_tile_read_returns_only_the_features_that_reach_it() {
+    let mut g = Graph::new();
+    let vec = g.add_source(Box::new(
+        VecSrc::new(spread_collection(), Crs::WGS84).unwrap(),
+    ));
+    let engine = Engine::new(g, 64 << 20).unwrap();
+    assert_eq!(engine.grid(vec).base_resolution, 1.0);
+    assert_eq!(engine.grid(vec).origin_y, 604.0);
+
+    let tile = |ix: f64, iy: f64| WindowReq {
+        bbox: Bbox::new(
+            ix * 256.0,
+            604.0 - (iy + 1.0) * 256.0,
+            (ix + 1.0) * 256.0,
+            604.0 - iy * 256.0,
+        ),
+        resolution: 1.0,
+    };
+    let ids =
+        |chunk: &geoplumb::VectorChunk| chunk.features.iter().map(|f| f.id).collect::<Vec<_>>();
+
+    for (ix, iy, want) in [(0.0, 2.0, 0), (2.0, 2.0, 1), (4.0, 2.0, 2), (2.0, 0.0, 3)] {
+        let got = engine
+            .pull(vec, tile(ix, iy))
+            .await
+            .unwrap()
+            .into_vector()
+            .unwrap();
+        assert_eq!(ids(&got), vec![want], "tile ({ix}, {iy})");
+    }
+
+    // a tile no feature reaches comes back empty, not as an error
+    let empty = engine
+        .pull(vec, tile(1.0, 2.0))
+        .await
+        .unwrap()
+        .into_vector()
+        .unwrap();
+    assert!(empty.features.is_empty(), "{:?}", ids(&empty));
+
+    // and the whole window still sees every feature, in id order
+    let whole = engine
+        .pull(
+            vec,
+            WindowReq {
+                bbox: Bbox::new(0.0, 0.0, 1204.0, 604.0),
+                resolution: 1.0,
+            },
+        )
+        .await
+        .unwrap()
+        .into_vector()
+        .unwrap();
+    assert_eq!(ids(&whole), vec![0, 1, 2, 3]);
+}
+
+/// the index hands its candidates back in the tree's own spatial order once
+/// a node overflows its fanout, and fragment order inside a chunk is burn
+/// order, so the read has to restore id order. assembly sorts by id, which
+/// would mask this, hence the direct source read
+#[tokio::test]
+async fn a_tile_read_keeps_its_fragments_in_id_order() {
+    // a dozen squares inserted east to west, past the tree's fanout, so the
+    // order it packs them in is the reverse of their ids
+    let features = (0..12)
+        .map(|i| {
+            feature(
+                FeatureGeometry::Polygon(unit_square(110.0 - 10.0 * f64::from(i), 0.0, 4)),
+                props(f64::from(i)),
+            )
+        })
+        .collect();
+    let src = VecSrc::new(FeatureCollection { features }, Crs::WGS84).unwrap();
+    let chunk = src
+        .read(&WindowReq {
+            bbox: Bbox::new(0.0, 0.0, 114.0, 4.0),
+            resolution: 1.0,
+        })
+        .await
+        .unwrap()
+        .into_vector()
+        .unwrap();
+    assert_eq!(
+        chunk.features.iter().map(|f| f.id).collect::<Vec<_>>(),
+        (0..12).collect::<Vec<u64>>()
+    );
+}

@@ -17,8 +17,8 @@ use futures::future::BoxFuture;
 use terrano_core::{BandedRaster, Raster};
 use topoi_core::geojson::{FeatureCollection, FeatureGeometry};
 use topoi_core::{
-    Coord, GridWindow, LineString, MultiLineString, MultiPolygon, Polygon, Ring, rasterize,
-    simplify,
+    Coord, Envelope, GridWindow, LineString, MultiLineString, MultiPolygon, Polygon, RTree, Ring,
+    rasterize, simplify,
 };
 
 /// in-memory feature source. a level simplifies whole features first
@@ -28,6 +28,9 @@ use topoi_core::{
 /// the raw geometry
 pub struct VecSrc {
     features: Vec<VectorFeature>,
+    /// raw-geometry envelopes, so a tile read only clips the features that
+    /// can reach it
+    index: RTree,
     origin_x: f64,
     origin_y: f64,
     base_resolution: f64,
@@ -50,10 +53,14 @@ impl VecSrc {
                 properties,
             })
             .collect();
-        let envelope = features
+        let envelopes: Vec<Envelope> = features
             .iter()
             .map(|f| geometry_envelope(&f.geometry))
-            .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+            .collect();
+        let envelope = envelopes
+            .iter()
+            .copied()
+            .reduce(|a, b| a.union(&b))
             .ok_or(Error::Source("empty feature collection".into()))?;
         let mut lengths: Vec<f64> = features
             .iter()
@@ -61,16 +68,17 @@ impl VecSrc {
             .filter(|l| *l > 0.0)
             .collect();
         let base_resolution = if lengths.is_empty() {
-            let dim = (envelope.2 - envelope.0).max(envelope.3 - envelope.1);
+            let dim = envelope.width().max(envelope.height());
             if dim > 0.0 { dim / 1024.0 } else { 1.0 }
         } else {
             lengths.sort_by(|a, b| a.total_cmp(b));
             lengths[lengths.len() / 2]
         };
         Ok(VecSrc {
+            index: RTree::new(&envelopes),
             features,
-            origin_x: envelope.0,
-            origin_y: envelope.3,
+            origin_x: envelope.min_x,
+            origin_y: envelope.max_y,
             base_resolution,
             crs,
         })
@@ -104,8 +112,20 @@ impl Source for VecSrc {
     fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<Chunk>> {
         Box::pin(async move {
             let coarse = req.resolution > self.base_resolution;
+            // simplification only drops vertices, so a simplified geometry
+            // sits inside its raw envelope: a feature whose raw envelope
+            // misses the window cannot produce a fragment of it
+            let mut candidates = self.index.search(&Envelope::new(
+                req.bbox.min_x,
+                req.bbox.min_y,
+                req.bbox.max_x,
+                req.bbox.max_y,
+            ));
+            // the tree hands back leaf order, ids are positions in the
+            // feature vec, and fragment order in a chunk is burn order
+            candidates.sort_unstable();
             let mut fragments = Vec::new();
-            for f in &self.features {
+            for f in candidates.into_iter().map(|i| &self.features[i]) {
                 let simplified;
                 let geometry = if coarse {
                     match simplify_geometry(&f.geometry, req.resolution) {
@@ -136,20 +156,18 @@ impl Source for VecSrc {
     }
 }
 
-fn geometry_envelope(geometry: &FeatureGeometry) -> (f64, f64, f64, f64) {
-    let mut env = (
+fn geometry_envelope(geometry: &FeatureGeometry) -> Envelope {
+    let mut env = Envelope::new(
         f64::INFINITY,
         f64::INFINITY,
         f64::NEG_INFINITY,
         f64::NEG_INFINITY,
     );
     for c in all_coords(geometry) {
-        env = (
-            env.0.min(c.x),
-            env.1.min(c.y),
-            env.2.max(c.x),
-            env.3.max(c.y),
-        );
+        env.min_x = env.min_x.min(c.x);
+        env.min_y = env.min_y.min(c.y);
+        env.max_x = env.max_x.max(c.x);
+        env.max_y = env.max_y.max(c.y);
     }
     env
 }
@@ -216,7 +234,7 @@ fn simplify_geometry(geometry: &FeatureGeometry, resolution: f64) -> Option<Feat
         FeatureGeometry::Point(_) | FeatureGeometry::MultiPoint(_)
     ) {
         let env = geometry_envelope(geometry);
-        if (env.2 - env.0).max(env.3 - env.1) < resolution {
+        if env.width().max(env.height()) < resolution {
             return None;
         }
     }
