@@ -1,3 +1,3 @@
 # TODO
 
-- geodukt executor swap onto the engine. geoplumb serves the window-local head of a pipeline (sources, reproject, filter, schema, clip, rasterize), the executor pulls full-extent, dissolves at the boundary, then runs the whole-feature ops on geodukt's existing topoi-based transforms: buffer, centroid, group-by dissolve, `$area` expressions, fixed-tolerance simplify
+- an interior spatial index for `VecSrc`: reads scan every feature per tile, O(features x tiles) on a fine-resolution wide-extent collection
