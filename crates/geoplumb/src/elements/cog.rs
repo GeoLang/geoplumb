@@ -10,17 +10,18 @@ use crate::caps::{
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::window::{GridSpec, WindowReq};
 use futures::future::BoxFuture;
 use terrano_core::{BandedRaster, CogReader, RangeRead, Raster};
 
 pub struct CogSrc<R: RangeRead + Send + 'static> {
-    // read_window needs &mut, so concurrent chunk reads serialize here
+    // read_window_bands needs &mut, so concurrent chunk reads serialize here
     reader: Arc<Mutex<CogReader<R>>>,
     origin_x: f64,
     origin_y: f64,
     base_resolution: f64,
+    bands: u16,
     crs: Crs,
 }
 
@@ -30,21 +31,38 @@ impl<R: RangeRead + Send + 'static> CogSrc<R> {
     pub fn open(source: R) -> Result<Self> {
         let reader = CogReader::open(source)?;
         let meta = reader.meta().clone();
+        let bands = band_count(&reader)?;
         Ok(CogSrc {
             origin_x: meta.origin_x,
             origin_y: meta.origin_y,
             base_resolution: meta.pixel_width,
+            bands,
             crs: Crs(u32::from(meta.epsg)),
             reader: Arc::new(Mutex::new(reader)),
         })
     }
+
+    /// bands the file carries, every level alike
+    pub fn bands(&self) -> u16 {
+        self.bands
+    }
+}
+
+/// samples per pixel at the base level, which every level shares
+pub(crate) fn band_count<R: RangeRead>(reader: &CogReader<R>) -> Result<u16> {
+    let samples = reader
+        .levels()
+        .first()
+        .ok_or_else(|| Error::Source("cog has no levels".into()))?
+        .samples;
+    u16::try_from(samples).map_err(|_| Error::Source(format!("cog has {samples} bands")))
 }
 
 impl<R: RangeRead + Send + 'static> Source for CogSrc<R> {
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
             dtype: SetField::one(Dtype::F64),
-            bands: SetField::one(1),
+            bands: SetField::one(self.bands),
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.base_resolution),
             chunk_px: SetField::Any,
@@ -83,6 +101,7 @@ pub(crate) fn read_chunk<R: RangeRead>(
 ) -> Result<RasterChunk> {
     let level = reader.select_level(req.resolution);
     let lres = reader.levels()[level].pixel_width;
+    let samples = reader.levels()[level].samples;
     let factor = (req.resolution / lres).round().max(1.0) as usize;
     let cols = (req.bbox.width() / req.resolution).round() as usize;
     let rows = (req.bbox.height() / req.resolution).round() as usize;
@@ -90,33 +109,40 @@ pub(crate) fn read_chunk<R: RangeRead>(
     let col0 = ((req.bbox.min_x - origin_x) / lres).round() as i64;
     let row0 = ((origin_y - req.bbox.max_y) / lres).round() as i64;
 
-    // read_window pads right/bottom itself but cannot start left/above the
-    // image, so clamp the start and copy at an offset
-    let mut fine = vec![f64::NAN; fcols * frows];
+    // read_window_bands pads right/bottom itself but cannot start left or
+    // above the image, so clamp the start and copy at an offset
+    let mut fine = vec![vec![f64::NAN; fcols * frows]; samples];
     let (skip_c, skip_r) = ((-col0).max(0) as usize, (-row0).max(0) as usize);
     if skip_c < fcols && skip_r < frows {
-        let window = reader.read_window(
+        let window = reader.read_window_bands(
             level,
             (col0 + skip_c as i64) as usize,
             (row0 + skip_r as i64) as usize,
             fcols - skip_c,
             frows - skip_r,
         )?;
-        let w = window.width();
-        for r in 0..window.height() {
-            let dst = (skip_r + r) * fcols + skip_c;
-            fine[dst..dst + w].copy_from_slice(&window.data()[r * w..(r + 1) * w]);
+        for (plane, band) in fine.iter_mut().zip(window.bands()) {
+            let w = band.width();
+            for r in 0..band.height() {
+                let dst = (skip_r + r) * fcols + skip_c;
+                plane[dst..dst + w].copy_from_slice(&band.data()[r * w..(r + 1) * w]);
+            }
         }
     }
 
-    let data = if factor == 1 {
-        fine
-    } else {
-        decimate(&fine, cols, rows, factor)
-    };
-    let band = Raster::from_vec(cols, rows, data, req.resolution, f64::NAN).expect("window dims");
+    let bands: Vec<Raster> = fine
+        .into_iter()
+        .map(|plane| {
+            let data = if factor == 1 {
+                plane
+            } else {
+                decimate(&plane, cols, rows, factor)
+            };
+            Raster::from_vec(cols, rows, data, req.resolution, f64::NAN).expect("window dims")
+        })
+        .collect();
     Ok(RasterChunk {
-        bands: BandedRaster::new(vec![band]).expect("single band"),
+        bands: BandedRaster::new(bands).map_err(Error::Terrano)?,
         bbox: req.bbox,
         resolution: req.resolution,
         crs,

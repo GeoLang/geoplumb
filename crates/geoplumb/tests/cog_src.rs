@@ -1,5 +1,6 @@
 //! cog-backed source: overview selection, decimation past the pyramid,
-//! nan padding outside the file, and the http range transport
+//! nan padding outside the file, multi-band files, and the http range
+//! transport
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,9 +9,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
 use geoplumb::element::Source;
-use geoplumb::elements::{CogSrc, Hillshade, HttpRange, RasterSrc};
+use geoplumb::elements::{CogSrc, Hillshade, HttpRange, RasterSrc, Reproject};
 use geoplumb::{Bbox, Crs, Engine, Graph, WindowReq};
-use terrano_core::{BandedRaster, CogParams, RangeRead, Raster, write_cog};
+use terrano_core::{BandedRaster, CogParams, RangeRead, Raster, write_cog, write_cog_bands};
 
 const W: usize = 600;
 const H: usize = 400;
@@ -19,19 +20,32 @@ const ORIGIN_X: f64 = 7.0;
 const ORIGIN_Y: f64 = 47.0;
 
 fn dem() -> Raster {
+    plane(0)
+}
+
+/// band `b` of the multi-band fixture: the same scene scaled per band, so
+/// a swapped or duplicated band is visible in both value and shape
+fn plane(b: usize) -> Raster {
     let mut data = Vec::with_capacity(W * H);
     for row in 0..H {
         for col in 0..W {
             let lon = ORIGIN_X + (col as f64 + 0.5) * CELL;
             let lat = ORIGIN_Y - (row as f64 + 0.5) * CELL;
-            data.push(500.0 + 200.0 * ((lon * 8.0).sin() * (lat * 8.0).cos()));
+            let v = 500.0 + 200.0 * ((lon * 8.0).sin() * (lat * 8.0).cos());
+            data.push(v * (b as f64 + 1.0));
         }
     }
     Raster::from_vec(W, H, data, CELL, f64::NAN).unwrap()
 }
 
-fn cog_bytes(overview_levels: u32) -> Vec<u8> {
-    let params = CogParams {
+const BANDS: usize = 3;
+
+fn banded() -> BandedRaster {
+    BandedRaster::new((0..BANDS).map(plane).collect()).unwrap()
+}
+
+fn params(overview_levels: u32) -> CogParams {
+    CogParams {
         tile_width: 64,
         tile_height: 64,
         overview_levels,
@@ -41,9 +55,18 @@ fn cog_bytes(overview_levels: u32) -> Vec<u8> {
         pixel_width: CELL,
         pixel_height: CELL,
         deflate: false,
-    };
+    }
+}
+
+fn cog_bytes(overview_levels: u32) -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
-    write_cog(&dem(), &params, &mut buf).unwrap();
+    write_cog(&dem(), &params(overview_levels), &mut buf).unwrap();
+    buf.into_inner()
+}
+
+fn cog3_bytes(overview_levels: u32) -> Vec<u8> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    write_cog_bands(&banded(), &params(overview_levels), &mut buf).unwrap();
     buf.into_inner()
 }
 
@@ -78,6 +101,10 @@ fn mem_src() -> RasterSrc {
     )
 }
 
+fn mem_src3() -> RasterSrc {
+    RasterSrc::new(banded(), ORIGIN_X, ORIGIN_Y, Crs::WGS84)
+}
+
 fn window(px0: usize, py0: usize, px1: usize, py1: usize) -> Bbox {
     Bbox {
         min_x: ORIGIN_X + px0 as f64 * CELL,
@@ -96,12 +123,17 @@ fn engine_of(src: impl Source + 'static) -> (Engine, geoplumb::NodeId) {
 fn assert_bands_close(a: &geoplumb::RasterChunk, b: &geoplumb::RasterChunk, tol: f64) {
     assert_eq!(a.width(), b.width());
     assert_eq!(a.height(), b.height());
-    let (ba, bb) = (a.bands.band(0).unwrap(), b.bands.band(0).unwrap());
-    for (i, (x, y)) in ba.data().iter().zip(bb.data()).enumerate() {
-        if x.is_nan() && y.is_nan() {
-            continue;
+    assert_eq!(a.bands.band_count(), b.bands.band_count());
+    for (bi, (ba, bb)) in a.bands.bands().iter().zip(b.bands.bands()).enumerate() {
+        for (i, (x, y)) in ba.data().iter().zip(bb.data()).enumerate() {
+            if x.is_nan() && y.is_nan() {
+                continue;
+            }
+            assert!(
+                (x - y).abs() < tol,
+                "band {bi} pixel {i}: cog {x} vs memory {y}"
+            );
         }
-        assert!((x - y).abs() < tol, "pixel {i}: cog {x} vs memory {y}");
     }
 }
 
@@ -301,4 +333,140 @@ async fn http_transport_feeds_the_engine() {
     let a = engine.pull(hs, req).await.unwrap().into_raster().unwrap();
     let b = mem.pull(mhs, req).await.unwrap().into_raster().unwrap();
     assert_bands_close(&a, &b, 1e-9);
+}
+
+#[tokio::test]
+async fn multi_band_matches_in_memory_at_base_and_overview() {
+    let (cog, cn) = engine_of(CogSrc::open(MemRange::new(cog3_bytes(2))).unwrap());
+    let (mem, mn) = engine_of(mem_src3());
+    for res in [CELL, CELL * 2.0] {
+        let req = WindowReq {
+            bbox: window(20, 20, 340, 230),
+            resolution: res,
+        };
+        let a = cog.pull(cn, req).await.unwrap().into_raster().unwrap();
+        let b = mem.pull(mn, req).await.unwrap().into_raster().unwrap();
+        assert_eq!(a.bands.band_count(), BANDS, "bands dropped at {res}");
+        assert_bands_close(&a, &b, 1e-9);
+    }
+}
+
+#[test]
+fn multi_band_caps_advertise_the_file_band_count() {
+    let src = CogSrc::open(MemRange::new(cog3_bytes(2))).unwrap();
+    assert_eq!(src.bands(), BANDS as u16);
+    let (engine, n) = engine_of(src);
+    assert_eq!(engine.caps(n).raster().bands, BANDS as u16);
+}
+
+#[tokio::test]
+async fn multi_band_pull_coarser_than_pyramid_decimates_every_band() {
+    // one overview (down to 2*CELL), request 4*CELL: read level 1, average 2x2
+    let src = CogSrc::open(MemRange::new(cog3_bytes(1))).unwrap();
+    let (mem, mn) = engine_of(mem_src3());
+    let req = WindowReq {
+        bbox: window(0, 0, 400, 400),
+        resolution: CELL * 4.0,
+    };
+    let a = src.read(&req).await.unwrap().into_raster().unwrap();
+    let b = mem.pull(mn, req).await.unwrap().into_raster().unwrap();
+    assert_eq!(a.bands.band_count(), BANDS);
+    assert_eq!(a.width(), 100);
+    assert_bands_close(&a, &b, 1e-9);
+}
+
+#[tokio::test]
+async fn multi_band_window_outside_the_file_pads_every_band() {
+    let src = CogSrc::open(MemRange::new(cog3_bytes(0))).unwrap();
+    let req = WindowReq {
+        bbox: Bbox {
+            min_x: ORIGIN_X - 40.0 * CELL,
+            max_x: ORIGIN_X + 40.0 * CELL,
+            max_y: ORIGIN_Y + 40.0 * CELL,
+            min_y: ORIGIN_Y - 40.0 * CELL,
+        },
+        resolution: CELL,
+    };
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    assert_eq!(chunk.bands.band_count(), BANDS);
+    for (bi, band) in chunk.bands.bands().iter().enumerate() {
+        assert_eq!(band.width(), 80);
+        assert!(band.data()[0].is_nan(), "band {bi} outside pixel not nan");
+        let got = band.data()[45 * 80 + 45];
+        let expected = plane(bi).data()[5 * W + 5];
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "band {bi}: {got} vs {expected}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_band_over_the_http_transport() {
+    let app = axum::Router::new()
+        .route("/rgb.tif", get(range_handler))
+        .with_state(Arc::new(cog3_bytes(2)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let url = format!("http://{addr}/rgb.tif");
+    let src = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(url)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(src.bands(), BANDS as u16);
+    let req = WindowReq {
+        bbox: window(20, 20, 340, 230),
+        resolution: CELL,
+    };
+    let a = src.read(&req).await.unwrap().into_raster().unwrap();
+    let (mem, mn) = engine_of(mem_src3());
+    let b = mem.pull(mn, req).await.unwrap().into_raster().unwrap();
+    assert_bands_close(&a, &b, 1e-12);
+}
+
+/// reproject samples band by band, so a multi-band chunk keeps its bands
+/// and each one carries its own values through the crs change
+#[tokio::test]
+async fn reproject_keeps_every_band() {
+    let mut g = Graph::new();
+    let s = g.add_source(Box::new(
+        CogSrc::open(MemRange::new(cog3_bytes(2))).unwrap(),
+    ));
+    let rp = g.add_transform(s, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
+    let engine = Engine::new(g, 64 << 20).unwrap();
+
+    let grid = engine.grid(rp);
+    let res = grid.base_resolution;
+    let (cx, cy) = (
+        779236.0_f64, // lon 7.0 in web mercator, roughly
+        5937000.0_f64,
+    );
+    let req = WindowReq {
+        bbox: Bbox {
+            min_x: cx,
+            max_x: cx + 100.0 * res,
+            max_y: cy,
+            min_y: cy - 100.0 * res,
+        },
+        resolution: res,
+    };
+    let chunk = engine.pull(rp, req).await.unwrap().into_raster().unwrap();
+    assert_eq!(chunk.bands.band_count(), BANDS);
+    let b0 = chunk.bands.band(0).unwrap().data();
+    for (bi, band) in chunk.bands.bands().iter().enumerate().skip(1) {
+        let mut compared = 0;
+        for (a, b) in b0.iter().zip(band.data()) {
+            if a.is_finite() && b.is_finite() {
+                // band bi is band 0 scaled by bi+1, preserved by a linear resample
+                assert!(
+                    (b - a * (bi as f64 + 1.0)).abs() < 1e-6,
+                    "band {bi}: {b} vs {a}"
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 100, "band {bi} had no overlapping finite pixels");
+    }
 }

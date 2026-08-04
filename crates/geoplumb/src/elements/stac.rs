@@ -1,9 +1,10 @@
 //! stac collection source: pulls search the api lazily, in whole-degree
 //! blocks cached for the source's lifetime, so coverage is not bound to
 //! the bbox given at open. open searches that bbox once to anchor the
-//! grid and crs on the most recent item. items are filtered to the
-//! anchor crs, each item's cog asset opens lazily over http range
-//! requests, and a pull mosaics its items most-recent-first
+//! grid, crs and band count on the most recent item. items are filtered
+//! to the anchor crs and band count, searches follow `next` links to the
+//! end, each item's cog asset opens lazily over http range requests, and
+//! a pull mosaics its items most-recent-first, band by band
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -13,7 +14,7 @@ use crate::caps::{
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
-use crate::elements::cog::{HttpRange, read_chunk};
+use crate::elements::cog::{HttpRange, band_count, read_chunk};
 use crate::error::{Error, Result};
 use crate::window::{Bbox, GridSpec, WindowReq};
 use futures::future::BoxFuture;
@@ -27,6 +28,10 @@ const BLOCK_DEG: f64 = 2.0;
 /// asking for a mosaic of thousands of items anyway, fail loud instead
 const MAX_BLOCK_SEARCHES: usize = 32;
 
+/// features one search may accumulate across its pages, for the same
+/// reason: past this the mosaic is not something a pull should be doing
+const MAX_SEARCH_ITEMS: usize = 1000;
+
 #[derive(Clone)]
 pub struct StacSearch {
     /// stac api root, e.g. `https://earth-search.aws.element84.com/v1`
@@ -39,8 +44,8 @@ pub struct StacSearch {
     pub bbox: [f64; 4],
     /// rfc 3339 instant or interval, verbatim stac `datetime`
     pub datetime: Option<String>,
-    /// items per search page. a block search filling a whole page fails
-    /// rather than serving partial coverage
+    /// items per search page. a search follows `next` links until the api
+    /// runs out, so this is page size only, not a coverage limit
     pub limit: u32,
 }
 
@@ -63,6 +68,8 @@ struct Found {
     /// lon/lat footprint straight from the stac feature
     bbox: [f64; 4],
     epsg: u32,
+    /// band count the asset declares, `None` when it declares none
+    bands: Option<u16>,
 }
 
 struct Item {
@@ -77,6 +84,8 @@ struct Inner {
     search: StacSearch,
     client: reqwest::blocking::Client,
     crs: Crs,
+    /// band count of the anchor item's cog, which every kept item shares
+    bands: u16,
     /// lon/lat to source crs for item footprints, `None` when it is 4326
     to_native: Option<projicio_core::Transform>,
     /// source crs to lon/lat for pull windows, `None` when it is 4326
@@ -91,6 +100,7 @@ pub struct StacSrc {
     origin_x: f64,
     origin_y: f64,
     base_resolution: f64,
+    bands: u16,
     crs: Crs,
 }
 
@@ -103,7 +113,8 @@ pub fn s3_to_https(href: &str) -> String {
     }
 }
 
-/// one search request, first page only
+/// one search, following the response's `next` links until the api runs
+/// out of pages, so coverage never depends on `limit`
 fn search_page(
     client: &reqwest::blocking::Client,
     search: &StacSearch,
@@ -118,47 +129,79 @@ fn search_page(
     if let Some(dt) = &search.datetime {
         url.push_str(&format!("&datetime={dt}"));
     }
-    let text = client
-        .get(&url)
-        .header(reqwest::header::ACCEPT, "application/geo+json")
-        .send()
-        .and_then(|r| r.error_for_status())
-        .and_then(|r| r.text())
-        .map_err(|e| fail(format!("stac search failed: {e}")))?;
-    let body: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| fail(format!("stac search returned invalid json: {e}")))?;
 
-    let features = body["features"]
-        .as_array()
-        .ok_or_else(|| fail("stac search response has no features".into()))?;
     let mut found = Vec::new();
-    for f in features {
-        let Some(href) = f["assets"][&search.asset]["href"].as_str() else {
-            continue;
-        };
-        let datetime = f["properties"]["datetime"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        let bbox: Vec<f64> = f["bbox"]
+    let mut seen = 0usize;
+    loop {
+        let text = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/geo+json")
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.text())
+            .map_err(|e| fail(format!("stac search failed: {e}")))?;
+        let body: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| fail(format!("stac search returned invalid json: {e}")))?;
+
+        let features = body["features"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
-            .unwrap_or_default();
-        if bbox.len() < 4 {
-            continue;
+            .ok_or_else(|| fail("stac search response has no features".into()))?;
+        seen += features.len();
+        if seen > MAX_SEARCH_ITEMS {
+            return Err(fail(format!(
+                "stac search over bbox {minx},{miny},{maxx},{maxy} passed {MAX_SEARCH_ITEMS} items across its pages, narrow the search"
+            )));
         }
-        let epsg = f["properties"]["proj:epsg"]
-            .as_u64()
-            .or_else(|| f["assets"][&search.asset]["proj:epsg"].as_u64())
-            .unwrap_or(0) as u32;
-        found.push(Found {
-            href: s3_to_https(href),
-            datetime,
-            bbox: [bbox[0], bbox[1], bbox[2], bbox[3]],
-            epsg,
+        for f in features {
+            if let Some(item) = parse_found(f, &search.asset) {
+                found.push(item);
+            }
+        }
+
+        let next = body["links"].as_array().and_then(|links| {
+            links
+                .iter()
+                .find(|l| l["rel"].as_str() == Some("next"))
+                .and_then(|l| l["href"].as_str())
         });
+        match next {
+            Some(href) => url = href.to_string(),
+            None => break,
+        }
     }
     Ok(found)
+}
+
+fn parse_found(f: &serde_json::Value, asset: &str) -> Option<Found> {
+    let href = f["assets"][asset]["href"].as_str()?;
+    let datetime = f["properties"]["datetime"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let bbox: Vec<f64> = f["bbox"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+        .unwrap_or_default();
+    if bbox.len() < 4 {
+        return None;
+    }
+    let epsg = f["properties"]["proj:epsg"]
+        .as_u64()
+        .or_else(|| f["assets"][asset]["proj:epsg"].as_u64())
+        .unwrap_or(0) as u32;
+    // raster:bands is the per-asset one, eo:bands the spectral list, both
+    // one entry per band. a collection declaring neither is not filtered
+    let bands = ["raster:bands", "eo:bands"]
+        .iter()
+        .find_map(|k| f["assets"][asset][k].as_array())
+        .and_then(|a| u16::try_from(a.len()).ok());
+    Some(Found {
+        href: s3_to_https(href),
+        datetime,
+        bbox: [bbox[0], bbox[1], bbox[2], bbox[3]],
+        epsg,
+        bands,
+    })
 }
 
 impl StacSrc {
@@ -193,10 +236,17 @@ impl StacSrc {
             )
         };
 
+        // the anchor cog opens before the filter runs, its band count is
+        // what the other items are held to
+        let reader = CogReader::open(HttpRange::new(&anchor_href))?;
+        let meta = reader.meta().clone();
+        let bands = band_count(&reader)?;
+
         let inner = Inner {
             search: search.clone(),
             client,
             crs,
+            bands,
             to_native,
             to_lonlat,
             searched: Mutex::new(HashSet::new()),
@@ -209,15 +259,18 @@ impl StacSrc {
             .unwrap()
             .get(&anchor_href)
             .cloned()
-            .expect("anchor inserted above");
-        let reader = CogReader::open(HttpRange::new(&anchor.href))?;
-        let meta = reader.meta().clone();
+            .ok_or_else(|| {
+                Error::Source(format!(
+                    "anchor item {anchor_href} declares a band count its cog does not have"
+                ))
+            })?;
         *anchor.reader.lock().unwrap() = Some(reader);
         Ok(StacSrc {
             inner: Arc::new(inner),
             origin_x: meta.origin_x,
             origin_y: meta.origin_y,
             base_resolution: meta.pixel_width,
+            bands,
             crs,
         })
     }
@@ -230,6 +283,11 @@ impl StacSrc {
     /// the crs all kept items share, from the most recent anchor item
     pub fn crs(&self) -> Crs {
         self.crs
+    }
+
+    /// the band count all kept items share, from the anchor item's cog
+    pub fn bands(&self) -> u16 {
+        self.bands
     }
 }
 
@@ -262,10 +320,14 @@ impl Inner {
         }
     }
 
-    /// keep crs-matching items, one shared copy per href
+    /// keep items matching the anchor's crs and band count, one shared
+    /// copy per href
     fn insert(&self, found: Vec<Found>) -> Result<()> {
         for f in found {
             if f.epsg != self.crs.0 {
+                continue;
+            }
+            if f.bands.is_some_and(|b| b != self.bands) {
                 continue;
             }
             if self.items.lock().unwrap().contains_key(&f.href) {
@@ -314,12 +376,6 @@ impl Inner {
                 (f64::from(iy + 1) * BLOCK_DEG).min(90.0),
             ];
             let found = search_page(&self.client, &self.search, bbox)?;
-            if found.len() >= self.search.limit as usize {
-                return Err(Error::Source(format!(
-                    "stac block search filled a whole page of {} items, coverage would be partial",
-                    found.len()
-                )));
-            }
             self.insert(found)?;
             self.searched.lock().unwrap().insert((ix, iy));
         }
@@ -347,25 +403,37 @@ impl Inner {
             }
             let reader = slot.as_mut().expect("opened above");
             let meta = reader.meta().clone();
+            let item_bands = band_count(reader)?;
+            if item_bands != self.bands {
+                return Err(Error::Source(format!(
+                    "stac item {} has {item_bands} bands, the anchor item has {}",
+                    item.href, self.bands
+                )));
+            }
             let chunk = read_chunk(reader, req, meta.origin_x, meta.origin_y, self.crs)?;
             drop(slot);
             match &mut merged {
                 None => merged = Some(chunk),
                 Some(out) => {
-                    let add = chunk.bands.band(0).expect("single band").data().to_vec();
-                    let band = out.bands.band_mut(0).expect("single band");
-                    for (o, v) in band.data_mut().iter_mut().zip(add) {
-                        if o.is_nan() {
-                            *o = v;
+                    for (bi, src) in chunk.bands.bands().iter().enumerate() {
+                        let dst = out.bands.band_mut(bi).expect("equal band counts");
+                        for (o, v) in dst.data_mut().iter_mut().zip(src.data()) {
+                            if o.is_nan() {
+                                *o = *v;
+                            }
                         }
                     }
                 }
             }
-            if let Some(out) = &merged {
-                let band = out.bands.band(0).expect("single band");
-                if !band.data().iter().any(|v| v.is_nan()) {
-                    break;
-                }
+            // a pixel is complete only when every band has a value there
+            if let Some(out) = &merged
+                && !out
+                    .bands
+                    .bands()
+                    .iter()
+                    .any(|b| b.data().iter().any(|v| v.is_nan()))
+            {
+                break;
             }
         }
         match merged {
@@ -374,16 +442,20 @@ impl Inner {
             None => {
                 let cols = (req.bbox.width() / req.resolution).round() as usize;
                 let rows = (req.bbox.height() / req.resolution).round() as usize;
-                let band = terrano_core::Raster::from_vec(
-                    cols,
-                    rows,
-                    vec![f64::NAN; cols * rows],
-                    req.resolution,
-                    f64::NAN,
-                )
-                .map_err(Error::Terrano)?;
+                let bands = (0..self.bands)
+                    .map(|_| {
+                        terrano_core::Raster::from_vec(
+                            cols,
+                            rows,
+                            vec![f64::NAN; cols * rows],
+                            req.resolution,
+                            f64::NAN,
+                        )
+                    })
+                    .collect::<core::result::Result<Vec<_>, _>>()
+                    .map_err(Error::Terrano)?;
                 Ok(RasterChunk {
-                    bands: terrano_core::BandedRaster::new(vec![band]).map_err(Error::Terrano)?,
+                    bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
                     bbox: req.bbox,
                     resolution: req.resolution,
                     crs: self.crs,
@@ -397,7 +469,7 @@ impl Source for StacSrc {
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
             dtype: SetField::one(Dtype::F64),
-            bands: SetField::one(1),
+            bands: SetField::one(self.bands),
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.base_resolution),
             chunk_px: SetField::Any,
