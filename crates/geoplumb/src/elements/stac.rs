@@ -32,6 +32,20 @@ const MAX_BLOCK_SEARCHES: usize = 32;
 /// reason: past this the mosaic is not something a pull should be doing
 const MAX_SEARCH_ITEMS: usize = 1000;
 
+/// how a pull combines the items covering one window. time is resolved
+/// here, at the source, not on the pull: `datetime` picks the interval and
+/// this picks what the interval collapses to
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Composite {
+    /// most recent item wins each pixel, older ones fill its nodata
+    #[default]
+    Latest,
+    Mean,
+    Median,
+    Min,
+    Max,
+}
+
 #[derive(Clone)]
 pub struct StacSearch {
     /// stac api root, e.g. `https://earth-search.aws.element84.com/v1`
@@ -47,6 +61,8 @@ pub struct StacSearch {
     /// items per search page. a search follows `next` links until the api
     /// runs out, so this is page size only, not a coverage limit
     pub limit: u32,
+    /// what a pull does with the items covering one window
+    pub composite: Composite,
 }
 
 impl StacSearch {
@@ -58,6 +74,7 @@ impl StacSearch {
             bbox,
             datetime: None,
             limit: 100,
+            composite: Composite::default(),
         }
     }
 }
@@ -382,36 +399,30 @@ impl Inner {
         Ok(())
     }
 
-    fn read_sync(&self, req: &WindowReq) -> Result<RasterChunk> {
-        self.ensure_coverage(&self.lonlat_bbox(&req.bbox)?)?;
-        let mut items: Vec<Arc<Item>> = self
-            .items
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|i| i.bbox.intersects(&req.bbox))
-            .cloned()
-            .collect();
-        // most recent first, so it wins the mosaic
-        items.sort_by(|a, b| b.datetime.cmp(&a.datetime));
+    /// one item's window, opening its cog on first use
+    fn read_item(&self, item: &Item, req: &WindowReq) -> Result<RasterChunk> {
+        let mut slot = item.reader.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(CogReader::open(HttpRange::new(&item.href))?);
+        }
+        let reader = slot.as_mut().expect("opened above");
+        let meta = reader.meta().clone();
+        let item_bands = band_count(reader)?;
+        if item_bands != self.bands {
+            return Err(Error::Source(format!(
+                "stac item {} has {item_bands} bands, the anchor item has {}",
+                item.href, self.bands
+            )));
+        }
+        read_chunk(reader, req, meta.origin_x, meta.origin_y, self.crs)
+    }
 
+    /// most-recent-first fill: each item patches the nodata the newer ones
+    /// left, and the walk stops as soon as every band is complete
+    fn latest(&self, items: &[Arc<Item>], req: &WindowReq) -> Result<Option<RasterChunk>> {
         let mut merged: Option<RasterChunk> = None;
         for item in items {
-            let mut slot = item.reader.lock().unwrap();
-            if slot.is_none() {
-                *slot = Some(CogReader::open(HttpRange::new(&item.href))?);
-            }
-            let reader = slot.as_mut().expect("opened above");
-            let meta = reader.meta().clone();
-            let item_bands = band_count(reader)?;
-            if item_bands != self.bands {
-                return Err(Error::Source(format!(
-                    "stac item {} has {item_bands} bands, the anchor item has {}",
-                    item.href, self.bands
-                )));
-            }
-            let chunk = read_chunk(reader, req, meta.origin_x, meta.origin_y, self.crs)?;
-            drop(slot);
+            let chunk = self.read_item(item, req)?;
             match &mut merged {
                 None => merged = Some(chunk),
                 Some(out) => {
@@ -436,30 +447,120 @@ impl Inner {
                 break;
             }
         }
+        Ok(merged)
+    }
+
+    /// every item's window reduced per pixel per band. no early exit, a
+    /// reducer needs the whole stack
+    fn reduce(
+        &self,
+        items: &[Arc<Item>],
+        req: &WindowReq,
+        op: Composite,
+    ) -> Result<Option<RasterChunk>> {
+        let chunks: Vec<RasterChunk> = items
+            .iter()
+            .map(|i| self.read_item(i, req))
+            .collect::<Result<_>>()?;
+        if chunks.is_empty() {
+            return Ok(None);
+        }
+        let (cols, rows) = (chunks[0].width(), chunks[0].height());
+        let mut bands = Vec::with_capacity(usize::from(self.bands));
+        for bi in 0..usize::from(self.bands) {
+            let planes: Vec<&[f64]> = chunks
+                .iter()
+                .map(|c| c.bands.band(bi).expect("equal band counts").data())
+                .collect();
+            let mut values = Vec::with_capacity(planes.len());
+            let mut data = Vec::with_capacity(cols * rows);
+            for p in 0..cols * rows {
+                values.clear();
+                values.extend(planes.iter().map(|pl| pl[p]).filter(|v| v.is_finite()));
+                data.push(reduce_values(&mut values, op));
+            }
+            bands.push(
+                terrano_core::Raster::from_vec(cols, rows, data, req.resolution, f64::NAN)
+                    .map_err(Error::Terrano)?,
+            );
+        }
+        Ok(Some(RasterChunk {
+            bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
+            bbox: req.bbox,
+            resolution: req.resolution,
+            crs: self.crs,
+        }))
+    }
+
+    /// nothing intersects: an all-nodata window on the source grid
+    fn empty(&self, req: &WindowReq) -> Result<RasterChunk> {
+        let cols = (req.bbox.width() / req.resolution).round() as usize;
+        let rows = (req.bbox.height() / req.resolution).round() as usize;
+        let bands = (0..self.bands)
+            .map(|_| {
+                terrano_core::Raster::from_vec(
+                    cols,
+                    rows,
+                    vec![f64::NAN; cols * rows],
+                    req.resolution,
+                    f64::NAN,
+                )
+            })
+            .collect::<core::result::Result<Vec<_>, _>>()
+            .map_err(Error::Terrano)?;
+        Ok(RasterChunk {
+            bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
+            bbox: req.bbox,
+            resolution: req.resolution,
+            crs: self.crs,
+        })
+    }
+
+    fn read_sync(&self, req: &WindowReq) -> Result<RasterChunk> {
+        self.ensure_coverage(&self.lonlat_bbox(&req.bbox)?)?;
+        let mut items: Vec<Arc<Item>> = self
+            .items
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|i| i.bbox.intersects(&req.bbox))
+            .cloned()
+            .collect();
+        // most recent first, so Latest fills in the right order. the
+        // reducers do not care, they share the sort anyway
+        items.sort_by(|a, b| b.datetime.cmp(&a.datetime));
+
+        let merged = match self.search.composite {
+            Composite::Latest => self.latest(&items, req)?,
+            op => self.reduce(&items, req, op)?,
+        };
         match merged {
             Some(chunk) => Ok(chunk),
-            // nothing intersects: an all-nodata window on the source grid
-            None => {
-                let cols = (req.bbox.width() / req.resolution).round() as usize;
-                let rows = (req.bbox.height() / req.resolution).round() as usize;
-                let bands = (0..self.bands)
-                    .map(|_| {
-                        terrano_core::Raster::from_vec(
-                            cols,
-                            rows,
-                            vec![f64::NAN; cols * rows],
-                            req.resolution,
-                            f64::NAN,
-                        )
-                    })
-                    .collect::<core::result::Result<Vec<_>, _>>()
-                    .map_err(Error::Terrano)?;
-                Ok(RasterChunk {
-                    bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
-                    bbox: req.bbox,
-                    resolution: req.resolution,
-                    crs: self.crs,
-                })
+            None => self.empty(req),
+        }
+    }
+}
+
+/// reduce one pixel's finite values across items. `vals` holds only finite
+/// values, so min and max cannot fold a NaN into the answer, and a pixel
+/// no item had a value at stays nodata
+fn reduce_values(vals: &mut [f64], op: Composite) -> f64 {
+    if vals.is_empty() {
+        return f64::NAN;
+    }
+    match op {
+        // items arrive most-recent-first, so the first value is the latest
+        Composite::Latest => vals[0],
+        Composite::Mean => vals.iter().sum::<f64>() / vals.len() as f64,
+        Composite::Min => vals.iter().copied().fold(f64::INFINITY, f64::min),
+        Composite::Max => vals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        Composite::Median => {
+            vals.sort_by(f64::total_cmp);
+            let mid = vals.len() / 2;
+            if vals.len() % 2 == 1 {
+                vals[mid]
+            } else {
+                (vals[mid - 1] + vals[mid]) / 2.0
             }
         }
     }

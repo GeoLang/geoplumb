@@ -10,7 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
 use geoplumb::element::Source;
-use geoplumb::elements::{StacSearch, StacSrc, stac::s3_to_https};
+use geoplumb::elements::{Composite, StacSearch, StacSrc, stac::s3_to_https};
 use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, WindowReq};
 use terrano_core::{BandedRaster, CogParams, Raster, write_cog, write_cog_bands};
 
@@ -255,6 +255,52 @@ async fn start_mock() -> (String, Arc<Mock>) {
                 "2024-06-01T00:00:00Z",
                 &format!("{base}/cog/right.tif"),
                 [7.3, 46.6, 7.6, 47.0],
+                4326,
+            ),
+        ];
+        (cogs, features)
+    })
+    .await
+}
+
+/// four overlapping single-band items so a pixel can be three deep: old
+/// (+1000) covers everything, mid (+100) the middle, and the 2024 pair
+/// the two halves, left holing out rows 100..120. the shifts are spaced
+/// unevenly on purpose, so a median cannot pass as a mean
+async fn start_composite_mock() -> (String, Arc<Mock>) {
+    start_mock_with(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert("c_old.tif".into(), cog(0, 600, 400, 1000.0, false));
+        cogs.insert("c_mid.tif".into(), cog(100, 400, 400, 100.0, false));
+        cogs.insert("c_left.tif".into(), cog(0, 300, 400, 0.0, true));
+        cogs.insert("c_right.tif".into(), cog(300, 300, 400, 0.0, false));
+        let features = vec![
+            item(
+                "c_left",
+                "2024-06-01T00:00:00Z",
+                &format!("{base}/cog/c_left.tif"),
+                [7.0, 46.6, 7.3, 47.0],
+                4326,
+            ),
+            item(
+                "c_right",
+                "2024-06-01T00:00:00Z",
+                &format!("{base}/cog/c_right.tif"),
+                [7.3, 46.6, 7.6, 47.0],
+                4326,
+            ),
+            item(
+                "c_mid",
+                "2022-01-01T00:00:00Z",
+                &format!("{base}/cog/c_mid.tif"),
+                [7.1, 46.6, 7.5, 47.0],
+                4326,
+            ),
+            item(
+                "c_old",
+                "2020-01-01T00:00:00Z",
+                &format!("{base}/cog/c_old.tif"),
+                [7.0, 46.6, 7.6, 47.0],
                 4326,
             ),
         ];
@@ -578,4 +624,190 @@ fn s3_hrefs_rewrite_to_https() {
         "https://copernicus-dem-30m.s3.amazonaws.com/some/key.tif"
     );
     assert_eq!(s3_to_https("https://x/y.tif"), "https://x/y.tif");
+}
+
+async fn open_composite(base: &str, composite: Composite) -> StacSrc {
+    let mut search = StacSearch::new(base, "test-dem", "data", [7.0, 46.6, 7.6, 47.0]);
+    search.composite = composite;
+    tokio::task::spawn_blocking(move || StacSrc::open(&search))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// walks every band and pixel of an exactly-sized read, handing the check
+/// the pixel center and the value there
+fn each_pixel(chunk: &RasterChunk, mut f: impl FnMut(usize, f64, f64, f64)) {
+    let res = chunk.resolution;
+    for (bi, band) in chunk.bands.bands().iter().enumerate() {
+        for row in 0..band.height() {
+            for col in 0..band.width() {
+                let x = chunk.bbox.min_x + (col as f64 + 0.5) * res;
+                let y = chunk.bbox.max_y - (row as f64 + 0.5) * res;
+                f(bi, x, y, band.data()[row * band.width() + col]);
+            }
+        }
+    }
+}
+
+fn scene_row(y: f64) -> usize {
+    ((ORIGIN_Y - y) / CELL - 0.5).round() as usize
+}
+
+/// lon 7.2..7.3 over rows 50..150: the left item covers it and holes out
+/// rows 100..120, the old item covers all of it shifted by 1000
+const OVERLAP: WindowReq = WindowReq {
+    bbox: Bbox {
+        min_x: 7.2,
+        max_x: 7.3,
+        max_y: ORIGIN_Y - 0.05,
+        min_y: ORIGIN_Y - 0.15,
+    },
+    resolution: CELL,
+};
+
+fn close(got: f64, want: f64, at: (f64, f64)) {
+    assert!(
+        (got - want).abs() < 1e-6,
+        "({:.4},{:.4}): {got} vs {want}",
+        at.0,
+        at.1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mean_averages_the_items_and_skips_their_nodata() {
+    let (base, _mock) = start_mock().await;
+    let src = open_composite(&base, Composite::Mean).await;
+    let chunk = src.read(&OVERLAP).await.unwrap().into_raster().unwrap();
+    let mut in_hole = 0;
+    each_pixel(&chunk, |_, x, y, got| {
+        let e = elevation(x, y);
+        // outside the hole both items contribute, inside only the old one,
+        // and its nodata must not drag the average toward zero
+        if (100..120).contains(&scene_row(y)) {
+            in_hole += 1;
+            close(got, e + 1000.0, (x, y));
+        } else {
+            close(got, e + 500.0, (x, y));
+        }
+    });
+    assert!(in_hole > 1000, "the window missed the hole");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn median_takes_the_middle_of_three_and_the_mean_of_two() {
+    let (base, _mock) = start_composite_mock().await;
+    let src = open_composite(&base, Composite::Median).await;
+    assert_eq!(src.item_count(), 4);
+    let chunk = src.read(&OVERLAP).await.unwrap().into_raster().unwrap();
+    let (mut three_deep, mut two_deep) = (0, 0);
+    each_pixel(&chunk, |_, x, y, got| {
+        let e = elevation(x, y);
+        if (100..120).contains(&scene_row(y)) {
+            // left holed out, leaving mid and old: the mean of the two
+            two_deep += 1;
+            close(got, e + 550.0, (x, y));
+        } else {
+            // left (+0), mid (+100) and old (+1000) stack here, so the
+            // middle value is mid, well away from their mean of +366.67
+            three_deep += 1;
+            close(got, e + 100.0, (x, y));
+        }
+    });
+    assert!(three_deep > 1000 && two_deep > 1000, "window missed a case");
+
+    // the same window under Mean, to pin that the two are distinct
+    let src = open_composite(&base, Composite::Mean).await;
+    let chunk = src.read(&OVERLAP).await.unwrap().into_raster().unwrap();
+    each_pixel(&chunk, |_, x, y, got| {
+        let e = elevation(x, y);
+        if (100..120).contains(&scene_row(y)) {
+            close(got, e + 550.0, (x, y));
+        } else {
+            close(got, e + 1100.0 / 3.0, (x, y));
+        }
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn min_and_max_pick_the_unshifted_and_shifted_items() {
+    let (base, _mock) = start_mock().await;
+    for (op, unholed, holed) in [
+        (Composite::Min, 0.0, 1000.0),
+        (Composite::Max, 1000.0, 1000.0),
+    ] {
+        let src = open_composite(&base, op).await;
+        let chunk = src.read(&OVERLAP).await.unwrap().into_raster().unwrap();
+        each_pixel(&chunk, |_, x, y, got| {
+            let shift = if (100..120).contains(&scene_row(y)) {
+                holed
+            } else {
+                unholed
+            };
+            close(got, elevation(x, y) + shift, (x, y));
+        });
+    }
+}
+
+/// lon 7.5..7.7 runs off the east edge of every item at 7.6, so the far
+/// half has no finite value to reduce and must stay nodata
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pixel_no_item_covers_stays_nodata() {
+    let (base, _mock) = start_mock().await;
+    let req = WindowReq {
+        bbox: Bbox {
+            min_x: 7.5,
+            max_x: 7.7,
+            max_y: ORIGIN_Y - 0.05,
+            min_y: ORIGIN_Y - 0.15,
+        },
+        resolution: CELL,
+    };
+    let src = open_composite(&base, Composite::Min).await;
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    let (mut covered, mut bare) = (0, 0);
+    each_pixel(&chunk, |_, x, y, got| {
+        if x < 7.6 {
+            covered += 1;
+            close(got, elevation(x, y), (x, y));
+        } else {
+            bare += 1;
+            assert!(got.is_nan(), "({x:.4},{y:.4}) past every item: {got}");
+        }
+    });
+    assert!(covered > 1000 && bare > 1000, "window missed a case");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_multi_band_composite_reduces_each_band_independently() {
+    let (base, _mock) = start_mb_mock().await;
+    let src = open_composite(&base, Composite::Mean).await;
+    assert_eq!(src.bands(), MB_BANDS as u16);
+    // taller than OVERLAP: the per-band holes run down to row 180
+    let req = WindowReq {
+        bbox: Bbox {
+            min_y: ORIGIN_Y - 0.20,
+            ..OVERLAP.bbox
+        },
+        ..OVERLAP
+    };
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    assert_eq!(chunk.bands.band_count(), MB_BANDS);
+    let mut holes_hit = [0usize; MB_BANDS];
+    each_pixel(&chunk, |bi, x, y, got| {
+        // each band holes out its own rows, so the band that falls back to
+        // the old item alone differs row by row
+        let shift = if hole_rows(bi).contains(&scene_row(y)) {
+            holes_hit[bi] += 1;
+            1000.0
+        } else {
+            500.0
+        };
+        close(got, mb_value(bi, x, y, shift), (x, y));
+    });
+    assert!(
+        holes_hit.iter().all(|&n| n > 1000),
+        "a band's hole was missed: {holes_hit:?}"
+    );
 }

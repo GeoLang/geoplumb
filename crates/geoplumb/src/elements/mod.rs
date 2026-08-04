@@ -18,7 +18,7 @@ pub use mosaic::Mosaic;
 pub use points::{IdwGrid, LasSrc};
 pub use reproject::{Reproject, VecReproject};
 pub use source::RasterSrc;
-pub use stac::{StacSearch, StacSrc};
+pub use stac::{Composite, StacSearch, StacSrc};
 pub use tensor::{TensorConv, ToRaster, ToTensor};
 pub use vec_ops::{VecClip, VecFilter, VecSchema};
 pub use vector::{Burn, Rasterize, VecSrc};
