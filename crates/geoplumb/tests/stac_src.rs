@@ -617,6 +617,157 @@ async fn multi_band_mosaic_fills_holes_per_band() {
     assert!(holes_hit > 1000, "the window missed the holes");
 }
 
+/// item whose bands live in one cog per asset, sentinel-2 style
+fn asset_item(id: &str, dt: &str, assets: &[(&str, String)], bbox: [f64; 4]) -> serde_json::Value {
+    let mut f = serde_json::json!({
+        "id": id,
+        "bbox": bbox,
+        "properties": { "datetime": dt, "proj:epsg": 4326 },
+        "assets": {}
+    });
+    for (key, href) in assets {
+        f["assets"][key] = serde_json::json!({ "href": href });
+    }
+    f
+}
+
+/// nir values sit 5000 over red everywhere, so band order is visible
+const NIR_SHIFT: f64 = 5000.0;
+
+/// per-band-asset scene: the 2024 pair carries red and nir cogs, red left
+/// holed, the 2020 item covers everything shifted by 1000, and one item
+/// only has a red asset
+async fn start_asset_mock() -> (String, Arc<Mock>) {
+    start_mock_with(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert("r_left.tif".into(), cog(0, 300, 400, 0.0, true));
+        cogs.insert("n_left.tif".into(), cog(0, 300, 400, NIR_SHIFT, false));
+        cogs.insert("r_right.tif".into(), cog(300, 300, 400, 0.0, false));
+        cogs.insert("n_right.tif".into(), cog(300, 300, 400, NIR_SHIFT, false));
+        cogs.insert("r_old.tif".into(), cog(0, 600, 400, 1000.0, false));
+        cogs.insert(
+            "n_old.tif".into(),
+            cog(0, 600, 400, NIR_SHIFT + 1000.0, false),
+        );
+        let features = vec![
+            asset_item(
+                "a_left",
+                "2024-06-01T00:00:00Z",
+                &[
+                    ("red", format!("{base}/cog/r_left.tif")),
+                    ("nir", format!("{base}/cog/n_left.tif")),
+                ],
+                [7.0, 46.6, 7.3, 47.0],
+            ),
+            asset_item(
+                "a_right",
+                "2024-06-01T00:00:00Z",
+                &[
+                    ("red", format!("{base}/cog/r_right.tif")),
+                    ("nir", format!("{base}/cog/n_right.tif")),
+                ],
+                [7.3, 46.6, 7.6, 47.0],
+            ),
+            asset_item(
+                "a_old",
+                "2020-01-01T00:00:00Z",
+                &[
+                    ("red", format!("{base}/cog/r_old.tif")),
+                    ("nir", format!("{base}/cog/n_old.tif")),
+                ],
+                [7.0, 46.6, 7.6, 47.0],
+            ),
+            asset_item(
+                "a_partial",
+                "2025-01-01T00:00:00Z",
+                &[("red", format!("{base}/cog/r_old.tif"))],
+                [7.0, 46.6, 7.6, 47.0],
+            ),
+        ];
+        (cogs, features)
+    })
+    .await
+}
+
+async fn open_assets(base: &str, assets: &[&str]) -> Result<StacSrc, geoplumb::Error> {
+    let mut search = StacSearch::new(base, "test-s2", "red", [7.0, 46.6, 7.6, 47.0]);
+    search.assets = assets.iter().map(|a| a.to_string()).collect();
+    tokio::task::spawn_blocking(move || StacSrc::open(&search))
+        .await
+        .unwrap()
+}
+
+/// per-band assets stack into one raster in asset order, items missing an
+/// asset are skipped, and the mosaic still fills each band independently:
+/// the newest red is holed and fills from the old item, nir is not
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_asset_cogs_stack_in_asset_order() {
+    let (base, _mock) = start_asset_mock().await;
+    let src = open_assets(&base, &["red", "nir"]).await.unwrap();
+    // the partial item lacks a nir asset, three full items remain
+    assert_eq!(src.item_count(), 3);
+    assert_eq!(src.bands(), 2);
+
+    let chunk = src.read(&SEAM).await.unwrap().into_raster().unwrap();
+    assert_eq!(chunk.bands.band_count(), 2);
+    let mut in_hole = 0;
+    each_pixel(&chunk, |bi, x, y, got| {
+        let holed = x < 7.3 && (100..120).contains(&scene_row(y));
+        let expected = match bi {
+            // red: the 2024 pair, with the old item showing in the hole
+            0 => elevation(x, y) + if holed { 1000.0 } else { 0.0 },
+            // nir: nothing holed, the 2024 pair everywhere
+            _ => elevation(x, y) + NIR_SHIFT,
+        };
+        in_hole += usize::from(holed && bi == 0);
+        close(got, expected, (x, y));
+    });
+    assert!(in_hole > 1000, "the window missed the red hole");
+}
+
+/// assets at different resolutions cannot stack, the open fails loud
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn assets_on_different_grids_fail_at_open() {
+    let (base, _mock) = start_mock_with(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert("fine.tif".into(), cog(0, 300, 400, 0.0, false));
+        let coarse = {
+            let mut data = Vec::with_capacity(150 * 200);
+            for row in 0..200 {
+                for col in 0..150 {
+                    let lon = ORIGIN_X + col as f64 * 2.0 * CELL + CELL;
+                    let lat = ORIGIN_Y - row as f64 * 2.0 * CELL - CELL;
+                    data.push(elevation(lon, lat));
+                }
+            }
+            let raster = Raster::from_vec(150, 200, data, 2.0 * CELL, f64::NAN).unwrap();
+            let mut params = params(0);
+            params.pixel_width = 2.0 * CELL;
+            params.pixel_height = 2.0 * CELL;
+            let mut buf = std::io::Cursor::new(Vec::new());
+            write_cog(&raster, &params, &mut buf).unwrap();
+            buf.into_inner()
+        };
+        cogs.insert("coarse.tif".into(), coarse);
+        let features = vec![asset_item(
+            "mixed",
+            "2024-06-01T00:00:00Z",
+            &[
+                ("red", format!("{base}/cog/fine.tif")),
+                ("nir", format!("{base}/cog/coarse.tif")),
+            ],
+            [7.0, 46.6, 7.3, 47.0],
+        )];
+        (cogs, features)
+    })
+    .await;
+    let err = match open_assets(&base, &["red", "nir"]).await {
+        Ok(_) => panic!("mixed-resolution assets opened"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("different resolutions"), "{err}");
+}
+
 #[test]
 fn s3_hrefs_rewrite_to_https() {
     assert_eq!(

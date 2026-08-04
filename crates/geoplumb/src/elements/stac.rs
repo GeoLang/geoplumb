@@ -2,9 +2,12 @@
 //! blocks cached for the source's lifetime, so coverage is not bound to
 //! the bbox given at open. open searches that bbox once to anchor the
 //! grid, crs and band count on the most recent item. items are filtered
-//! to the anchor crs and band count, searches follow `next` links to the
-//! end, each item's cog asset opens lazily over http range requests, and
-//! a pull mosaics its items most-recent-first, band by band
+//! to the anchor crs and band counts, searches follow `next` links to the
+//! end, each item's cog assets open lazily over http range requests, and
+//! a pull mosaics its items most-recent-first, band by band. a search may
+//! name several assets (collections like sentinel-2 spread bands across
+//! per-band cogs): an item is kept only when every asset is present, and
+//! a pull reads them all, bands concatenated in asset order
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -51,8 +54,10 @@ pub struct StacSearch {
     /// stac api root, e.g. `https://earth-search.aws.element84.com/v1`
     pub api: String,
     pub collection: String,
-    /// asset key holding the cog, e.g. `data`
-    pub asset: String,
+    /// asset keys holding the cogs, e.g. `["data"]`, or `["red", "nir"]`
+    /// for a collection with one cog per band. items missing any listed
+    /// asset are skipped, pulls concatenate bands in this order
+    pub assets: Vec<String>,
     /// lon/lat anchor bbox: min lon, min lat, max lon, max lat. searched
     /// once at open to pick the grid and crs, pulls search past it lazily
     pub bbox: [f64; 4],
@@ -70,7 +75,7 @@ impl StacSearch {
         StacSearch {
             api: api.into(),
             collection: collection.into(),
-            asset: asset.into(),
+            assets: vec![asset.into()],
             bbox,
             datetime: None,
             limit: 100,
@@ -80,28 +85,34 @@ impl StacSearch {
 }
 
 struct Found {
-    href: String,
+    /// one href per search asset, in asset order
+    hrefs: Vec<String>,
     datetime: String,
     /// lon/lat footprint straight from the stac feature
     bbox: [f64; 4],
     epsg: u32,
-    /// band count the asset declares, `None` when it declares none
-    bands: Option<u16>,
+    /// band count each asset declares, `None` when it declares none
+    bands: Vec<Option<u16>>,
 }
 
 struct Item {
-    href: String,
+    /// one href per search asset, in asset order
+    hrefs: Vec<String>,
     datetime: String,
     /// footprint in the source crs, for skipping items a pull misses
     bbox: Bbox,
-    reader: Mutex<Option<CogReader<HttpRange>>>,
+    /// one lazily opened reader per asset
+    readers: Vec<Mutex<Option<CogReader<HttpRange>>>>,
 }
 
 struct Inner {
     search: StacSearch,
     client: reqwest::blocking::Client,
     crs: Crs,
-    /// band count of the anchor item's cog, which every kept item shares
+    /// per-asset band counts of the anchor item's cogs, which every kept
+    /// item shares
+    asset_bands: Vec<u16>,
+    /// their sum, the band count a pull produces
     bands: u16,
     /// lon/lat to source crs for item footprints, `None` when it is 4326
     to_native: Option<projicio_core::Transform>,
@@ -170,7 +181,7 @@ fn search_page(
             )));
         }
         for f in features {
-            if let Some(item) = parse_found(f, &search.asset) {
+            if let Some(item) = parse_found(f, &search.assets) {
                 found.push(item);
             }
         }
@@ -189,8 +200,12 @@ fn search_page(
     Ok(found)
 }
 
-fn parse_found(f: &serde_json::Value, asset: &str) -> Option<Found> {
-    let href = f["assets"][asset]["href"].as_str()?;
+fn parse_found(f: &serde_json::Value, assets: &[String]) -> Option<Found> {
+    // every asset or none: a partial item cannot serve a full band stack
+    let hrefs: Vec<String> = assets
+        .iter()
+        .map(|a| f["assets"][a]["href"].as_str().map(s3_to_https))
+        .collect::<Option<_>>()?;
     let datetime = f["properties"]["datetime"]
         .as_str()
         .unwrap_or("")
@@ -204,16 +219,25 @@ fn parse_found(f: &serde_json::Value, asset: &str) -> Option<Found> {
     }
     let epsg = f["properties"]["proj:epsg"]
         .as_u64()
-        .or_else(|| f["assets"][asset]["proj:epsg"].as_u64())
+        .or_else(|| {
+            assets
+                .iter()
+                .find_map(|a| f["assets"][a]["proj:epsg"].as_u64())
+        })
         .unwrap_or(0) as u32;
     // raster:bands is the per-asset one, eo:bands the spectral list, both
-    // one entry per band. a collection declaring neither is not filtered
-    let bands = ["raster:bands", "eo:bands"]
+    // one entry per band. an asset declaring neither is not filtered
+    let bands = assets
         .iter()
-        .find_map(|k| f["assets"][asset][k].as_array())
-        .and_then(|a| u16::try_from(a.len()).ok());
+        .map(|a| {
+            ["raster:bands", "eo:bands"]
+                .iter()
+                .find_map(|k| f["assets"][a][k].as_array())
+                .and_then(|arr| u16::try_from(arr.len()).ok())
+        })
+        .collect();
     Some(Found {
-        href: s3_to_https(href),
+        hrefs,
         datetime,
         bbox: [bbox[0], bbox[1], bbox[2], bbox[3]],
         epsg,
@@ -222,22 +246,25 @@ fn parse_found(f: &serde_json::Value, asset: &str) -> Option<Found> {
 }
 
 impl StacSrc {
-    /// searches the anchor bbox and opens the most recent item's cog to
+    /// searches the anchor bbox and opens the most recent item's cogs to
     /// anchor the grid. blocking http, call it off the async runtime
     pub fn open(search: &StacSearch) -> Result<StacSrc> {
+        if search.assets.is_empty() {
+            return Err(Error::Source("stac search names no assets".into()));
+        }
         let client = reqwest::blocking::Client::new();
         let mut found = search_page(&client, search, search.bbox)?;
         if found.is_empty() {
             return Err(Error::Source(format!(
-                "stac search matched no items with asset {:?}",
-                search.asset
+                "stac search matched no items with assets {:?}",
+                search.assets
             )));
         }
         // most recent first, so it anchors crs and grid
         found.sort_by(|a, b| b.datetime.cmp(&a.datetime));
         let epsg = found[0].epsg;
         let crs = Crs(epsg);
-        let anchor_href = found[0].href.clone();
+        let anchor_key = found[0].hrefs[0].clone();
 
         let (to_native, to_lonlat) = if epsg == 4326 {
             (None, None)
@@ -253,16 +280,35 @@ impl StacSrc {
             )
         };
 
-        // the anchor cog opens before the filter runs, its band count is
-        // what the other items are held to
-        let reader = CogReader::open(HttpRange::new(&anchor_href))?;
-        let meta = reader.meta().clone();
-        let bands = band_count(&reader)?;
+        // the anchor cogs open before the filter runs, their band counts
+        // are what the other items are held to
+        let readers = found[0]
+            .hrefs
+            .iter()
+            .map(|href| CogReader::open(HttpRange::new(href)))
+            .collect::<core::result::Result<Vec<_>, _>>()?;
+        let meta = readers[0].meta().clone();
+        for (reader, asset) in readers.iter().zip(&search.assets) {
+            let res = reader.meta().pixel_width;
+            if res != meta.pixel_width {
+                return Err(Error::Source(format!(
+                    "asset {asset} has pixel size {res}, asset {} has {}: \
+                     assets on different resolutions cannot stack into one raster",
+                    search.assets[0], meta.pixel_width
+                )));
+            }
+        }
+        let asset_bands = readers
+            .iter()
+            .map(band_count)
+            .collect::<Result<Vec<u16>>>()?;
+        let bands = asset_bands.iter().sum();
 
         let inner = Inner {
             search: search.clone(),
             client,
             crs,
+            asset_bands,
             bands,
             to_native,
             to_lonlat,
@@ -274,14 +320,16 @@ impl StacSrc {
             .items
             .lock()
             .unwrap()
-            .get(&anchor_href)
+            .get(&anchor_key)
             .cloned()
             .ok_or_else(|| {
                 Error::Source(format!(
-                    "anchor item {anchor_href} declares a band count its cog does not have"
+                    "anchor item {anchor_key} declares a band count its cogs do not have"
                 ))
             })?;
-        *anchor.reader.lock().unwrap() = Some(reader);
+        for (slot, reader) in anchor.readers.iter().zip(readers) {
+            *slot.lock().unwrap() = Some(reader);
+        }
         Ok(StacSrc {
             inner: Arc::new(inner),
             origin_x: meta.origin_x,
@@ -302,7 +350,8 @@ impl StacSrc {
         self.crs
     }
 
-    /// the band count all kept items share, from the anchor item's cog
+    /// the band count all kept items share: the anchor item's cog bands,
+    /// summed across the search's assets
     pub fn bands(&self) -> u16 {
         self.bands
     }
@@ -337,26 +386,31 @@ impl Inner {
         }
     }
 
-    /// keep items matching the anchor's crs and band count, one shared
-    /// copy per href
+    /// keep items matching the anchor's crs and per-asset band counts,
+    /// one shared copy per item, keyed by its first asset's href
     fn insert(&self, found: Vec<Found>) -> Result<()> {
         for f in found {
             if f.epsg != self.crs.0 {
                 continue;
             }
-            if f.bands.is_some_and(|b| b != self.bands) {
+            if f.bands
+                .iter()
+                .zip(&self.asset_bands)
+                .any(|(declared, anchor)| declared.is_some_and(|b| b != *anchor))
+            {
                 continue;
             }
-            if self.items.lock().unwrap().contains_key(&f.href) {
+            if self.items.lock().unwrap().contains_key(&f.hrefs[0]) {
                 continue;
             }
+            let key = f.hrefs[0].clone();
             let item = Arc::new(Item {
                 bbox: self.native_bbox(&f.bbox)?,
-                href: f.href.clone(),
+                readers: f.hrefs.iter().map(|_| Mutex::new(None)).collect(),
+                hrefs: f.hrefs,
                 datetime: f.datetime,
-                reader: Mutex::new(None),
             });
-            self.items.lock().unwrap().insert(f.href, item);
+            self.items.lock().unwrap().insert(key, item);
         }
         Ok(())
     }
@@ -399,22 +453,33 @@ impl Inner {
         Ok(())
     }
 
-    /// one item's window, opening its cog on first use
+    /// one item's window across every asset, bands concatenated in asset
+    /// order, each cog opening on first use
     fn read_item(&self, item: &Item, req: &WindowReq) -> Result<RasterChunk> {
-        let mut slot = item.reader.lock().unwrap();
-        if slot.is_none() {
-            *slot = Some(CogReader::open(HttpRange::new(&item.href))?);
+        let mut bands = Vec::with_capacity(usize::from(self.bands));
+        for (k, slot) in item.readers.iter().enumerate() {
+            let mut slot = slot.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(CogReader::open(HttpRange::new(&item.hrefs[k]))?);
+            }
+            let reader = slot.as_mut().expect("opened above");
+            let meta = reader.meta().clone();
+            let asset_bands = band_count(reader)?;
+            if asset_bands != self.asset_bands[k] {
+                return Err(Error::Source(format!(
+                    "stac item asset {} has {asset_bands} bands, the anchor item has {}",
+                    item.hrefs[k], self.asset_bands[k]
+                )));
+            }
+            let chunk = read_chunk(reader, req, meta.origin_x, meta.origin_y, self.crs)?;
+            bands.extend(chunk.bands.into_bands());
         }
-        let reader = slot.as_mut().expect("opened above");
-        let meta = reader.meta().clone();
-        let item_bands = band_count(reader)?;
-        if item_bands != self.bands {
-            return Err(Error::Source(format!(
-                "stac item {} has {item_bands} bands, the anchor item has {}",
-                item.href, self.bands
-            )));
-        }
-        read_chunk(reader, req, meta.origin_x, meta.origin_y, self.crs)
+        Ok(RasterChunk {
+            bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
+            bbox: req.bbox,
+            resolution: req.resolution,
+            crs: self.crs,
+        })
     }
 
     /// most-recent-first fill: each item patches the nodata the newer ones
