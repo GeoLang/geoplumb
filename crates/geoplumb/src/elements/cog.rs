@@ -3,7 +3,8 @@
 //! requested ladder level. when the file pyramid is shallower than the
 //! request the remainder is block-averaged, matching RasterSrc semantics
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use crate::caps::{
     CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
@@ -173,56 +174,245 @@ fn decimate(fine: &[f64], cols: usize, rows: usize, factor: usize) -> Vec<f64> {
     out
 }
 
-/// range-request transport for remote cogs. blocking, so it must run off
-/// the async runtime, which `CogSrc::read` already does. transient faults
-/// (send errors, 5xx, 429, short or failed bodies) retry with backoff
+/// range-request transport for remote cogs. blocking to its caller, so
+/// it must run off the async runtime, which `CogSrc::read` already does,
+/// but fetches run multiplexed on a small dedicated runtime: a
+/// `read_ranges` call fetches all its misses concurrently. transient
+/// faults (send errors, 5xx, 429, short or failed bodies) retry with
+/// backoff
 pub struct HttpRange {
-    client: reqwest::blocking::Client,
     url: String,
 }
 
 const RANGE_ATTEMPTS: u32 = 3;
 const RANGE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
-impl HttpRange {
-    pub fn new(url: impl Into<String>) -> Self {
-        HttpRange {
-            client: reqwest::blocking::Client::new(),
-            url: url.into(),
+/// transfers in flight across the process, however many readers are
+/// mid-read. queued transfers wait on a semaphore, not a thread
+const MAX_PARALLEL_TRANSFERS: usize = 48;
+
+static FETCH_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("range-fetch")
+        .enable_all()
+        .build()
+        .expect("fetch runtime never fails to build")
+});
+
+static FETCH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+
+static TRANSFER_PERMITS: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(MAX_PARALLEL_TRANSFERS));
+
+/// one fetch attempt, the bool says whether the failure is transient
+async fn fetch_once(
+    url: &str,
+    offset: u64,
+    len: u64,
+) -> core::result::Result<Vec<u8>, (bool, String)> {
+    let end = offset + len - 1;
+    let resp = FETCH_CLIENT
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
+        .send()
+        .await
+        .map_err(|e| (true, format!("range request failed: {e}")))?;
+    let status = resp.status();
+    if status.is_client_error() || status.is_server_error() {
+        let transient =
+            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        return Err((transient, format!("range request failed: status {status}")));
+    }
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err((
+            false,
+            format!("server ignored the range header (status {status})"),
+        ));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| (true, format!("range body read failed: {e}")))?;
+    if bytes.len() as u64 != len {
+        return Err((
+            true,
+            format!("range returned {} bytes, wanted {len}", bytes.len()),
+        ));
+    }
+    Ok(bytes.to_vec())
+}
+
+/// retried fetch under a transfer permit
+async fn fetch_range(
+    url: &str,
+    offset: u64,
+    len: u64,
+) -> core::result::Result<Vec<u8>, terrano_core::Error> {
+    let _permit = TRANSFER_PERMITS
+        .acquire()
+        .await
+        .expect("semaphore is never closed");
+    let mut attempts = 0;
+    let mut delay = RANGE_BACKOFF;
+    loop {
+        match fetch_once(url, offset, len).await {
+            Ok(bytes) => return Ok(bytes),
+            Err((transient, detail)) => {
+                attempts += 1;
+                if !transient || attempts == RANGE_ATTEMPTS {
+                    return Err(terrano_core::Error::Format(detail));
+                }
+                tokio::time::sleep(delay).await;
+                delay *= 4;
+            }
+        }
+    }
+}
+
+/// process-wide budget for cached range bytes, compressed as fetched
+const RANGE_CACHE_BUDGET: usize = 256 << 20;
+
+type RangeKey = (String, u64, u64);
+
+enum RangeSlot {
+    /// a fetch is in flight, waiters sleep on the condvar
+    Pending,
+    Ready {
+        bytes: Arc<Vec<u8>>,
+        used: u64,
+    },
+}
+
+/// what `probe` found without waiting
+enum Probe {
+    Ready(Arc<Vec<u8>>),
+    /// the key is now claimed pending, the caller must fetch and publish
+    Claimed,
+    /// another caller's fetch is in flight
+    InFlight,
+}
+
+struct RangeState {
+    slots: HashMap<RangeKey, RangeSlot>,
+    bytes: usize,
+    /// bumps per touch, so eviction can drop the least recently used
+    tick: u64,
+}
+
+/// cog readers fetch an interior tile as the same exact byte range every
+/// time, so the concurrent chunks of a pull that touch the same tile
+/// dedup here instead of re-fetching it. misses are single-flight: the
+/// first caller fetches while the rest wait, and an abandoned claim (the
+/// fetch failed) wakes a waiter to become the fetcher
+struct RangeCache {
+    state: Mutex<RangeState>,
+    done: Condvar,
+}
+
+static RANGE_CACHE: LazyLock<RangeCache> = LazyLock::new(|| RangeCache {
+    state: Mutex::new(RangeState {
+        slots: HashMap::new(),
+        bytes: 0,
+        tick: 0,
+    }),
+    done: Condvar::new(),
+});
+
+impl RangeCache {
+    /// like `get_or_claim` but never waits on someone else's fetch, so a
+    /// caller can collect its own claims without holding them while
+    /// blocked, which is what would deadlock two callers over one url
+    fn probe(&self, key: &RangeKey) -> Probe {
+        let mut st = self.state.lock().unwrap();
+        st.tick += 1;
+        let tick = st.tick;
+        match st.slots.get_mut(key) {
+            Some(RangeSlot::Ready { bytes, used }) => {
+                *used = tick;
+                Probe::Ready(bytes.clone())
+            }
+            Some(RangeSlot::Pending) => Probe::InFlight,
+            None => {
+                st.slots.insert(key.clone(), RangeSlot::Pending);
+                Probe::Claimed
+            }
         }
     }
 
-    /// one fetch attempt, the bool says whether the failure is transient
-    fn fetch(&self, offset: u64, len: u64) -> core::result::Result<Vec<u8>, (bool, String)> {
-        let end = offset + len - 1;
-        let resp = self
-            .client
-            .get(&self.url)
-            .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
-            .send()
-            .map_err(|e| (true, format!("range request failed: {e}")))?;
-        let status = resp.status();
-        if status.is_client_error() || status.is_server_error() {
-            let transient =
-                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-            return Err((transient, format!("range request failed: status {status}")));
+    /// cached bytes, or `None` with the key claimed pending: the caller
+    /// must fetch and `publish` the result
+    fn get_or_claim(&self, key: &RangeKey) -> Option<Arc<Vec<u8>>> {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            st.tick += 1;
+            let tick = st.tick;
+            match st.slots.get_mut(key) {
+                Some(RangeSlot::Ready { bytes, used }) => {
+                    *used = tick;
+                    return Some(bytes.clone());
+                }
+                Some(RangeSlot::Pending) => st = self.done.wait(st).unwrap(),
+                None => {
+                    st.slots.insert(key.clone(), RangeSlot::Pending);
+                    return None;
+                }
+            }
         }
-        if status != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err((
-                false,
-                format!("server ignored the range header (status {status})"),
-            ));
+    }
+
+    fn publish(&self, key: &RangeKey, fetched: Option<Arc<Vec<u8>>>) {
+        let mut st = self.state.lock().unwrap();
+        match fetched {
+            Some(bytes) => {
+                st.bytes += bytes.len();
+                st.tick += 1;
+                let used = st.tick;
+                st.slots
+                    .insert(key.clone(), RangeSlot::Ready { bytes, used });
+                while st.bytes > RANGE_CACHE_BUDGET {
+                    let oldest = st
+                        .slots
+                        .iter()
+                        .filter_map(|(k, s)| match s {
+                            RangeSlot::Ready { bytes, used } => {
+                                Some((*used, k.clone(), bytes.len()))
+                            }
+                            RangeSlot::Pending => None,
+                        })
+                        .min_by_key(|(used, _, _)| *used);
+                    let Some((_, k, n)) = oldest else { break };
+                    st.slots.remove(&k);
+                    st.bytes -= n;
+                }
+            }
+            None => {
+                st.slots.remove(key);
+            }
         }
-        let bytes = resp
-            .bytes()
-            .map_err(|e| (true, format!("range body read failed: {e}")))?;
-        if bytes.len() as u64 != len {
-            return Err((
-                true,
-                format!("range returned {} bytes, wanted {len}", bytes.len()),
-            ));
+        drop(st);
+        self.done.notify_all();
+    }
+}
+
+impl HttpRange {
+    pub fn new(url: impl Into<String>) -> Self {
+        HttpRange { url: url.into() }
+    }
+
+    /// fetch one claimed range on the fetch runtime and publish it
+    fn fetch_claimed(&self, key: &RangeKey) -> core::result::Result<Vec<u8>, terrano_core::Error> {
+        match FETCH_RT.block_on(fetch_range(&self.url, key.1, key.2)) {
+            Ok(bytes) => {
+                let bytes = Arc::new(bytes);
+                RANGE_CACHE.publish(key, Some(bytes.clone()));
+                Ok((*bytes).clone())
+            }
+            Err(e) => {
+                RANGE_CACHE.publish(key, None);
+                Err(e)
+            }
         }
-        Ok(bytes.to_vec())
     }
 }
 
@@ -232,20 +422,69 @@ impl RangeRead for HttpRange {
         offset: u64,
         len: u64,
     ) -> core::result::Result<Vec<u8>, terrano_core::Error> {
-        let mut attempts = 0;
-        let mut delay = RANGE_BACKOFF;
-        loop {
-            match self.fetch(offset, len) {
-                Ok(bytes) => return Ok(bytes),
-                Err((transient, detail)) => {
-                    attempts += 1;
-                    if !transient || attempts == RANGE_ATTEMPTS {
-                        return Err(terrano_core::Error::Format(detail));
+        Ok(self.read_ranges(&[(offset, len)])?.remove(0))
+    }
+
+    /// misses fetch concurrently on the dedicated runtime. claims are
+    /// held only while their fetches run, and waiting on another
+    /// caller's in-flight fetch happens after every own claim has been
+    /// published, so callers cannot deadlock on each other's claims
+    fn read_ranges(
+        &mut self,
+        ranges: &[(u64, u64)],
+    ) -> core::result::Result<Vec<Vec<u8>>, terrano_core::Error> {
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; ranges.len()];
+        let mut mine = Vec::new();
+        let mut theirs = Vec::new();
+        for (i, &(offset, len)) in ranges.iter().enumerate() {
+            let key = (self.url.clone(), offset, len);
+            match RANGE_CACHE.probe(&key) {
+                Probe::Ready(bytes) => out[i] = Some((*bytes).clone()),
+                Probe::Claimed => mine.push(i),
+                Probe::InFlight => theirs.push(i),
+            }
+        }
+
+        let mut first_err = None;
+        if !mine.is_empty() {
+            let url = &self.url;
+            let fetched = FETCH_RT.block_on(futures::future::join_all(mine.iter().map(|&i| {
+                let (offset, len) = ranges[i];
+                async move { (i, fetch_range(url, offset, len).await) }
+            })));
+            for (i, result) in fetched {
+                let (offset, len) = ranges[i];
+                let key = (self.url.clone(), offset, len);
+                match result {
+                    Ok(bytes) => {
+                        let bytes = Arc::new(bytes);
+                        RANGE_CACHE.publish(&key, Some(bytes.clone()));
+                        out[i] = Some((*bytes).clone());
                     }
-                    std::thread::sleep(delay);
-                    delay *= 4;
+                    Err(e) => {
+                        RANGE_CACHE.publish(&key, None);
+                        first_err.get_or_insert(e);
+                    }
                 }
             }
         }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+
+        for i in theirs {
+            let (offset, len) = ranges[i];
+            let key = (self.url.clone(), offset, len);
+            out[i] = Some(match RANGE_CACHE.get_or_claim(&key) {
+                Some(bytes) => (*bytes).clone(),
+                // the fetch that was in flight failed, this caller takes over
+                None => self.fetch_claimed(&key)?,
+            });
+        }
+
+        Ok(out
+            .into_iter()
+            .map(|o| o.expect("every range resolved"))
+            .collect())
     }
 }

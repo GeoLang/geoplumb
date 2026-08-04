@@ -241,6 +241,53 @@ async fn range_handler(
     )
 }
 
+async fn counting_handler(
+    State((bytes, hits)): State<(Arc<Vec<u8>>, Arc<AtomicUsize>)>,
+    headers: HeaderMap,
+) -> (StatusCode, Vec<u8>) {
+    hits.fetch_add(1, Ordering::SeqCst);
+    range_handler(State(bytes), headers).await
+}
+
+/// the process-wide range cache: a second reader on the same url issues
+/// the same header and tile ranges and must be served from cache
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_ranges_are_fetched_once_across_readers() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route("/dem.tif", get(counting_handler))
+        .with_state((Arc::new(cog_bytes(2)), hits.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let url = format!("http://{addr}/dem.tif");
+    let u = url.clone();
+    let src = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(u)))
+        .await
+        .unwrap()
+        .unwrap();
+    let req = WindowReq {
+        bbox: window(20, 20, 340, 230),
+        resolution: CELL,
+    };
+    let a = src.read(&req).await.unwrap().into_raster().unwrap();
+    let after_first = hits.load(Ordering::SeqCst);
+    assert!(after_first > 0, "nothing was fetched at all");
+
+    let src2 = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(url)))
+        .await
+        .unwrap()
+        .unwrap();
+    let b = src2.read(&req).await.unwrap().into_raster().unwrap();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        after_first,
+        "cached ranges were re-fetched"
+    );
+    assert_bands_close(&a, &b, 1e-12);
+}
+
 async fn flaky_handler(
     State((bytes, hits)): State<(Arc<Vec<u8>>, Arc<AtomicUsize>)>,
     headers: HeaderMap,
