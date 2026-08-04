@@ -7,10 +7,11 @@
 //! a pull mosaics its items most-recent-first, band by band. a search may
 //! name several assets (collections like sentinel-2 spread bands across
 //! per-band cogs): an item is kept only when every asset is present, and
-//! a pull reads them all, bands concatenated in asset order
+//! a pull reads them all, bands concatenated in asset order. item reads
+//! run in parallel, capped across every pull in the process
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::caps::{
     CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
@@ -34,6 +35,19 @@ const MAX_BLOCK_SEARCHES: usize = 32;
 /// features one search may accumulate across its pages, for the same
 /// reason: past this the mosaic is not something a pull should be doing
 const MAX_SEARCH_ITEMS: usize = 1000;
+
+/// item reads in flight across every pull in the process. each read is
+/// blocking http offloaded to the runtime's blocking pool, so without a
+/// shared cap n concurrent pulls would stack n windows' worth of threads
+const MAX_PARALLEL_ITEM_READS: usize = 64;
+
+static ITEM_READ_PERMITS: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(MAX_PARALLEL_ITEM_READS));
+
+/// readers an item keeps per asset once a read returns them. each pooled
+/// reader holds its own http client and client thread, so an uncapped
+/// pool retains one thread per concurrent read it ever saw
+const POOLED_READERS_PER_ASSET: usize = 4;
 
 /// how a pull combines the items covering one window. time is resolved
 /// here, at the source, not on the pull: `datetime` picks the interval and
@@ -101,8 +115,10 @@ struct Item {
     datetime: String,
     /// footprint in the source crs, for skipping items a pull misses
     bbox: Bbox,
-    /// one lazily opened reader per asset
-    readers: Vec<Mutex<Option<CogReader<HttpRange>>>>,
+    /// per-asset pools of opened readers: a read takes one out, opens
+    /// fresh when the pool is empty, and puts it back after, so
+    /// concurrent chunks of one pull do not serialize on an item
+    readers: Vec<Mutex<Vec<CogReader<HttpRange>>>>,
 }
 
 struct Inner {
@@ -327,8 +343,8 @@ impl StacSrc {
                     "anchor item {anchor_key} declares a band count its cogs do not have"
                 ))
             })?;
-        for (slot, reader) in anchor.readers.iter().zip(readers) {
-            *slot.lock().unwrap() = Some(reader);
+        for (pool, reader) in anchor.readers.iter().zip(readers) {
+            pool.lock().unwrap().push(reader);
         }
         Ok(StacSrc {
             inner: Arc::new(inner),
@@ -406,7 +422,7 @@ impl Inner {
             let key = f.hrefs[0].clone();
             let item = Arc::new(Item {
                 bbox: self.native_bbox(&f.bbox)?,
-                readers: f.hrefs.iter().map(|_| Mutex::new(None)).collect(),
+                readers: f.hrefs.iter().map(|_| Mutex::new(Vec::new())).collect(),
                 hrefs: f.hrefs,
                 datetime: f.datetime,
             });
@@ -457,21 +473,27 @@ impl Inner {
     /// order, each cog opening on first use
     fn read_item(&self, item: &Item, req: &WindowReq) -> Result<RasterChunk> {
         let mut bands = Vec::with_capacity(usize::from(self.bands));
-        for (k, slot) in item.readers.iter().enumerate() {
-            let mut slot = slot.lock().unwrap();
-            if slot.is_none() {
-                *slot = Some(CogReader::open(HttpRange::new(&item.hrefs[k]))?);
-            }
-            let reader = slot.as_mut().expect("opened above");
+        for (k, pool) in item.readers.iter().enumerate() {
+            let taken = pool.lock().unwrap().pop();
+            let mut reader = match taken {
+                Some(r) => r,
+                None => CogReader::open(HttpRange::new(&item.hrefs[k]))?,
+            };
             let meta = reader.meta().clone();
-            let asset_bands = band_count(reader)?;
+            let asset_bands = band_count(&reader)?;
             if asset_bands != self.asset_bands[k] {
                 return Err(Error::Source(format!(
                     "stac item asset {} has {asset_bands} bands, the anchor item has {}",
                     item.hrefs[k], self.asset_bands[k]
                 )));
             }
-            let chunk = read_chunk(reader, req, meta.origin_x, meta.origin_y, self.crs)?;
+            let chunk = read_chunk(&mut reader, req, meta.origin_x, meta.origin_y, self.crs)?;
+            {
+                let mut pool = pool.lock().unwrap();
+                if pool.len() < POOLED_READERS_PER_ASSET {
+                    pool.push(reader);
+                }
+            }
             bands.extend(chunk.bands.into_bands());
         }
         Ok(RasterChunk {
@@ -482,54 +504,14 @@ impl Inner {
         })
     }
 
-    /// most-recent-first fill: each item patches the nodata the newer ones
-    /// left, and the walk stops as soon as every band is complete
-    fn latest(&self, items: &[Arc<Item>], req: &WindowReq) -> Result<Option<RasterChunk>> {
-        let mut merged: Option<RasterChunk> = None;
-        for item in items {
-            let chunk = self.read_item(item, req)?;
-            match &mut merged {
-                None => merged = Some(chunk),
-                Some(out) => {
-                    for (bi, src) in chunk.bands.bands().iter().enumerate() {
-                        let dst = out.bands.band_mut(bi).expect("equal band counts");
-                        for (o, v) in dst.data_mut().iter_mut().zip(src.data()) {
-                            if o.is_nan() {
-                                *o = *v;
-                            }
-                        }
-                    }
-                }
-            }
-            // a pixel is complete only when every band has a value there
-            if let Some(out) = &merged
-                && !out
-                    .bands
-                    .bands()
-                    .iter()
-                    .any(|b| b.data().iter().any(|v| v.is_nan()))
-            {
-                break;
-            }
-        }
-        Ok(merged)
-    }
-
-    /// every item's window reduced per pixel per band. no early exit, a
-    /// reducer needs the whole stack
-    fn reduce(
+    /// every chunk reduced per pixel per band, one chunk per item. a
+    /// reducer needs the whole stack, the caller reads it first
+    fn reduce_chunks(
         &self,
-        items: &[Arc<Item>],
+        chunks: &[RasterChunk],
         req: &WindowReq,
         op: Composite,
-    ) -> Result<Option<RasterChunk>> {
-        let chunks: Vec<RasterChunk> = items
-            .iter()
-            .map(|i| self.read_item(i, req))
-            .collect::<Result<_>>()?;
-        if chunks.is_empty() {
-            return Ok(None);
-        }
+    ) -> Result<RasterChunk> {
         let (cols, rows) = (chunks[0].width(), chunks[0].height());
         let mut bands = Vec::with_capacity(usize::from(self.bands));
         for bi in 0..usize::from(self.bands) {
@@ -549,12 +531,12 @@ impl Inner {
                     .map_err(Error::Terrano)?,
             );
         }
-        Ok(Some(RasterChunk {
+        Ok(RasterChunk {
             bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
             bbox: req.bbox,
             resolution: req.resolution,
             crs: self.crs,
-        }))
+        })
     }
 
     /// nothing intersects: an all-nodata window on the source grid
@@ -581,7 +563,10 @@ impl Inner {
         })
     }
 
-    fn read_sync(&self, req: &WindowReq) -> Result<RasterChunk> {
+    /// search coverage for the window, then every known item touching it.
+    /// most recent first, so Latest fills in the right order. the
+    /// reducers do not care, they share the sort anyway
+    fn intersecting_items(&self, req: &WindowReq) -> Result<Vec<Arc<Item>>> {
         self.ensure_coverage(&self.lonlat_bbox(&req.bbox)?)?;
         let mut items: Vec<Arc<Item>> = self
             .items
@@ -591,19 +576,94 @@ impl Inner {
             .filter(|i| i.bbox.intersects(&req.bbox))
             .cloned()
             .collect();
-        // most recent first, so Latest fills in the right order. the
-        // reducers do not care, they share the sort anyway
         items.sort_by(|a, b| b.datetime.cmp(&a.datetime));
+        Ok(items)
+    }
+}
 
-        let merged = match self.search.composite {
-            Composite::Latest => self.latest(&items, req)?,
-            op => self.reduce(&items, req, op)?,
-        };
-        match merged {
-            Some(chunk) => Ok(chunk),
-            None => self.empty(req),
+/// one window read per item, `MAX_PARALLEL_ITEM_READS` in flight across
+/// the whole process, results in item order
+async fn read_items(
+    inner: &Arc<Inner>,
+    items: &[Arc<Item>],
+    req: &WindowReq,
+) -> Result<Vec<RasterChunk>> {
+    let reads = items.iter().map(|item| {
+        let inner = inner.clone();
+        let item = item.clone();
+        let req = *req;
+        async move {
+            let _permit = ITEM_READ_PERMITS
+                .acquire()
+                .await
+                .expect("semaphore is never closed");
+            crate::engine::offload(move || inner.read_item(&item, &req)).await
+        }
+    });
+    futures::future::try_join_all(reads).await
+}
+
+/// most-recent-first fill: each chunk patches the nodata the newer ones
+/// left
+fn fill_latest(mut merged: Option<RasterChunk>, chunks: Vec<RasterChunk>) -> Option<RasterChunk> {
+    for chunk in chunks {
+        match &mut merged {
+            None => merged = Some(chunk),
+            Some(out) => {
+                for (bi, src) in chunk.bands.bands().iter().enumerate() {
+                    let dst = out.bands.band_mut(bi).expect("equal band counts");
+                    for (o, v) in dst.data_mut().iter_mut().zip(src.data()) {
+                        if o.is_nan() {
+                            *o = *v;
+                        }
+                    }
+                }
+            }
         }
     }
+    merged
+}
+
+/// a pixel is complete only when every band has a value there
+fn complete(chunk: &RasterChunk) -> bool {
+    !chunk
+        .bands
+        .bands()
+        .iter()
+        .any(|b| b.data().iter().any(|v| v.is_nan()))
+}
+
+/// the fill walks in waves so the early exit survives parallel reads: it
+/// stops after the first complete wave, wasting at most one wave of reads
+async fn latest_window(
+    inner: &Arc<Inner>,
+    items: &[Arc<Item>],
+    req: &WindowReq,
+) -> Result<Option<RasterChunk>> {
+    let mut merged: Option<RasterChunk> = None;
+    for wave in items.chunks(MAX_PARALLEL_ITEM_READS) {
+        let chunks = read_items(inner, wave, req).await?;
+        merged = crate::engine::offload(move || fill_latest(merged, chunks)).await;
+        if merged.as_ref().is_some_and(complete) {
+            break;
+        }
+    }
+    Ok(merged)
+}
+
+async fn reduce_window(
+    inner: &Arc<Inner>,
+    items: &[Arc<Item>],
+    req: &WindowReq,
+    op: Composite,
+) -> Result<Option<RasterChunk>> {
+    let chunks = read_items(inner, items, req).await?;
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+    let inner = inner.clone();
+    let req = *req;
+    crate::engine::offload(move || inner.reduce_chunks(&chunks, &req, op).map(Some)).await
 }
 
 /// reduce one pixel's finite values across items. `vals` holds only finite
@@ -655,7 +715,18 @@ impl Source for StacSrc {
         let inner = self.inner.clone();
         let req = *req;
         Box::pin(async move {
-            crate::engine::offload(move || inner.read_sync(&req).map(Chunk::Raster)).await
+            let items = {
+                let inner = inner.clone();
+                crate::engine::offload(move || inner.intersecting_items(&req)).await?
+            };
+            let merged = match inner.search.composite {
+                Composite::Latest => latest_window(&inner, &items, &req).await?,
+                op => reduce_window(&inner, &items, &req, op).await?,
+            };
+            match merged {
+                Some(chunk) => Ok(Chunk::Raster(chunk)),
+                None => crate::engine::offload(move || inner.empty(&req).map(Chunk::Raster)).await,
+            }
         })
     }
 }

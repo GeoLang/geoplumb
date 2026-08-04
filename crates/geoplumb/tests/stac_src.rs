@@ -962,3 +962,57 @@ async fn a_multi_band_composite_reduces_each_band_independently() {
         "a band's hole was missed: {holes_hit:?}"
     );
 }
+
+/// seventy co-located items, one per day, shifts spaced unevenly so a
+/// scrambled read order or a dropped item shows in the reduce
+async fn start_deep_stack_mock() -> (String, Arc<Mock>) {
+    start_mock_with(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        let mut features = Vec::new();
+        for i in 0..70usize {
+            let name = format!("stack_{i}.tif");
+            cogs.insert(name.clone(), cog(0, 64, 64, (i * i) as f64, false));
+            features.push(item(
+                &format!("stack_{i}"),
+                &format!("2024-{:02}-{:02}T00:00:00Z", i / 28 + 1, i % 28 + 1),
+                &format!("{base}/cog/{name}"),
+                [7.0, 46.936, 7.064, 47.0],
+                4326,
+            ));
+        }
+        (cogs, features)
+    })
+    .await
+}
+
+/// the deep stack's full footprint
+const STACK: WindowReq = WindowReq {
+    bbox: Bbox {
+        min_x: 7.0,
+        max_x: 7.064,
+        max_y: ORIGIN_Y,
+        min_y: ORIGIN_Y - 0.064,
+    },
+    resolution: CELL,
+};
+
+/// a stack deeper than the parallel read cap, so the reads span more than
+/// one wave of permits
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stack_deeper_than_the_read_cap_reduces_and_fills_in_order() {
+    let (base, _mock) = start_deep_stack_mock().await;
+    let src = open_composite(&base, Composite::Median).await;
+    assert_eq!(src.item_count(), 70);
+    let chunk = src.read(&STACK).await.unwrap().into_raster().unwrap();
+    each_pixel(&chunk, |_, x, y, got| {
+        // shifts are 0,1,4,..,4761: the median of the seventy is 1190.5
+        close(got, elevation(x, y) + 1190.5, (x, y));
+    });
+
+    let src = open_composite(&base, Composite::Latest).await;
+    let chunk = src.read(&STACK).await.unwrap().into_raster().unwrap();
+    each_pixel(&chunk, |_, x, y, got| {
+        // every item covers every pixel, the newest must win them all
+        close(got, elevation(x, y) + 4761.0, (x, y));
+    });
+}
