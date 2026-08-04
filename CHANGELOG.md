@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-04
+
+- geodukt executor prerequisites: `VectorChunk::dissolve` merges a pull's fragments back per feature id at the driver boundary (polygons unioned through topoi, lines stitched at their seam vertices, points and collection members merged classwise), proven against a polygon with a hole straddling two seams, a line that comes back with its source vertices and a multipoint split across three tiles
+- window-local vector to vector elements `VecFilter`, `VecSchema` and `VecClip`, each per fragment on an identity plan, with chunked output proven equal to whole-window output. `VecClip` cuts lines at their boundary crossings and drops points outside it rather than passing them through as geodukt's clip does
+- `VecReproject` and its adapter, registered alongside the raster one, so a crs demand on a vector link splices a vector reproject instead of failing negotiation. vertices project without densification, matching geodukt
+
 ## 2026-08-03
 
 - tensor as a chunk kind: caps carry dtype and channel count, chunks are contiguous CHW f32 over a tile window and spill under their own kind byte, `ToTensor` and `ToRaster` cross the kind boundary either way and `TensorConv` runs a 3x3 kernel per channel with one pixel of halo. a model's input size negotiates as a chunk size demand, proven to narrow the tensor links from a raster consumer downstream of the boundary, with chunked convolution proven equal to whole-window convolution and tensor chunks proven to spill and reload
