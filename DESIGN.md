@@ -10,6 +10,7 @@ A pull may also name a time interval (`TimeInterval`, half-open UTC epoch millis
 
 - Batch is a degenerate pull: enumerate the chunk grid over an extent (`materialize`, or the pyramid example's tile loop) and pull everything.
 - Live is invalidation plus re-pull: `Engine::invalidate` walks a dirty window downstream (widened by each element's `spread`, projected across CRS changes), drops overlapping cache entries, and publishes `Invalidation` events for drivers to re-render.
+- Serving is a driver too: `geoplumb-server` builds one engine per layer from a TOML file (source plus an ordered op pipeline, ending web mercator and PNG), and `GET /tiles/{layer}/{z}/{x}/{y}.png?t={start}/{end}` turns the query interval into the pull time, so a layer's instant is a request parameter rather than a deployment.
 - Event-stream processing (per-event latency, geofencing) is out of scope, that is fluvius.
 
 ## Caps negotiation

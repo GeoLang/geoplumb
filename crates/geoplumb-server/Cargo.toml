@@ -1,0 +1,27 @@
+[package]
+name = "geoplumb-server"
+description = "HTTP tile server over geoplumb: config-defined layers, xyz png tiles, per-request time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+geoplumb = { path = "../geoplumb" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "rustls-tls",
+] }
+
+[dev-dependencies]
+terrano-core.workspace = true
+png = "0.17"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

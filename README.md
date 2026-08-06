@@ -25,6 +25,28 @@ cargo run --release -p geoplumb --example tile_server
 cargo run --release -p geoplumb --example pyramid -- 12 tiles
 ```
 
+## Serving
+
+`geoplumb-server` is the HTTP face of the engine: one engine per layer, layers defined in a TOML file named by `GEOPLUMB_LAYERS` (there is no default, it refuses to start without one). A layer is a source, either a STAC collection or a local COG, plus an ordered pipeline of `hillshade` and `bandmath` ops, and every layer ends reprojected to web mercator and encoded as grayscale PNG. `GET /tiles/{layer}/{z}/{x}/{y}.png` renders a tile, `?t=2024-06-01T00:00:00Z/2024-07-01T00:00:00Z` renders it at that interval instead of the source's own `datetime`, `GET /layers` lists what is served with each collection's temporal extent, and `GET /health` is the healthcheck. `PORT` defaults to 3000, `GEOPLUMB_CACHE_BYTES` to 256 MiB per layer, and setting `GEOPLUMB_DISK_CACHE` to a directory adds the disk tier (eight times the memory budget per layer). Endpoints are public, matching the rest of the public tile path.
+
+```sh
+cp crates/geoplumb-server/examples/layers.toml /tmp/layers.toml   # then edit it
+GEOPLUMB_LAYERS=/tmp/layers.toml cargo run --release -p geoplumb-server
+curl localhost:3000/layers
+```
+
+```toml
+# the smallest useful layer file: hillshade over a public collection
+[[layer]]
+name = "cop-dem-hillshade"
+source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "cop-dem-glo-30", assets = ["data"], bbox = [7.0, 46.3, 8.0, 46.9] }
+
+[[layer.op]]
+kind = "hillshade"
+azimuth = 315.0
+altitude = 45.0
+```
+
 ```rust
 use geoplumb::elements::{Hillshade, RasterSrc, Reproject};
 use geoplumb::{Crs, Engine, Graph, WindowReq};
@@ -35,7 +57,8 @@ let hs = g.add_transform(src, Box::new(Hillshade::new(315.0, 45.0)));
 let rp = g.add_transform(hs, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
 let engine = Engine::new(g, 256 << 20)?;   // caps solve happens here
 
-let chunk = engine.pull(rp, WindowReq { bbox, resolution }).await?;
+// time is None unless the pull asks for an instant
+let chunk = engine.pull(rp, WindowReq { bbox, resolution, time }).await?;
 ```
 
 ## Build

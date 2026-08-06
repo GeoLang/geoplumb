@@ -1,0 +1,42 @@
+# geoplumb-server layers. copy this file, edit it, and point
+# GEOPLUMB_LAYERS at it. every layer ends reprojected to web mercator and
+# encoded as grayscale png, so only the source and the ops go here.
+
+# hillshade over a public copernicus dem collection. bbox is the anchor
+# the grid and crs are read from, not a coverage limit: tiles past it
+# search the api lazily.
+[[layer]]
+name = "cop-dem-hillshade"
+source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "cop-dem-glo-30", assets = [
+    "data",
+], bbox = [7.0, 46.3, 8.0, 46.9] }
+
+[[layer.op]]
+kind = "hillshade"
+azimuth = 315.0
+altitude = 45.0
+
+# ndvi from two per-band cogs, median over whatever interval the request
+# asks for with ?t=, or over `datetime` when it asks for none.
+[[layer]]
+name = "ndvi"
+source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "sentinel-2-l2a", assets = [
+    "red",
+    "nir",
+], bbox = [7.0, 46.3, 8.0, 46.9], datetime = "2025-06-01T00:00:00Z/2025-09-01T00:00:00Z", composite = "median" }
+
+[[layer.op]]
+kind = "bandmath"
+expr = "(b1 - b0) / (b1 + b0)"
+min = -1.0
+max = 1.0
+
+# a local cog, hillshaded. no network, no time axis.
+[[layer]]
+name = "local-dem"
+source = { kind = "cog", path = "/data/dem.tif" }
+
+[[layer.op]]
+kind = "hillshade"
+azimuth = 315.0
+altitude = 45.0
