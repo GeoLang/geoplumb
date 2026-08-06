@@ -150,10 +150,25 @@ fn parse_ms(s: &str) -> Option<i64> {
             (num(sec)?, num(&milli)?)
         }
     };
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+    if !(1..=12).contains(&mo)
+        || !(1..=days_in_month(y, mo)).contains(&d)
+        || h > 23
+        || mi > 59
+        || sec > 60
+    {
         return None;
     }
     Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec) * 1000 + frac - offset_ms)
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    match m {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 /// days since 1970-01-01 in the proleptic gregorian calendar, and its

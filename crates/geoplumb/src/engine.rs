@@ -813,7 +813,8 @@ pub async fn materialize(
     let mut count = 0;
     for level in 0..=max_level {
         let res = grid.resolution_at(level);
-        for key in grid.cover(&extent, level) {
+        for mut key in grid.cover(&extent, level) {
+            key.time = time;
             let chunk = engine
                 .pull(
                     node,
