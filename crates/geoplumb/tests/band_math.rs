@@ -79,6 +79,7 @@ async fn pull(expr: &str, source: RasterSrc, bbox: Bbox) -> RasterChunk {
             WindowReq {
                 bbox,
                 resolution: CELL,
+                time: None,
             },
         )
         .await
@@ -165,6 +166,7 @@ async fn chunked_pull_matches_the_whole_window() {
             WindowReq {
                 bbox,
                 resolution: CELL,
+                time: None,
             },
         )
         .await

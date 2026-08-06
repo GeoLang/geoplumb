@@ -51,8 +51,12 @@ impl SpillStore {
     }
 
     pub(crate) fn path(&self, node: usize, key: ChunkKey) -> PathBuf {
-        self.dir
-            .join(format!("{node}_{}_{}_{}.bin", key.level, key.ix, key.iy))
+        let mut name = format!("{node}_{}_{}_{}", key.level, key.ix, key.iy);
+        if let Some(t) = key.time {
+            name.push_str(&format!("_{}_{}", t.start_ms, t.end_ms));
+        }
+        name.push_str(".bin");
+        self.dir.join(name)
     }
 }
 

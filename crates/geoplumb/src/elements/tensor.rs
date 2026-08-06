@@ -103,10 +103,7 @@ impl Transform for TensorConv {
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
-        WindowReq {
-            bbox: out.bbox.expand(out.resolution),
-            resolution: out.resolution,
-        }
+        out.with_window(out.bbox.expand(out.resolution), out.resolution)
     }
 
     fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {

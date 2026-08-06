@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
 use geoplumb::element::Source;
 use geoplumb::elements::{Composite, StacSearch, StacSrc, stac::s3_to_https};
-use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, WindowReq};
+use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, TimeInterval, WindowReq};
 use terrano_core::{BandedRaster, CogParams, Raster, write_cog, write_cog_bands};
 
 const CELL: f64 = 0.001;
@@ -144,6 +144,12 @@ async fn serve_search(
         .collect();
     let limit: usize = params["limit"].parse().unwrap();
     let page: usize = params.get("page").map_or(0, |v| v.parse().unwrap());
+    // the api's interval is closed at both ends, and every datetime here
+    // is fixed-width utc, so string order is time order
+    let time = params.get("datetime").map(|dt| {
+        let (start, end) = dt.split_once('/').unwrap();
+        (start.to_string(), end.to_string())
+    });
     let matching: Vec<&serde_json::Value> = mock
         .features
         .iter()
@@ -154,7 +160,11 @@ async fn serve_search(
                 .iter()
                 .map(|v| v.as_f64().unwrap())
                 .collect();
-            b[0] <= q[2] && b[2] >= q[0] && b[1] <= q[3] && b[3] >= q[1]
+            let dt = f["properties"]["datetime"].as_str().unwrap();
+            let in_time = time
+                .as_ref()
+                .is_none_or(|(start, end)| dt >= start.as_str() && dt <= end.as_str());
+            in_time && b[0] <= q[2] && b[2] >= q[0] && b[1] <= q[3] && b[3] >= q[1]
         })
         .collect();
     let hits: Vec<&serde_json::Value> = matching
@@ -394,6 +404,7 @@ const SEAM: WindowReq = WindowReq {
         min_y: ORIGIN_Y - 0.15,
     },
     resolution: CELL,
+    time: None,
 };
 
 /// every pixel is the 2024 value except in the left item's hole, where the
@@ -431,6 +442,76 @@ async fn recent_items_win_and_old_fills_their_holes() {
     assert_seam_mosaic(&chunk);
 }
 
+/// a pull carrying an interval overrides the source's own datetime, and
+/// each interval gets its own block searches and its own item set: the
+/// 2024 window is the recent pair with the left item's hole left open,
+/// the 2020 window is the older item alone
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pull_time_picks_the_items_and_keys_the_block_cache() {
+    let (base, mock) = start_mock().await;
+    let src = open_src(&base).await;
+    assert_eq!(mock.searches.load(Ordering::SeqCst), 1);
+
+    let recent = SEAM.with_time(Some(
+        TimeInterval::parse("2024-01-01T00:00:00Z/2025-01-01T00:00:00Z").unwrap(),
+    ));
+    let older = SEAM.with_time(Some(
+        TimeInterval::parse("2019-06-01T00:00:00Z/2020-06-01T00:00:00Z").unwrap(),
+    ));
+
+    let chunk = src.read(&recent).await.unwrap().into_raster().unwrap();
+    assert_eq!(mock.searches.load(Ordering::SeqCst), 2);
+    assert_seam_at(&chunk, |in_hole| match in_hole {
+        // nothing older is in this interval to patch the hole
+        true => f64::NAN,
+        false => 0.0,
+    });
+
+    let chunk = src.read(&older).await.unwrap().into_raster().unwrap();
+    assert_eq!(mock.searches.load(Ordering::SeqCst), 3);
+    assert_seam_at(&chunk, |_| 1000.0);
+
+    // each interval's block is searched once, and the two item sets stay
+    // apart: the recent window is still hole-free of the older item
+    let chunk = src.read(&recent).await.unwrap().into_raster().unwrap();
+    assert_eq!(
+        mock.searches.load(Ordering::SeqCst),
+        3,
+        "the block was searched twice at one time"
+    );
+    assert_seam_at(&chunk, |in_hole| match in_hole {
+        true => f64::NAN,
+        false => 0.0,
+    });
+    // the two searches shared one copy of the items they both matched
+    assert_eq!(src.item_count(), 3);
+}
+
+/// the seam window with a per-pixel shift over the scene, `None` where the
+/// pixel should have no value at all
+fn assert_seam_at(chunk: &RasterChunk, shift: impl Fn(bool) -> f64) {
+    let band = chunk.bands.band(0).unwrap();
+    let res = chunk.resolution;
+    for row in 0..band.height() {
+        for col in 0..band.width() {
+            let x = chunk.bbox.min_x + (col as f64 + 0.5) * res;
+            let y = chunk.bbox.max_y - (row as f64 + 0.5) * res;
+            let got = band.data()[row * band.width() + col];
+            let scene_row = ((ORIGIN_Y - y) / CELL - 0.5).round() as usize;
+            let shift = shift(x < 7.3 && (100..120).contains(&scene_row));
+            if shift.is_nan() {
+                assert!(got.is_nan(), "({x:.4},{y:.4}): {got} should be nodata");
+                continue;
+            }
+            let expected = elevation(x, y) + shift;
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "({x:.4},{y:.4}): {got} vs {expected}"
+            );
+        }
+    }
+}
+
 /// the open bbox is only an anchor: a pull past it finds its items
 /// through a lazy block search, and the blocks are searched once
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -453,6 +534,7 @@ async fn pulls_past_the_open_bbox_search_lazily_and_cache_blocks() {
             min_y: 46.85,
         },
         resolution: CELL,
+        time: None,
     };
     let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
     assert_eq!(src.item_count(), 3, "the right item was not discovered");
@@ -482,6 +564,7 @@ async fn pulls_past_the_open_bbox_search_lazily_and_cache_blocks() {
             min_y: 46.85,
         },
         resolution: CELL,
+        time: None,
     };
     src.read(&again).await.unwrap();
     assert_eq!(
@@ -589,6 +672,7 @@ async fn multi_band_mosaic_fills_holes_per_band() {
             min_y: ORIGIN_Y - 0.20,
         },
         resolution: CELL,
+        time: None,
     };
     let chunk = engine.pull(n, req).await.unwrap().into_raster().unwrap();
     assert_eq!(chunk.bands.band_count(), MB_BANDS);
@@ -815,6 +899,7 @@ const OVERLAP: WindowReq = WindowReq {
         min_y: ORIGIN_Y - 0.15,
     },
     resolution: CELL,
+    time: None,
 };
 
 fn close(got: f64, want: f64, at: (f64, f64)) {
@@ -914,6 +999,7 @@ async fn a_pixel_no_item_covers_stays_nodata() {
             min_y: ORIGIN_Y - 0.15,
         },
         resolution: CELL,
+        time: None,
     };
     let src = open_composite(&base, Composite::Min).await;
     let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
@@ -994,6 +1080,7 @@ const STACK: WindowReq = WindowReq {
         min_y: ORIGIN_Y - 0.064,
     },
     resolution: CELL,
+    time: None,
 };
 
 /// a stack deeper than the parallel read cap, so the reads span more than

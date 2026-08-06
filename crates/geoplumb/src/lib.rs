@@ -26,4 +26,4 @@ pub use element::{Adapter, Fanin, Source, Transform};
 pub use engine::{Engine, Invalidation, materialize};
 pub use error::{Error, Result};
 pub use graph::{Graph, NodeId};
-pub use window::{Bbox, WindowReq};
+pub use window::{Bbox, TimeInterval, WindowReq};

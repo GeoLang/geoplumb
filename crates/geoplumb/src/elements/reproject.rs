@@ -159,10 +159,7 @@ impl Transform for Reproject {
         let cx = (out.bbox.min_x + out.bbox.max_x) / 2.0;
         let cy = (out.bbox.min_y + out.bbox.max_y) / 2.0;
         let in_res = local_scale(self.inv(), cx, cy, out.resolution);
-        WindowReq {
-            bbox: env.expand(2.0 * in_res),
-            resolution: in_res,
-        }
+        out.with_window(env.expand(2.0 * in_res), in_res)
     }
 
     fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {
@@ -311,10 +308,7 @@ impl Transform for VecReproject {
         let cx = (out.bbox.min_x + out.bbox.max_x) / 2.0;
         let cy = (out.bbox.min_y + out.bbox.max_y) / 2.0;
         let in_res = local_scale(self.inv(), cx, cy, out.resolution);
-        WindowReq {
-            bbox: env.expand(2.0 * in_res),
-            resolution: in_res,
-        }
+        out.with_window(env.expand(2.0 * in_res), in_res)
     }
 
     fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {

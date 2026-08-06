@@ -203,6 +203,7 @@ async fn pull_window(chunk_px: u32) -> VectorChunk {
             WindowReq {
                 bbox: WINDOW,
                 resolution: 1.0,
+                time: None,
             },
         )
         .await
@@ -253,6 +254,7 @@ async fn seam_pull(window: Bbox) -> VectorChunk {
             WindowReq {
                 bbox: window,
                 resolution: 1.0,
+                time: None,
             },
         )
         .await
@@ -469,6 +471,7 @@ fn whole_window(element: &dyn Transform, chunk: &VectorChunk) -> VectorChunk {
     let req = WindowReq {
         bbox: chunk.bbox,
         resolution: chunk.resolution,
+        time: None,
     };
     element
         .compute(&req, &Chunk::Vector(chunk.clone()))
@@ -486,6 +489,7 @@ async fn pull_through(element: Box<dyn Transform>) -> (VectorChunk, VectorChunk)
     let req = WindowReq {
         bbox: WINDOW,
         resolution: 1.0,
+        time: None,
     };
     let chunked = engine.pull(op, req).await.unwrap().into_vector().unwrap();
     let source = engine.pull(vec, req).await.unwrap().into_vector().unwrap();
@@ -734,6 +738,7 @@ async fn a_vector_crs_demand_autoplugs_a_vector_reproject() {
             WindowReq {
                 bbox: Bbox::new(x0 - res, y0 - res, x1 + res, y1 + res),
                 resolution: res,
+                time: None,
             },
         )
         .await
@@ -799,6 +804,7 @@ fn vec_reproject_matches_projicio_vertex_by_vertex() {
     let out = WindowReq {
         bbox: Bbox::new(x0 - 1000.0, y0 - 1000.0, x1 + 1000.0, y1 + 1000.0),
         resolution: 100.0,
+        time: None,
     };
     let input = Chunk::Vector(VectorChunk::new(
         vec![geoplumb::VectorFeature {

@@ -132,6 +132,7 @@ async fn hillshade_is_seam_free_across_chunks() {
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
+        time: None,
     };
     let got = engine.pull(hs, req).await.unwrap().into_raster().unwrap();
 
@@ -178,6 +179,7 @@ async fn concurrent_pulls_coalesce() {
     let req = WindowReq {
         bbox: window(0, 0, 300, 300),
         resolution: CELL,
+        time: None,
     };
     let (a, b) = tokio::join!(
         tokio::spawn({
@@ -211,6 +213,7 @@ async fn cache_serves_repeat_pulls_and_invalidation_clears() {
     let req = WindowReq {
         bbox: window(10, 10, 200, 200),
         resolution: CELL,
+        time: None,
     };
     engine.pull(hs, req).await.unwrap().into_raster().unwrap();
     let after_first = reads.load(Ordering::SeqCst);
@@ -258,6 +261,7 @@ async fn cancelled_pull_leaves_no_wedged_chunk() {
     let req = WindowReq {
         bbox: window(0, 0, 100, 100),
         resolution: CELL,
+        time: None,
     };
 
     let cancelled = tokio::time::timeout(Duration::from_millis(5), engine.pull(src, req)).await;
@@ -283,7 +287,7 @@ async fn batch_materialize_walks_the_pyramid() {
     let engine = Engine::new(g, 64 << 20).unwrap();
     let extent = window(0, 0, W, H);
     let mut seen = 0;
-    let count = geoplumb::materialize(&engine, hs, extent, 2, |_k, chunk| {
+    let count = geoplumb::materialize(&engine, hs, extent, 2, None, |_k, chunk| {
         assert!(chunk.raster().unwrap().width() > 0);
         seen += 1;
     })
@@ -346,6 +350,7 @@ async fn an_absurd_pull_fails_instead_of_enumerating() {
             WindowReq {
                 bbox: Bbox::new(0.0, 0.0, 1.0, 1.0),
                 resolution: cell,
+                time: None,
             },
         )
         .await

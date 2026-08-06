@@ -188,6 +188,7 @@ async fn coarse_levels_simplify_and_drop_subpixel_features() {
             WindowReq {
                 bbox,
                 resolution: base,
+                time: None,
             },
         )
         .await
@@ -200,6 +201,7 @@ async fn coarse_levels_simplify_and_drop_subpixel_features() {
             WindowReq {
                 bbox,
                 resolution: base * 8.0,
+                time: None,
             },
         )
         .await
@@ -269,6 +271,7 @@ async fn chunked_rasterize_matches_the_whole_window_reference() {
             WindowReq {
                 bbox: Bbox::new(3.0, 5.0, 58.0, 58.0),
                 resolution: base,
+                time: None,
             },
         )
         .await
@@ -347,6 +350,7 @@ async fn vector_chunks_spill_to_disk_and_reload() {
     let fine = WindowReq {
         bbox,
         resolution: base,
+        time: None,
     };
     let budget = probe.read(&fine).await.unwrap().byte_size();
 
@@ -360,6 +364,7 @@ async fn vector_chunks_spill_to_disk_and_reload() {
     let coarse = WindowReq {
         bbox,
         resolution: base * 8.0,
+        time: None,
     };
 
     let first = engine.pull(vec, fine).await.unwrap().into_vector().unwrap();
@@ -540,6 +545,7 @@ async fn a_tile_read_returns_only_the_features_that_reach_it() {
             604.0 - iy * 256.0,
         ),
         resolution: 1.0,
+        time: None,
     };
     let ids =
         |chunk: &geoplumb::VectorChunk| chunk.features.iter().map(|f| f.id).collect::<Vec<_>>();
@@ -570,6 +576,7 @@ async fn a_tile_read_returns_only_the_features_that_reach_it() {
             WindowReq {
                 bbox: Bbox::new(0.0, 0.0, 1204.0, 604.0),
                 resolution: 1.0,
+                time: None,
             },
         )
         .await
@@ -600,6 +607,7 @@ async fn a_tile_read_keeps_its_fragments_in_id_order() {
         .read(&WindowReq {
             bbox: Bbox::new(0.0, 0.0, 114.0, 4.0),
             resolution: 1.0,
+            time: None,
         })
         .await
         .unwrap()

@@ -8,7 +8,13 @@
 //! name several assets (collections like sentinel-2 spread bands across
 //! per-band cogs): an item is kept only when every asset is present, and
 //! a pull reads them all, bands concatenated in asset order. item reads
-//! run in parallel, capped across every pull in the process
+//! run in parallel, capped across every pull in the process.
+//!
+//! a pull may carry its own interval, which overrides the search's
+//! `datetime` for that pull: blocks are searched, and their item sets
+//! kept, per interval, so one source serves any number of instants. the
+//! rfc 3339 side of `TimeInterval` lives here, the only place that speaks
+//! it
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -20,7 +26,7 @@ use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::elements::cog::{HttpRange, band_count, read_chunk};
 use crate::error::{Error, Result};
-use crate::window::{Bbox, GridSpec, WindowReq};
+use crate::window::{Bbox, GridSpec, TimeInterval, WindowReq};
 use futures::future::BoxFuture;
 use terrano_core::CogReader;
 
@@ -49,9 +55,135 @@ static ITEM_READ_PERMITS: LazyLock<tokio::sync::Semaphore> =
 /// pool retains one thread per concurrent read it ever saw
 const POOLED_READERS_PER_ASSET: usize = 4;
 
-/// how a pull combines the items covering one window. time is resolved
-/// here, at the source, not on the pull: `datetime` picks the interval and
-/// this picks what the interval collapses to
+/// epoch milliseconds from an rfc 3339 timestamp, the form stac item and
+/// search datetimes take: a date, `T`, a time, optional fractional
+/// seconds past the second, and `Z` or a `+hh:mm` utc offset
+pub fn parse_rfc3339(s: &str) -> Result<i64> {
+    parse_ms(s).ok_or_else(|| Error::Source(format!("not an rfc 3339 timestamp: {s}")))
+}
+
+/// the inverse, always utc, fractional seconds only when there are any
+pub fn format_rfc3339(ms: i64) -> String {
+    let (y, m, d) = civil_from_days(ms.div_euclid(86_400_000));
+    let ms_of_day = ms.rem_euclid(86_400_000);
+    let (s, milli) = (ms_of_day / 1000, ms_of_day % 1000);
+    let (h, mi, sec) = (s / 3600, s / 60 % 60, s % 60);
+    let date = format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{sec:02}");
+    match milli {
+        0 => format!("{date}Z"),
+        _ => format!("{date}.{milli:03}Z"),
+    }
+}
+
+/// the rfc 3339 face of the engine's time interval. it sits here because
+/// the search string is the only place geoplumb speaks rfc 3339
+impl TimeInterval {
+    /// an rfc 3339 `start/end` interval, the form stac's `datetime` takes
+    pub fn parse(s: &str) -> Result<TimeInterval> {
+        let (start, end) = s
+            .split_once('/')
+            .ok_or_else(|| Error::Source(format!("not an rfc 3339 interval: {s}")))?;
+        let interval = TimeInterval::new(parse_rfc3339(start)?, parse_rfc3339(end)?);
+        if interval.end_ms < interval.start_ms {
+            return Err(Error::Source(format!(
+                "time interval {s} ends before it starts"
+            )));
+        }
+        Ok(interval)
+    }
+
+    /// the `datetime` a search carrying this interval sends. stac compares
+    /// it closed at both ends, so an item stamped exactly at `end_ms` can
+    /// come back even though the interval excludes that instant
+    pub fn to_stac_datetime(self) -> String {
+        format!(
+            "{}/{}",
+            format_rfc3339(self.start_ms),
+            format_rfc3339(self.end_ms)
+        )
+    }
+}
+
+fn parse_ms(s: &str) -> Option<i64> {
+    let num = |v: &str| match !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+        true => v.parse::<i64>().ok(),
+        false => None,
+    };
+    let (date, rest) = s.split_at_checked(10)?;
+    let mut parts = date.split('-');
+    let (y, mo, d) = (
+        num(parts.next()?)?,
+        num(parts.next()?)?,
+        num(parts.next()?)?,
+    );
+    if parts.next().is_some() {
+        return None;
+    }
+    let rest = rest.strip_prefix(['T', 't'])?;
+    let (time, offset_ms) = match rest.strip_suffix(['Z', 'z']) {
+        Some(time) => (time, 0),
+        None => {
+            let (time, offset) = rest.split_at_checked(rest.len().checked_sub(6)?)?;
+            let sign = match offset.as_bytes()[0] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let (oh, om) = offset[1..].split_once(':')?;
+            (time, sign * (num(oh)? * 3600 + num(om)? * 60) * 1000)
+        }
+    };
+    let mut parts = time.split(':');
+    let (h, mi) = (num(parts.next()?)?, num(parts.next()?)?);
+    let seconds = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (sec, frac) = match seconds.split_once('.') {
+        None => (num(seconds)?, 0),
+        Some((sec, frac)) => {
+            if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // truncate or pad to milliseconds, the engine's resolution
+            let milli: String = frac.chars().chain("000".chars()).take(3).collect();
+            (num(sec)?, num(&milli)?)
+        }
+    };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec) * 1000 + frac - offset_ms)
+}
+
+/// days since 1970-01-01 in the proleptic gregorian calendar, and its
+/// inverse. howard hinnant's `days_from_civil` / `civil_from_days`
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// how a pull combines the items covering one window. `datetime`, or the
+/// pull's own interval where it has one, picks the interval and this
+/// picks what the interval collapses to. the composite is fixed at the
+/// source either way, only the interval moves per pull
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Composite {
     /// most recent item wins each pixel, older ones fill its nodata
@@ -134,9 +266,15 @@ struct Inner {
     to_native: Option<projicio_core::Transform>,
     /// source crs to lon/lat for pull windows, `None` when it is 4326
     to_lonlat: Option<projicio_core::Transform>,
-    searched: Mutex<HashSet<(i32, i32)>>,
-    /// every item seen so far, keyed by href so blocks share one copy
+    /// blocks searched, per pull time. `None` is the search's own
+    /// `datetime`, the only time there was before pulls carried one
+    searched: Mutex<HashSet<(i32, i32, Option<TimeInterval>)>>,
+    /// every item seen so far, keyed by href so blocks and pull times
+    /// share one copy, its pooled readers included
     items: Mutex<HashMap<String, Arc<Item>>>,
+    /// the hrefs each pull time's searches matched, so two times over one
+    /// block do not pool their items into one mosaic
+    matched: Mutex<HashMap<Option<TimeInterval>, HashSet<String>>>,
 }
 
 pub struct StacSrc {
@@ -163,6 +301,7 @@ fn search_page(
     client: &reqwest::blocking::Client,
     search: &StacSearch,
     bbox: [f64; 4],
+    time: Option<TimeInterval>,
 ) -> Result<Vec<Found>> {
     let fail = |detail: String| Error::Source(detail);
     let [minx, miny, maxx, maxy] = bbox;
@@ -170,7 +309,11 @@ fn search_page(
         "{}/search?collections={}&bbox={minx},{miny},{maxx},{maxy}&limit={}",
         search.api, search.collection, search.limit
     );
-    if let Some(dt) = &search.datetime {
+    // a pull's interval replaces the search's own for this search
+    let datetime = time
+        .map(TimeInterval::to_stac_datetime)
+        .or_else(|| search.datetime.clone());
+    if let Some(dt) = datetime {
         url.push_str(&format!("&datetime={dt}"));
     }
 
@@ -269,7 +412,7 @@ impl StacSrc {
             return Err(Error::Source("stac search names no assets".into()));
         }
         let client = reqwest::blocking::Client::new();
-        let mut found = search_page(&client, search, search.bbox)?;
+        let mut found = search_page(&client, search, search.bbox, None)?;
         if found.is_empty() {
             return Err(Error::Source(format!(
                 "stac search matched no items with assets {:?}",
@@ -330,8 +473,11 @@ impl StacSrc {
             to_lonlat,
             searched: Mutex::new(HashSet::new()),
             items: Mutex::new(HashMap::new()),
+            matched: Mutex::new(HashMap::new()),
         };
-        inner.insert(found)?;
+        // the anchor search ran on the search's own datetime, so its
+        // items belong to the `None` time
+        inner.insert(found, None)?;
         let anchor = inner
             .items
             .lock()
@@ -403,8 +549,9 @@ impl Inner {
     }
 
     /// keep items matching the anchor's crs and per-asset band counts,
-    /// one shared copy per item, keyed by its first asset's href
-    fn insert(&self, found: Vec<Found>) -> Result<()> {
+    /// one shared copy per item, keyed by its first asset's href, and
+    /// record which of them `time`'s searches matched
+    fn insert(&self, found: Vec<Found>, time: Option<TimeInterval>) -> Result<()> {
         for f in found {
             if f.epsg != self.crs.0 {
                 continue;
@@ -416,25 +563,31 @@ impl Inner {
             {
                 continue;
             }
-            if self.items.lock().unwrap().contains_key(&f.hrefs[0]) {
-                continue;
-            }
             let key = f.hrefs[0].clone();
-            let item = Arc::new(Item {
-                bbox: self.native_bbox(&f.bbox)?,
-                readers: f.hrefs.iter().map(|_| Mutex::new(Vec::new())).collect(),
-                hrefs: f.hrefs,
-                datetime: f.datetime,
-            });
-            self.items.lock().unwrap().insert(key, item);
+            if !self.items.lock().unwrap().contains_key(&key) {
+                let item = Arc::new(Item {
+                    bbox: self.native_bbox(&f.bbox)?,
+                    readers: f.hrefs.iter().map(|_| Mutex::new(Vec::new())).collect(),
+                    hrefs: f.hrefs,
+                    datetime: f.datetime,
+                });
+                self.items.lock().unwrap().insert(key.clone(), item);
+            }
+            self.matched
+                .lock()
+                .unwrap()
+                .entry(time)
+                .or_default()
+                .insert(key);
         }
         Ok(())
     }
 
     /// search every block the lon/lat window touches that has not been
-    /// searched yet. concurrent pulls may race a block, the href dedup in
-    /// `insert` makes that harmless
-    fn ensure_coverage(&self, w: &[f64; 4]) -> Result<()> {
+    /// searched at this time yet. concurrent pulls may race a block, the
+    /// href dedup in `insert` makes that harmless. the cold-block cap
+    /// applies per time, the way it applies per source
+    fn ensure_coverage(&self, w: &[f64; 4], time: Option<TimeInterval>) -> Result<()> {
         let block = |v: f64, lo: f64, hi: f64| (v.clamp(lo, hi) / BLOCK_DEG).floor() as i32;
         let (ix0, ix1) = (block(w[0], -180.0, 180.0), block(w[2], -180.0, 180.0));
         let (iy0, iy1) = (block(w[1], -90.0, 90.0), block(w[3], -90.0, 90.0));
@@ -443,7 +596,7 @@ impl Inner {
             let searched = self.searched.lock().unwrap();
             for iy in iy0..=iy1 {
                 for ix in ix0..=ix1 {
-                    if !searched.contains(&(ix, iy)) {
+                    if !searched.contains(&(ix, iy, time)) {
                         missing.push((ix, iy));
                     }
                 }
@@ -462,9 +615,9 @@ impl Inner {
                 (f64::from(ix + 1) * BLOCK_DEG).min(180.0),
                 (f64::from(iy + 1) * BLOCK_DEG).min(90.0),
             ];
-            let found = search_page(&self.client, &self.search, bbox)?;
-            self.insert(found)?;
-            self.searched.lock().unwrap().insert((ix, iy));
+            let found = search_page(&self.client, &self.search, bbox, time)?;
+            self.insert(found, time)?;
+            self.searched.lock().unwrap().insert((ix, iy, time));
         }
         Ok(())
     }
@@ -563,19 +716,27 @@ impl Inner {
         })
     }
 
-    /// search coverage for the window, then every known item touching it.
-    /// most recent first, so Latest fills in the right order. the
-    /// reducers do not care, they share the sort anyway
+    /// search coverage for the window at the pull's time, then every item
+    /// that time matched which touches the window. most recent first, so
+    /// Latest fills in the right order. the reducers do not care, they
+    /// share the sort anyway
     fn intersecting_items(&self, req: &WindowReq) -> Result<Vec<Arc<Item>>> {
-        self.ensure_coverage(&self.lonlat_bbox(&req.bbox)?)?;
-        let mut items: Vec<Arc<Item>> = self
-            .items
+        self.ensure_coverage(&self.lonlat_bbox(&req.bbox)?, req.time)?;
+        let hrefs = self
+            .matched
             .lock()
             .unwrap()
-            .values()
+            .get(&req.time)
+            .cloned()
+            .unwrap_or_default();
+        let all = self.items.lock().unwrap();
+        let mut items: Vec<Arc<Item>> = hrefs
+            .iter()
+            .filter_map(|href| all.get(href))
             .filter(|i| i.bbox.intersects(&req.bbox))
             .cloned()
             .collect();
+        drop(all);
         items.sort_by(|a, b| b.datetime.cmp(&a.datetime));
         Ok(items)
     }
@@ -709,6 +870,10 @@ impl Source for StacSrc {
             base_resolution: self.base_resolution,
             chunk_px: 256,
         }
+    }
+
+    fn time_varying(&self) -> bool {
+        true
     }
 
     fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<Chunk>> {

@@ -71,6 +71,7 @@ async fn mosaic_stitches_sources_with_offset_origins() {
     let req = WindowReq {
         bbox: window(0, 0, W, H),
         resolution: CELL,
+        time: None,
     };
     let got = engine.pull(m, req).await.unwrap().into_raster().unwrap();
     assert_close(&got, &dem_patch(0, 0, W, H), 1e-9);
@@ -87,6 +88,7 @@ async fn combine_subtracts_per_cell() {
     let req = WindowReq {
         bbox: window(10, 10, 500, 300),
         resolution: CELL,
+        time: None,
     };
     let got = engine.pull(c, req).await.unwrap().into_raster().unwrap();
     let band = got.bands.band(0).unwrap();
@@ -107,6 +109,7 @@ async fn diamond_pull_combines_branches() {
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
+        time: None,
     };
     let sum = engine.pull(c, req).await.unwrap().into_raster().unwrap();
     let h = engine.pull(hs, req).await.unwrap().into_raster().unwrap();
@@ -218,6 +221,7 @@ async fn invalidation_crosses_the_fanin() {
     let req = WindowReq {
         bbox: window(0, 0, 200, 200),
         resolution: CELL,
+        time: None,
     };
     engine.pull(m, req).await.unwrap().into_raster().unwrap();
 

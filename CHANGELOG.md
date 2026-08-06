@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-06
+
+- per-pull time axis: a `WindowReq` may carry a `TimeInterval` (half-open UTC epoch milliseconds), which overrides a time-varying source's own `datetime` for that pull, so one graph serves any number of instants instead of needing a source per instant. `plan` implementations rewrite the window through `WindowReq::with_window` and the engine reasserts the pull's time on the planned request, so no element can drop or rewrite it upstream. Chunk keys carry the time only where an element declared `time_varying` (`StacSrc` does, ored over each node's parents at construction), so a time-invariant graph keeps one cache entry per tile however many instants are pulled, and spill files name the time so variants never collide on disk. `StacSrc` searches its two-degree blocks and keeps their matched item sets per interval, sharing one copy of an item, its pooled readers included, across intervals. `render_tile_at` and `materialize` take the pull time, `render_tile` still means the source's own. RFC 3339 parsing and formatting sit with `StacSrc`, the only thing that speaks it
+
 ## 2026-08-04
 
 - `HttpRange` fetches async and multiplexed on a small dedicated runtime instead of blocking a thread and a client per reader: `read_ranges` (terrano's new vectored read, one call per window) fetches its cache misses concurrently under a 48-transfer process-wide bound, single-flight claims are never held while waiting on another caller's fetch, and the per-reader `reqwest::blocking` clients and their driver threads are gone. Cold z12 ndvi 41 s to 37 s, the remaining cost is the link to the data itself

@@ -85,6 +85,7 @@ fn window(px0: usize, py0: usize, px1: usize, py1: usize) -> WindowReq {
             min_y: ORIGIN_Y - py1 as f64 * CELL,
         },
         resolution: CELL,
+        time: None,
     }
 }
 

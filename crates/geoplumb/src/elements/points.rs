@@ -137,10 +137,10 @@ impl Transform for IdwGrid {
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
-        WindowReq {
-            bbox: out.bbox.expand(self.radius_px * out.resolution),
-            resolution: out.resolution,
-        }
+        out.with_window(
+            out.bbox.expand(self.radius_px * out.resolution),
+            out.resolution,
+        )
     }
 
     fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {

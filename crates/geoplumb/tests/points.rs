@@ -86,6 +86,7 @@ async fn point_pull_filters_the_window_and_thins_coarse_levels() {
             WindowReq {
                 bbox,
                 resolution: base,
+                time: None,
             },
         )
         .await
@@ -100,6 +101,7 @@ async fn point_pull_filters_the_window_and_thins_coarse_levels() {
             WindowReq {
                 bbox,
                 resolution: base * 4.0,
+                time: None,
             },
         )
         .await
@@ -152,6 +154,7 @@ async fn chunked_idw_matches_the_whole_window_reference() {
             WindowReq {
                 bbox: Bbox::new(2.0, 2.0, 60.0, 60.0),
                 resolution: base,
+                time: None,
             },
         )
         .await
@@ -207,6 +210,7 @@ async fn constant_cloud_hillshades_flat() {
             WindowReq {
                 bbox: Bbox::new(8.0, 8.0, 56.0, 56.0),
                 resolution: base,
+                time: None,
             },
         )
         .await
@@ -266,10 +270,12 @@ async fn point_chunks_spill_to_disk_and_reload() {
     let fine = WindowReq {
         bbox,
         resolution: base,
+        time: None,
     };
     let coarse = WindowReq {
         bbox,
         resolution: base * 4.0,
+        time: None,
     };
 
     let first = engine.pull(las, fine).await.unwrap().into_points().unwrap();

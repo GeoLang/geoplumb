@@ -20,7 +20,7 @@ use crate::error::{Error, Result};
 use crate::graph::{Graph, Node, NodeId};
 use crate::solver;
 use crate::spill::{self, SpillStore};
-use crate::window::{Bbox, ChunkKey, GridSpec, WindowReq};
+use crate::window::{Bbox, ChunkKey, GridSpec, TimeInterval, WindowReq};
 use terrano_core::{BandedRaster, Raster};
 
 /// generous per-pull bound: a million 256 px tiles is far past what
@@ -43,6 +43,9 @@ struct RtNode {
     elem: RtElem,
     caps: Caps,
     grid: GridSpec,
+    /// this node or anything upstream of it resolves data per pull time,
+    /// so its chunks are cached per time
+    time_varying: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -166,10 +169,19 @@ impl Engine {
                 }
             };
             grid.chunk_px = caps[i].chunk_px();
+            let up = |p: usize| nodes[p].as_ref().expect("parents built first").time_varying;
+            let time_varying = match &elem {
+                RtElem::Source(s) => s.time_varying(),
+                RtElem::Transform { parent, element } => element.time_varying() || up(*parent),
+                RtElem::Fanin { parents, element } => {
+                    element.time_varying() || parents.iter().copied().any(up)
+                }
+            };
             nodes[i] = Some(RtNode {
                 elem,
                 caps: caps[i].clone(),
                 grid,
+                time_varying,
             });
         }
         let (events, _) = broadcast::channel(64);
@@ -297,7 +309,12 @@ impl Engine {
                     cap: MAX_TILES_PER_PULL,
                 });
             }
-            let keys = grid.cover(&aligned, level);
+            let time = self.chunk_time(node, req.time);
+            let keys: Vec<ChunkKey> = grid
+                .cover(&aligned, level)
+                .into_iter()
+                .map(|k| k.at_time(time))
+                .collect();
             let chunks =
                 futures::future::try_join_all(keys.iter().map(|k| self.chunk(node, *k))).await?;
             assemble(&grid, &keys, &chunks, &aligned, res, &self.nodes[node].caps)
@@ -455,28 +472,40 @@ impl Engine {
         }
     }
 
+    /// the time a node's chunks are keyed by: the pull's where anything
+    /// upstream resolves per time, the source's own otherwise
+    fn chunk_time(&self, node: usize, time: Option<TimeInterval>) -> Option<TimeInterval> {
+        if self.nodes[node].time_varying {
+            time
+        } else {
+            None
+        }
+    }
+
     async fn compute_chunk(&self, node: usize, key: ChunkKey) -> Result<Chunk> {
         let grid = self.nodes[node].grid;
         let out = WindowReq {
             bbox: grid.chunk_bbox(key),
             resolution: grid.resolution_at(key.level),
+            time: key.time,
         };
         match &self.nodes[node].elem {
             RtElem::Source(s) => s.read(&out).await,
             RtElem::Transform { parent, element } => {
-                let in_req = element.plan(&out);
+                // the pull's time is the engine's to carry, not an
+                // element's to rewrite: a plan that dropped it would ask
+                // upstream for the wrong instant
+                let in_req = element.plan(&out).with_time(out.time);
                 let input = self.pull_assembled(*parent, in_req).await?;
                 let element = element.clone();
                 offload(move || element.compute(&out, &input)).await
             }
             RtElem::Fanin { parents, element } => {
-                let inputs = futures::future::try_join_all(
-                    parents
-                        .iter()
-                        .enumerate()
-                        .map(|(k, p)| self.pull_assembled(*p, element.plan(&out, k))),
-                )
-                .await?;
+                let inputs =
+                    futures::future::try_join_all(parents.iter().enumerate().map(|(k, p)| {
+                        self.pull_assembled(*p, element.plan(&out, k).with_time(out.time))
+                    }))
+                    .await?;
                 let element = element.clone();
                 offload(move || element.compute(&out, &inputs)).await
             }
@@ -770,12 +799,14 @@ fn assemble_tensor(
 }
 
 /// batch driver: pull every chunk of `node` covering `extent` at each ladder
-/// level up to `max_level`, the full-extent materialization loop
+/// level up to `max_level`, the full-extent materialization loop. `time`
+/// is the pull time for every chunk, `None` for the sources' own
 pub async fn materialize(
     engine: &Engine,
     node: NodeId,
     extent: Bbox,
     max_level: u8,
+    time: Option<TimeInterval>,
     mut per_chunk: impl FnMut(ChunkKey, &Chunk),
 ) -> Result<usize> {
     let grid = *engine.grid(node);
@@ -789,6 +820,7 @@ pub async fn materialize(
                     WindowReq {
                         bbox: grid.chunk_bbox(key),
                         resolution: res,
+                        time,
                     },
                 )
                 .await?;

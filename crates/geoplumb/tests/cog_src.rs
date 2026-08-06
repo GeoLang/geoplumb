@@ -144,6 +144,7 @@ async fn base_level_matches_in_memory_source() {
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
+        time: None,
     };
     let a = cog.pull(cn, req).await.unwrap().into_raster().unwrap();
     let b = mem.pull(mn, req).await.unwrap().into_raster().unwrap();
@@ -159,6 +160,7 @@ async fn overview_pull_matches_and_fetches_less() {
     let coarse = WindowReq {
         bbox: full,
         resolution: CELL * 2.0,
+        time: None,
     };
     let a = src.read(&coarse).await.unwrap().into_raster().unwrap();
     let b = mem.pull(mn, coarse).await.unwrap().into_raster().unwrap();
@@ -169,6 +171,7 @@ async fn overview_pull_matches_and_fetches_less() {
     let base_bytes = tile_bytes_fetched(WindowReq {
         bbox: full,
         resolution: CELL,
+        time: None,
     })
     .await;
     let coarse_bytes = tile_bytes_fetched(coarse).await;
@@ -195,6 +198,7 @@ async fn pull_coarser_than_pyramid_decimates() {
     let req = WindowReq {
         bbox: window(0, 0, 400, 400),
         resolution: CELL * 4.0,
+        time: None,
     };
     let a = src.read(&req).await.unwrap().into_raster().unwrap();
     let b = mem.pull(mn, req).await.unwrap().into_raster().unwrap();
@@ -215,6 +219,7 @@ async fn window_outside_the_file_pads_nan() {
             min_y: ORIGIN_Y - 40.0 * CELL,
         },
         resolution: CELL,
+        time: None,
     };
     let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
     let band = chunk.bands.band(0).unwrap();
@@ -270,6 +275,7 @@ async fn identical_ranges_are_fetched_once_across_readers() {
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
+        time: None,
     };
     let a = src.read(&req).await.unwrap().into_raster().unwrap();
     let after_first = hits.load(Ordering::SeqCst);
@@ -316,6 +322,7 @@ async fn http_transport_retries_transient_faults() {
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
+        time: None,
     };
     let a = src.read(&req).await.unwrap().into_raster().unwrap();
     let (mem, mn) = engine_of(mem_src());
@@ -376,6 +383,7 @@ async fn http_transport_feeds_the_engine() {
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
+        time: None,
     };
     let a = engine.pull(hs, req).await.unwrap().into_raster().unwrap();
     let b = mem.pull(mhs, req).await.unwrap().into_raster().unwrap();
@@ -390,6 +398,7 @@ async fn multi_band_matches_in_memory_at_base_and_overview() {
         let req = WindowReq {
             bbox: window(20, 20, 340, 230),
             resolution: res,
+            time: None,
         };
         let a = cog.pull(cn, req).await.unwrap().into_raster().unwrap();
         let b = mem.pull(mn, req).await.unwrap().into_raster().unwrap();
@@ -414,6 +423,7 @@ async fn multi_band_pull_coarser_than_pyramid_decimates_every_band() {
     let req = WindowReq {
         bbox: window(0, 0, 400, 400),
         resolution: CELL * 4.0,
+        time: None,
     };
     let a = src.read(&req).await.unwrap().into_raster().unwrap();
     let b = mem.pull(mn, req).await.unwrap().into_raster().unwrap();
@@ -433,6 +443,7 @@ async fn multi_band_window_outside_the_file_pads_every_band() {
             min_y: ORIGIN_Y - 40.0 * CELL,
         },
         resolution: CELL,
+        time: None,
     };
     let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
     assert_eq!(chunk.bands.band_count(), BANDS);
@@ -466,6 +477,7 @@ async fn multi_band_over_the_http_transport() {
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
+        time: None,
     };
     let a = src.read(&req).await.unwrap().into_raster().unwrap();
     let (mem, mn) = engine_of(mem_src3());
@@ -498,6 +510,7 @@ async fn reproject_keeps_every_band() {
             min_y: cy - 100.0 * res,
         },
         resolution: res,
+        time: None,
     };
     let chunk = engine.pull(rp, req).await.unwrap().into_raster().unwrap();
     assert_eq!(chunk.bands.band_count(), BANDS);

@@ -46,11 +46,46 @@ impl Bbox {
     }
 }
 
-/// a pull: give me this window at this ground resolution
+/// half-open utc instant range in epoch milliseconds: `start_ms` is in,
+/// `end_ms` is out. the engine core holds only numbers, rfc 3339 parsing
+/// and formatting live with the source that speaks it
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TimeInterval {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+impl TimeInterval {
+    pub fn new(start_ms: i64, end_ms: i64) -> TimeInterval {
+        TimeInterval { start_ms, end_ms }
+    }
+}
+
+/// a pull: give me this window at this ground resolution, optionally at
+/// this instant
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowReq {
     pub bbox: Bbox,
     pub resolution: f64,
+    /// `None` leaves a time-varying source on its own configured
+    /// interval, `Some` overrides it for this pull
+    pub time: Option<TimeInterval>,
+}
+
+impl WindowReq {
+    /// the same pull over another window: how a `plan` rewrites its
+    /// upstream request, so the pull's time rides along untouched
+    pub fn with_window(&self, bbox: Bbox, resolution: f64) -> WindowReq {
+        WindowReq {
+            bbox,
+            resolution,
+            time: self.time,
+        }
+    }
+
+    pub fn with_time(&self, time: Option<TimeInterval>) -> WindowReq {
+        WindowReq { time, ..*self }
+    }
 }
 
 /// a node's native pixel grid, anchor of its resolution ladder.
@@ -63,12 +98,23 @@ pub struct GridSpec {
     pub chunk_px: u32,
 }
 
-/// cache-addressable unit: ladder level plus tile indices in the node grid
+/// cache-addressable unit: ladder level plus tile indices in the node
+/// grid, plus the pull time at nodes whose data varies with it
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkKey {
     pub level: u8,
     pub ix: i64,
     pub iy: i64,
+    /// `None` at a node nothing upstream resolves per pull time, so a
+    /// time-invariant graph keeps one entry per tile however many
+    /// instants are pulled
+    pub time: Option<TimeInterval>,
+}
+
+impl ChunkKey {
+    pub fn at_time(&self, time: Option<TimeInterval>) -> ChunkKey {
+        ChunkKey { time, ..*self }
+    }
 }
 
 pub const MAX_LEVEL: u8 = 31;
@@ -114,13 +160,19 @@ impl GridSpec {
         (ix0, ix1, iy0, iy1)
     }
 
-    /// chunk keys covering the bbox at the given level, row-major
+    /// chunk keys covering the bbox at the given level, row-major, at the
+    /// source's own time. the engine stamps the pull time onto them
     pub fn cover(&self, bbox: &Bbox, level: u8) -> Vec<ChunkKey> {
         let (ix0, ix1, iy0, iy1) = self.tile_range(bbox, level);
         let mut keys = Vec::new();
         for iy in iy0..=iy1 {
             for ix in ix0..=ix1 {
-                keys.push(ChunkKey { level, ix, iy });
+                keys.push(ChunkKey {
+                    level,
+                    ix,
+                    iy,
+                    time: None,
+                });
             }
         }
         keys

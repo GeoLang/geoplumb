@@ -6,7 +6,7 @@ use crate::engine::Engine;
 use crate::error::Result;
 use crate::graph::NodeId;
 use crate::resample::resample_to_grid;
-use crate::window::{Bbox, WindowReq};
+use crate::window::{Bbox, TimeInterval, WindowReq};
 
 pub const TILE_PX: usize = 256;
 const WEB_MERCATOR_EXTENT: f64 = 20037508.342789244;
@@ -37,6 +37,17 @@ impl XyzTile {
 
 /// pull a node's window for a tile and resample onto the exact 256 px grid
 pub async fn render_tile(engine: &Engine, node: NodeId, tile: XyzTile) -> Result<RasterChunk> {
+    render_tile_at(engine, node, tile, None).await
+}
+
+/// the same tile at a pull time, overriding the interval a time-varying
+/// source was configured with
+pub async fn render_tile_at(
+    engine: &Engine,
+    node: NodeId,
+    tile: XyzTile,
+    time: Option<TimeInterval>,
+) -> Result<RasterChunk> {
     let bbox = tile.bbox();
     let pulled = engine
         .pull(
@@ -44,6 +55,7 @@ pub async fn render_tile(engine: &Engine, node: NodeId, tile: XyzTile) -> Result
             WindowReq {
                 bbox,
                 resolution: tile.resolution(),
+                time,
             },
         )
         .await?;

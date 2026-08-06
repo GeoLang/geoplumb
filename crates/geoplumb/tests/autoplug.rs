@@ -122,6 +122,7 @@ async fn mixed_crs_fanin_autoplugs_a_reproject() {
             min_y: 46.82,
         },
         resolution: CELL,
+        time: None,
     };
     let got = engine.pull(m, req).await.unwrap().into_raster().unwrap();
     assert_matches_analytic(&got, &req.bbox, |x, y| (x, y), 2.0);
@@ -168,6 +169,7 @@ async fn crs_demanding_transform_autoplugs_upstream() {
             min_y: y1,
         },
         resolution: 200.0,
+        time: None,
     };
     let got = engine.pull(t, req).await.unwrap().into_raster().unwrap();
     assert_matches_analytic(&got, &req.bbox, |x, y| inv.convert(x, y).unwrap(), 2.0);
@@ -296,6 +298,7 @@ async fn registered_adapter_bridges_a_bands_mismatch() {
             min_y: 46.8,
         },
         resolution: CELL,
+        time: None,
     };
     let a = engine.pull(hs, req).await.unwrap().into_raster().unwrap();
     let b = reference

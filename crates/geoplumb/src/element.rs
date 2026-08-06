@@ -28,6 +28,13 @@ pub trait Source: Send + Sync {
     /// native pixel grid anchoring this source's resolution ladder
     fn grid(&self) -> GridSpec;
 
+    /// does `read` resolve different data per `req.time`? the engine ors
+    /// this up the graph and keys the cache by time only where it holds,
+    /// so a source ignoring time costs no extra entries
+    fn time_varying(&self) -> bool {
+        false
+    }
+
     /// req is chunk-aligned to `grid()` by the engine, the response must
     /// cover exactly that grid window
     fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<Chunk>>;
@@ -48,8 +55,16 @@ pub trait Transform: Send + Sync {
         *input
     }
 
+    /// like `Source::time_varying`, for a transform whose own output
+    /// depends on the pull time. it ors with the parent's
+    fn time_varying(&self) -> bool {
+        false
+    }
+
     /// the upstream window needed to compute `out`: widen by kernel halo,
-    /// inverse-project across a crs change
+    /// inverse-project across a crs change. build it with
+    /// `out.with_window(..)` so the pull time carries upstream, the
+    /// engine reasserts it either way
     fn plan(&self, out: &WindowReq) -> WindowReq;
 
     /// forward image of a dirty region at a given chunk resolution, for
@@ -82,6 +97,11 @@ pub trait Fanin: Send + Sync {
             .iter()
             .min_by(|a, b| a.base_resolution.total_cmp(&b.base_resolution))
             .expect("fanin has inputs")
+    }
+
+    /// like `Source::time_varying`, ored with every input's
+    fn time_varying(&self) -> bool {
+        false
     }
 
     /// the window needed from input `k` to compute `out`

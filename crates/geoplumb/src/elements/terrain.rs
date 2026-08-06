@@ -19,10 +19,7 @@ fn single_band() -> CapsSet {
 }
 
 fn plan_with_halo(out: &WindowReq) -> WindowReq {
-    WindowReq {
-        bbox: out.bbox.expand(HALO_CELLS * out.resolution),
-        resolution: out.resolution,
-    }
+    out.with_window(out.bbox.expand(HALO_CELLS * out.resolution), out.resolution)
 }
 
 fn crop(result: Raster, input: &RasterChunk, out: &WindowReq) -> Result<Chunk> {

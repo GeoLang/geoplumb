@@ -257,6 +257,7 @@ async fn chunked_conv_matches_the_whole_window_reference() {
             WindowReq {
                 bbox: window(px0, py0, px0 + cols, py0 + rows),
                 resolution: CELL,
+                time: None,
             },
         )
         .await
@@ -329,10 +330,12 @@ async fn tensor_chunks_spill_to_disk_and_reload() {
     let fine = WindowReq {
         bbox,
         resolution: CELL,
+        time: None,
     };
     let coarse = WindowReq {
         bbox,
         resolution: CELL * 2.0,
+        time: None,
     };
 
     let first = engine.pull(tt, fine).await.unwrap().into_tensor().unwrap();
