@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
 
-use geoplumb::elements::{BandMath, CogSrc, Hillshade, Reproject, StacSrc};
+use geoplumb::elements::{Aspect, BandMath, CogSrc, Hillshade, Reproject, Slope, StacSrc};
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Crs, Engine, Graph, NodeId, Source, TimeInterval};
 
@@ -32,6 +32,10 @@ const MAX_ZOOM: u8 = 24;
 /// the gray range png encoding stretches over when no bandmath op names
 /// one, hillshade's own range
 const DEFAULT_GRAY: (f64, f64) = (0.0, 255.0);
+/// slope is degrees from horizontal
+const SLOPE_GRAY: (f64, f64) = (0.0, 90.0);
+/// aspect is compass degrees
+const ASPECT_GRAY: (f64, f64) = (0.0, 360.0);
 
 /// disk tier size per layer, derived from the memory budget rather than
 /// given its own knob: the tier only exists when a disk dir is set
@@ -98,6 +102,14 @@ impl Layer {
                     gray = (*min, *max);
                     let math = BandMath::new(expr).map_err(|e| e.to_string())?;
                     graph.add_transform(node, Box::new(math))
+                }
+                OpConfig::Slope => {
+                    gray = SLOPE_GRAY;
+                    graph.add_transform(node, Box::new(Slope))
+                }
+                OpConfig::Aspect => {
+                    gray = ASPECT_GRAY;
+                    graph.add_transform(node, Box::new(Aspect))
                 }
             };
         }

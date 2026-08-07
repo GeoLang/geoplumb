@@ -126,12 +126,26 @@ source = { kind = "cog", path = "/data/dem.tif" }
 kind = "hillshade"
 azimuth = 315.0
 altitude = 45.0
+
+[[layer]]
+name = "slope"
+source = { kind = "cog", path = "/data/dem.tif" }
+
+[[layer.op]]
+kind = "slope"
+
+[[layer]]
+name = "aspect"
+source = { kind = "cog", path = "/data/dem.tif" }
+
+[[layer.op]]
+kind = "aspect"
 "#;
 
 #[test]
 fn config_parses_sources_ops_and_their_order() {
     let config = Config::parse(FULL).unwrap();
-    assert_eq!(config.layers.len(), 2);
+    assert_eq!(config.layers.len(), 4);
 
     let ndvi = &config.layers[0];
     assert_eq!(ndvi.name, "ndvi");
@@ -159,6 +173,8 @@ fn config_parses_sources_ops_and_their_order() {
         other => panic!("unexpected source: {other:?}"),
     }
     assert!(matches!(dem.ops[..], [OpConfig::Hillshade { .. }]));
+    assert!(matches!(config.layers[2].ops[..], [OpConfig::Slope]));
+    assert!(matches!(config.layers[3].ops[..], [OpConfig::Aspect]));
 }
 
 #[test]
@@ -208,8 +224,8 @@ source = { kind = "wms", url = "x" }"#,
 name = "a"
 source = { kind = "cog", path = "/a.tif" }
 [[layer.op]]
-kind = "slope""#,
-            "op outside the two supported",
+kind = "contours""#,
+            "op outside the supported set",
         ),
         (
             r#"[[layer]]

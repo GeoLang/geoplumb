@@ -73,6 +73,8 @@ pub enum OpConfig {
         min: f64,
         max: f64,
     },
+    Slope,
+    Aspect,
 }
 
 impl From<CompositeConfig> for Composite {
