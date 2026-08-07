@@ -28,3 +28,5 @@ pub(crate) fn default_adapters() -> Vec<crate::element::Adapter> {
     vec![Reproject::adapter(), VecReproject::adapter()]
 }
 pub use terrain::{Aspect, Hillshade, Slope};
+pub mod mask;
+pub use mask::QualityMask;
