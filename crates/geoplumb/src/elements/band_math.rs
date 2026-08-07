@@ -9,12 +9,60 @@ use crate::error::{Error, Result};
 use crate::window::WindowReq;
 use terrano_core::{BandedRaster, Raster};
 
-#[derive(Debug, Clone, Copy)]
+/// what a true comparison yields, and what `where` reads as its true
+/// branch. any other finite value is true to `where` as well
+const TRUE_VALUE: f64 = 1.0;
+const FALSE_VALUE: f64 = 0.0;
+
+fn from_bool(hit: bool) -> f64 {
+    if hit { TRUE_VALUE } else { FALSE_VALUE }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum BinOp {
     Add,
     Sub,
     Mul,
     Div,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+    Equal,
+    NotEqual,
+}
+
+/// spelling of every comparison, two-character ones first so the lexer can
+/// take the first match at a position
+const COMPARISONS: [(&str, BinOp); 6] = [
+    ("<=", BinOp::LessOrEqual),
+    (">=", BinOp::GreaterOrEqual),
+    ("==", BinOp::Equal),
+    ("!=", BinOp::NotEqual),
+    ("<", BinOp::Less),
+    (">", BinOp::Greater),
+];
+
+impl BinOp {
+    /// nan in, nan out: every rust comparison against a nan is false, so
+    /// nodata would otherwise come out as a confident 0.0, and `!=` as 1.0
+    fn eval(self, a: f64, b: f64) -> f64 {
+        if a.is_nan() || b.is_nan() {
+            return f64::NAN;
+        }
+        match self {
+            BinOp::Add => a + b,
+            BinOp::Sub => a - b,
+            BinOp::Mul => a * b,
+            BinOp::Div => a / b,
+            BinOp::Less => from_bool(a < b),
+            BinOp::LessOrEqual => from_bool(a <= b),
+            BinOp::Greater => from_bool(a > b),
+            BinOp::GreaterOrEqual => from_bool(a >= b),
+            BinOp::Equal => from_bool(a == b),
+            BinOp::NotEqual => from_bool(a != b),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -24,18 +72,24 @@ enum Func {
     Min,
     Max,
     Pow,
+    Log,
+    Exp,
+    Where,
 }
 
-const FUNCS: [(&str, Func, usize); 5] = [
+const FUNCS: [(&str, Func, usize); 8] = [
     ("sqrt", Func::Sqrt, 1),
     ("abs", Func::Abs, 1),
     ("min", Func::Min, 2),
     ("max", Func::Max, 2),
     ("pow", Func::Pow, 2),
+    ("log", Func::Log, 1),
+    ("exp", Func::Exp, 1),
+    ("where", Func::Where, 3),
 ];
 
 /// widest arity in `FUNCS`, the per-pixel argument buffer
-const MAX_ARITY: usize = 2;
+const MAX_ARITY: usize = 3;
 
 impl Func {
     fn lookup(name: &str) -> Option<(Func, usize)> {
@@ -58,6 +112,15 @@ impl Func {
             Func::Min => args[0].min(args[1]),
             Func::Max => args[0].max(args[1]),
             Func::Pow => args[0].powf(args[1]),
+            Func::Log => args[0].ln(),
+            Func::Exp => args[0].exp(),
+            Func::Where => {
+                if args[0] == FALSE_VALUE {
+                    args[2]
+                } else {
+                    args[1]
+                }
+            }
         }
     }
 }
@@ -75,15 +138,7 @@ fn eval(expr: &Expr, bands: &[f64]) -> f64 {
         Expr::Band(i) => bands[*i],
         Expr::Lit(v) => *v,
         Expr::Neg(inner) => -eval(inner, bands),
-        Expr::Bin(op, a, b) => {
-            let (a, b) = (eval(a, bands), eval(b, bands));
-            match op {
-                BinOp::Add => a + b,
-                BinOp::Sub => a - b,
-                BinOp::Mul => a * b,
-                BinOp::Div => a / b,
-            }
-        }
+        Expr::Bin(op, a, b) => op.eval(eval(a, bands), eval(b, bands)),
         Expr::Call(func, args) => {
             let mut vals = [f64::NAN; MAX_ARITY];
             for (slot, arg) in vals.iter_mut().zip(args) {
@@ -99,6 +154,15 @@ enum Tok {
     Num(f64),
     Name(String),
     Sym(char),
+    Comparison(BinOp),
+}
+
+fn comparison_text(op: BinOp) -> &'static str {
+    COMPARISONS
+        .iter()
+        .find(|(_, candidate)| *candidate == op)
+        .map(|(text, _)| *text)
+        .expect("a comparison token holds a comparison")
 }
 
 fn describe(tok: &Tok) -> String {
@@ -106,11 +170,19 @@ fn describe(tok: &Tok) -> String {
         Tok::Num(v) => format!("{v}"),
         Tok::Name(n) => n.clone(),
         Tok::Sym(c) => format!("'{c}'"),
+        Tok::Comparison(op) => format!("'{}'", comparison_text(*op)),
     }
 }
 
 fn parse_err(detail: String) -> Error {
     Error::InvalidGraph(format!("band math: {detail}"))
+}
+
+/// `text` is ascii, so its byte length is also its length in `chars`
+fn starts_with(chars: &[char], at: usize, text: &str) -> bool {
+    text.chars()
+        .enumerate()
+        .all(|(offset, c)| chars.get(at + offset) == Some(&c))
 }
 
 fn lex(src: &str) -> Result<Vec<Tok>> {
@@ -140,6 +212,12 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
         } else if "+-*/(),".contains(c) {
             toks.push(Tok::Sym(c));
             i += 1;
+        } else if let Some((text, op)) = COMPARISONS
+            .iter()
+            .find(|(text, _)| starts_with(&chars, i, text))
+        {
+            toks.push(Tok::Comparison(*op));
+            i += text.len();
         } else {
             return Err(parse_err(format!("unexpected character '{c}'")));
         }
@@ -184,7 +262,25 @@ impl Parser<'_> {
         }
     }
 
+    fn peek_comparison(&self) -> Option<BinOp> {
+        match self.toks.get(self.pos) {
+            Some(Tok::Comparison(op)) => Some(*op),
+            _ => None,
+        }
+    }
+
+    /// comparisons bind loosest, so `b0 + 1 < b1` compares the sums
     fn expr(&mut self) -> Result<Expr> {
+        let mut left = self.additive()?;
+        while let Some(op) = self.peek_comparison() {
+            self.pos += 1;
+            let right = self.additive()?;
+            left = Expr::Bin(op, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn additive(&mut self) -> Result<Expr> {
         let mut left = self.term()?;
         while let Some(c @ ('+' | '-')) = self.peek_sym() {
             self.pos += 1;
@@ -264,9 +360,11 @@ impl Parser<'_> {
 
 /// one output band per pixel from an expression over the input bands.
 /// band variables are `b0`, `b1`, ..., with f64 literals, `+ - * /`, unary
-/// minus, parentheses and `sqrt`, `abs`, `min`, `max`, `pow`. a nodata cell
-/// enters the expression as NaN and NaN propagates through every operator,
-/// so the output nodata is NaN
+/// minus, parentheses, the comparisons `< <= > >= == !=` yielding 1.0 or
+/// 0.0, and `sqrt`, `abs`, `min`, `max`, `pow`, `log` (natural), `exp` and
+/// `where(cond, a, b)`, which takes `a` where `cond` is nonzero. a nodata
+/// cell enters the expression as NaN and NaN propagates through every
+/// operator, so the output nodata is NaN
 pub struct BandMath {
     root: Expr,
     bands: usize,

@@ -1,6 +1,7 @@
 //! band math: an ndvi expression against a hand-computed reference, chunk
-//! seam equality, nan propagation, parse failures and the band count the
-//! expression demands of its input link
+//! seam equality, comparisons and `where`, `log` and `exp`, nan
+//! propagation, parse failures and the band count the expression demands of
+//! its input link
 
 use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
 use geoplumb::element::Transform;
@@ -206,6 +207,18 @@ async fn nan_propagates_through_every_operator() {
         "max(b0, b1)",
         "pow(b0, 0)",
         "-b0",
+        "b0 < b1",
+        "b0 <= b1",
+        "b0 > b1",
+        "b0 >= b1",
+        "b0 == b1",
+        "b0 != b1",
+        "log(b0)",
+        "exp(b0)",
+        // the condition holds the nodata, so neither branch may answer
+        "where(b0 > 0.1, b1, b1)",
+        // and a nodata branch the condition did not pick still poisons it
+        "where(b1 > 0.1, b1, b0)",
     ] {
         let got = pull(expr, src_with(hole), bbox).await;
         let band = got.bands.band(0).unwrap();
@@ -231,6 +244,10 @@ fn parse_failures_name_the_offending_token() {
         ("b0 + bx", "unknown name bx"),
         ("min(b0)", "min takes 2 arguments"),
         ("b0 b1", "trailing b1"),
+        ("b0 = b1", "'='"),
+        ("b0 ! b1", "'!'"),
+        ("where(b0, b1)", "where takes 3 arguments"),
+        ("b0 < ", "expression ends"),
     ] {
         let err = BandMath::new(expr)
             .err()
@@ -282,4 +299,146 @@ fn extra_source_bands_are_fine() {
     let bm = g.add_transform(s, Box::new(BandMath::new("b0 + b1").unwrap()));
     let engine = Engine::new(g, 64 << 20).unwrap();
     assert_eq!(engine.caps(bm).raster().bands, 1);
+}
+
+/// pixel window the operator tests pull, small enough to walk twice over
+const OP_WINDOW: (usize, usize, usize, usize) = (16, 24, 32, 24);
+
+/// walks the pulled band against a reference over the same cells
+async fn each_cell(expr: &str, source: RasterSrc, mut check: impl FnMut(usize, usize, f64)) {
+    let (px0, py0, cols, rows) = OP_WINDOW;
+    let got = pull(expr, source, window(px0, py0, px0 + cols, py0 + rows)).await;
+    let band = got.bands.band(0).unwrap();
+    assert_eq!((got.width(), got.height()), (cols, rows));
+    for row in 0..rows {
+        for col in 0..cols {
+            check(px0 + col, py0 + row, band.data()[row * cols + col]);
+        }
+    }
+}
+
+type Comparison = fn(f64, f64) -> bool;
+
+#[tokio::test]
+async fn comparisons_against_a_threshold_match_the_reference() {
+    // band 0 runs 0.1..0.3, so a threshold at 0.2 splits the window
+    const THRESHOLD: f64 = 0.2;
+    let cases: [(&str, Comparison); 4] = [
+        ("<", |a, b| a < b),
+        ("<=", |a, b| a <= b),
+        (">", |a, b| a > b),
+        (">=", |a, b| a >= b),
+    ];
+    for (symbol, compare) in cases {
+        let (mut ones, mut zeroes) = (0, 0);
+        each_cell(
+            &format!("b0 {symbol} {THRESHOLD}"),
+            src(),
+            |col, row, got| {
+                let want = if compare(band_value(0, col, row), THRESHOLD) {
+                    ones += 1;
+                    1.0
+                } else {
+                    zeroes += 1;
+                    0.0
+                };
+                assert_eq!(got, want, "{symbol} at ({col},{row})");
+            },
+        )
+        .await;
+        assert!(ones > 0 && zeroes > 0, "{symbol}: the window split nothing");
+    }
+}
+
+#[tokio::test]
+async fn comparing_a_band_with_itself_pins_the_boundary_cases() {
+    for (expr, want) in [
+        ("b0 < b0", 0.0),
+        ("b0 <= b0", 1.0),
+        ("b0 > b0", 0.0),
+        ("b0 >= b0", 1.0),
+        ("b0 == b0", 1.0),
+        ("b0 != b0", 0.0),
+        // band 1 stays above band 0 everywhere
+        ("b0 < b1", 1.0),
+        ("b0 == b1", 0.0),
+        ("b0 != b1", 1.0),
+    ] {
+        each_cell(expr, src(), |col, row, got| {
+            assert_eq!(got, want, "{expr} at ({col},{row})");
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn comparisons_bind_looser_than_arithmetic() {
+    // parsed as (b0 + b1) > 0.7, not b0 + (b1 > 0.7)
+    let (mut ones, mut zeroes) = (0, 0);
+    each_cell("b0 + b1 > 0.7", src(), |col, row, got| {
+        let want = if band_value(0, col, row) + band_value(1, col, row) > 0.7 {
+            ones += 1;
+            1.0
+        } else {
+            zeroes += 1;
+            0.0
+        };
+        assert_eq!(got, want, "at ({col},{row})");
+    })
+    .await;
+    assert!(ones > 0 && zeroes > 0, "the window split nothing");
+}
+
+#[tokio::test]
+async fn where_takes_the_branch_the_condition_names() {
+    each_cell("where(b0 < 0.2, b0, b1)", src(), |col, row, got| {
+        let (red, nir) = (band_value(0, col, row), band_value(1, col, row));
+        let want = if red < 0.2 { red } else { nir };
+        assert_eq!(got, want, "at ({col},{row})");
+    })
+    .await;
+
+    // any nonzero condition is true, zero alone is false
+    for (expr, want_band) in [
+        ("where(1, b0, b1)", 0),
+        ("where(0, b0, b1)", 1),
+        ("where(-3.5, b0, b1)", 0),
+        ("where(0.0, b0, b1)", 1),
+    ] {
+        each_cell(expr, src(), |col, row, got| {
+            assert_eq!(
+                got,
+                band_value(want_band, col, row),
+                "{expr} at ({col},{row})"
+            );
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn log_and_exp_are_natural_and_invert_each_other() {
+    each_cell("log(b0)", src(), |col, row, got| {
+        let want = band_value(0, col, row).ln();
+        assert!((got - want).abs() < 1e-15, "log at ({col},{row}): {got}");
+    })
+    .await;
+
+    each_cell("exp(b1)", src(), |col, row, got| {
+        let want = band_value(1, col, row).exp();
+        assert!((got - want).abs() < 1e-15, "exp at ({col},{row}): {got}");
+    })
+    .await;
+
+    each_cell("exp(log(b0))", src(), |col, row, got| {
+        let want = band_value(0, col, row);
+        assert!((got - want).abs() < 1e-15, "round trip at ({col},{row})");
+    })
+    .await;
+
+    // log of a negative is nan, not an error, and it must not spread
+    each_cell("log(0 - b0)", src(), |col, row, got| {
+        assert!(got.is_nan(), "log of a negative at ({col},{row}): {got}");
+    })
+    .await;
 }
