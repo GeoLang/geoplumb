@@ -695,11 +695,17 @@ async fn multi_band_mosaic_fills_holes_per_band() {
 }
 
 /// item whose bands live in one cog per asset, sentinel-2 style
-fn asset_item(id: &str, dt: &str, assets: &[(&str, String)], bbox: [f64; 4]) -> serde_json::Value {
+fn asset_item(
+    id: &str,
+    dt: &str,
+    assets: &[(&str, String)],
+    bbox: [f64; 4],
+    epsg: u32,
+) -> serde_json::Value {
     let mut f = serde_json::json!({
         "id": id,
         "bbox": bbox,
-        "properties": { "datetime": dt, "proj:epsg": 4326 },
+        "properties": { "datetime": dt, "proj:epsg": epsg },
         "assets": {}
     });
     for (key, href) in assets {
@@ -735,6 +741,7 @@ async fn start_asset_mock() -> (String, Arc<Mock>) {
                     ("nir", format!("{base}/cog/n_left.tif")),
                 ],
                 [7.0, 46.6, 7.3, 47.0],
+                4326,
             ),
             asset_item(
                 "a_right",
@@ -744,6 +751,7 @@ async fn start_asset_mock() -> (String, Arc<Mock>) {
                     ("nir", format!("{base}/cog/n_right.tif")),
                 ],
                 [7.3, 46.6, 7.6, 47.0],
+                4326,
             ),
             asset_item(
                 "a_old",
@@ -753,12 +761,14 @@ async fn start_asset_mock() -> (String, Arc<Mock>) {
                     ("nir", format!("{base}/cog/n_old.tif")),
                 ],
                 [7.0, 46.6, 7.6, 47.0],
+                4326,
             ),
             asset_item(
                 "a_partial",
                 "2025-01-01T00:00:00Z",
                 &[("red", format!("{base}/cog/r_old.tif"))],
                 [7.0, 46.6, 7.6, 47.0],
+                4326,
             ),
         ];
         (cogs, features)
@@ -834,6 +844,7 @@ async fn assets_on_different_grids_fail_at_open() {
                 ("nir", format!("{base}/cog/coarse.tif")),
             ],
             [7.0, 46.6, 7.3, 47.0],
+            4326,
         )];
         (cogs, features)
     })
@@ -1127,6 +1138,411 @@ async fn a_percent_outside_the_range_clamps_to_min_and_max() {
             close(got, elevation(x, y) + shift, (x, y));
         });
     }
+}
+
+/// the utm zone pair sentinel-2 straddles at lon 12, the case the anchor
+/// crs alone cannot serve
+const ZONE_32: u16 = 32632;
+const ZONE_33: u16 = 32633;
+
+/// cell of the mixed-crs scene, in metres
+const UTM_CELL: f64 = 20.0;
+
+/// top-left corner of the zone 32 anchor item, west of the zone boundary
+/// but wide enough to run past it
+const MIXED_LON: f64 = 11.9;
+const MIXED_LAT: f64 = 47.0;
+const MIXED_COLS: usize = 600;
+const MIXED_ROWS: usize = 400;
+
+/// cells the zone 33 item reaches past the anchor item's footprint, so a
+/// window running off the anchor item still has cover and no test pixel
+/// sits within a resampling kernel of the zone 33 item's own edge
+const MIXED_MARGIN: usize = 100;
+
+/// marks the zone 33 item's values, so a pixel says which item filled it
+const MIXED_SHIFT: f64 = 2000.0;
+
+/// a warped value is one bilinear cell of the scene's curvature away from
+/// the scene the cogs were built from
+const WARP_TOLERANCE: f64 = 1e-3;
+
+fn to_lonlat(epsg: u16) -> projicio_core::Transform {
+    projicio_core::Transform::new(&format!("EPSG:{epsg}"), "EPSG:4326").unwrap()
+}
+
+fn from_lonlat(epsg: u16) -> projicio_core::Transform {
+    projicio_core::Transform::new("EPSG:4326", &format!("EPSG:{epsg}")).unwrap()
+}
+
+/// a utm pixel grid: where its top-left corner sits in its own metres and
+/// how many `UTM_CELL` cells it holds
+struct UtmGrid {
+    epsg: u16,
+    origin_x: f64,
+    origin_y: f64,
+    cols: usize,
+    rows: usize,
+}
+
+impl UtmGrid {
+    /// the grid whose top-left corner is this lon/lat
+    fn at(epsg: u16, lon: f64, lat: f64, cols: usize, rows: usize) -> UtmGrid {
+        let (origin_x, origin_y) = from_lonlat(epsg).convert(lon, lat).unwrap();
+        UtmGrid {
+            epsg,
+            origin_x,
+            origin_y,
+            cols,
+            rows,
+        }
+    }
+
+    fn pixel_center(&self, col: usize, row: usize) -> (f64, f64) {
+        (
+            self.origin_x + (col as f64 + 0.5) * UTM_CELL,
+            self.origin_y - (row as f64 + 0.5) * UTM_CELL,
+        )
+    }
+
+    /// corners plus edge midpoints, the boundary points a rotated grid
+    /// needs for an honest envelope in another crs
+    fn boundary(&self) -> Vec<(f64, f64)> {
+        let xs = [0.0, self.cols as f64 / 2.0, self.cols as f64];
+        let ys = [0.0, self.rows as f64 / 2.0, self.rows as f64];
+        let mut pts = Vec::with_capacity(9);
+        for cols in xs {
+            for rows in ys {
+                pts.push((
+                    self.origin_x + cols * UTM_CELL,
+                    self.origin_y - rows * UTM_CELL,
+                ));
+            }
+        }
+        pts
+    }
+
+    /// the grid's lon/lat footprint, the bbox a stac item declares
+    fn footprint(&self) -> [f64; 4] {
+        let pts = to_lonlat(self.epsg)
+            .convert_batch(&self.boundary())
+            .unwrap();
+        let mut out = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for (lon, lat) in pts {
+            out = [
+                out[0].min(lon),
+                out[1].min(lat),
+                out[2].max(lon),
+                out[3].max(lat),
+            ];
+        }
+        out
+    }
+
+    /// the same ground on another crs's axes, plus `margin` cells all
+    /// round: the two grids are rotated against each other, so this is
+    /// what an item in the neighbouring zone covering the anchor looks like
+    fn covering(&self, epsg: u16, margin: usize) -> UtmGrid {
+        let to =
+            projicio_core::Transform::new(&format!("EPSG:{}", self.epsg), &format!("EPSG:{epsg}"))
+                .unwrap();
+        let pts = to.convert_batch(&self.boundary()).unwrap();
+        let min_x = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let max_x = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+        let min_y = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let max_y = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+        let margin_m = margin as f64 * UTM_CELL;
+        UtmGrid {
+            epsg,
+            origin_x: min_x - margin_m,
+            origin_y: max_y + margin_m,
+            cols: ((max_x - min_x) / UTM_CELL).ceil() as usize + 2 * margin,
+            rows: ((max_y - min_y) / UTM_CELL).ceil() as usize + 2 * margin,
+        }
+    }
+
+    /// cog over the shared lon/lat scene on this grid, `shift` marking the
+    /// values so tests can tell which item won a pixel, `hole` blanking
+    /// rows 100..120 to nodata like `cog`
+    fn cog(&self, shift: f64, hole: bool) -> Vec<u8> {
+        let mut centers = Vec::with_capacity(self.cols * self.rows);
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                centers.push(self.pixel_center(col, row));
+            }
+        }
+        let data = to_lonlat(self.epsg)
+            .convert_batch(&centers)
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(
+                |(i, &(lon, lat))| match hole && (100..120).contains(&(i / self.cols)) {
+                    true => f64::NAN,
+                    false => elevation(lon, lat) + shift,
+                },
+            )
+            .collect();
+        let raster = Raster::from_vec(self.cols, self.rows, data, UTM_CELL, f64::NAN).unwrap();
+        let params = CogParams {
+            epsg: self.epsg,
+            origin_x: self.origin_x,
+            origin_y: self.origin_y,
+            pixel_width: UTM_CELL,
+            pixel_height: UTM_CELL,
+            ..params(0)
+        };
+        let mut buf = std::io::Cursor::new(Vec::new());
+        write_cog(&raster, &params, &mut buf).unwrap();
+        buf.into_inner()
+    }
+
+    /// window over these cells of the grid, aligned to it the way the
+    /// engine's chunk windows are
+    fn window(&self, col0: usize, row0: usize, cols: usize, rows: usize) -> WindowReq {
+        WindowReq {
+            bbox: Bbox {
+                min_x: self.origin_x + col0 as f64 * UTM_CELL,
+                max_x: self.origin_x + (col0 + cols) as f64 * UTM_CELL,
+                max_y: self.origin_y - row0 as f64 * UTM_CELL,
+                min_y: self.origin_y - (row0 + rows) as f64 * UTM_CELL,
+            },
+            resolution: UTM_CELL,
+            time: None,
+        }
+    }
+
+    fn row_at(&self, y: f64) -> usize {
+        ((self.origin_y - y) / UTM_CELL - 0.5).round() as usize
+    }
+}
+
+/// zone 32 and zone 33 items over the same ground: the newest item anchors
+/// the grid on zone 32 and holes out rows 100..120, the zone 33 item covers
+/// all of it plus a margin, shifted so a warped pixel is recognisable
+async fn start_mixed_crs_mock() -> (String, UtmGrid) {
+    let anchor = UtmGrid::at(ZONE_32, MIXED_LON, MIXED_LAT, MIXED_COLS, MIXED_ROWS);
+    let other = anchor.covering(ZONE_33, MIXED_MARGIN);
+    let (base, _mock) = start_mock_with(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert("zone32.tif".into(), anchor.cog(0.0, true));
+        cogs.insert("zone33.tif".into(), other.cog(MIXED_SHIFT, false));
+        let features = vec![
+            item(
+                "zone32",
+                "2024-06-01T00:00:00Z",
+                &format!("{base}/cog/zone32.tif"),
+                anchor.footprint(),
+                u32::from(ZONE_32),
+            ),
+            item(
+                "zone33",
+                "2020-01-01T00:00:00Z",
+                &format!("{base}/cog/zone33.tif"),
+                other.footprint(),
+                u32::from(ZONE_33),
+            ),
+        ];
+        (cogs, features)
+    })
+    .await;
+    (base, anchor)
+}
+
+/// covers both footprints, so the open search finds the whole scene
+const MIXED_SEARCH_BBOX: [f64; 4] = [11.8, 46.85, 12.15, 47.05];
+
+async fn open_mixed(base: &str) -> StacSrc {
+    let search = StacSearch::new(base, "test-s2", "data", MIXED_SEARCH_BBOX);
+    tokio::task::spawn_blocking(move || StacSrc::open(&search))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+fn close_warped(got: f64, want: f64, at: (f64, f64)) {
+    assert!(
+        (got - want).abs() < WARP_TOLERANCE,
+        "({:.1},{:.1}): {got} vs {want}",
+        at.0,
+        at.1
+    );
+}
+
+/// an item on another crs is kept and warped onto the anchor grid, so it
+/// fills the anchor-crs item's nodata rows instead of leaving them empty
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_item_in_another_crs_fills_the_anchor_items_nodata() {
+    let (base, anchor) = start_mixed_crs_mock().await;
+    let src = open_mixed(&base).await;
+    assert_eq!(src.item_count(), 2, "the zone 33 item was dropped");
+    assert_eq!(src.crs(), Crs(u32::from(ZONE_32)));
+
+    // a hundred cells square over the holed rows, well inside both items
+    let req = anchor.window(100, 50, 100, 100);
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    let lonlat = to_lonlat(ZONE_32);
+    let (mut plain, mut holed) = (0, 0);
+    each_pixel(&chunk, |_, x, y, got| {
+        let (lon, lat) = lonlat.convert(x, y).unwrap();
+        let in_hole = (100..120).contains(&anchor.row_at(y));
+        match in_hole {
+            true => holed += 1,
+            false => plain += 1,
+        }
+        let shift = if in_hole { MIXED_SHIFT } else { 0.0 };
+        close_warped(got, elevation(lon, lat) + shift, (x, y));
+    });
+    assert_eq!((plain, holed), (8000, 2000), "window missed a case");
+}
+
+/// a window straddling the two items' coverage composites both: the zone
+/// 32 item wins its own half, the zone 33 item covers the ground past the
+/// zone 32 item's east edge
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_straddling_two_crss_composites_both() {
+    let (base, anchor) = start_mixed_crs_mock().await;
+    let src = open_mixed(&base).await;
+
+    // fifty cells either side of the zone 32 item's east edge, clear of
+    // its holed rows
+    let req = anchor.window(MIXED_COLS - 50, 150, 100, 100);
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    let east_edge = anchor.origin_x + MIXED_COLS as f64 * UTM_CELL;
+    let lonlat = to_lonlat(ZONE_32);
+    let (mut zone32, mut zone33) = (0, 0);
+    each_pixel(&chunk, |_, x, y, got| {
+        let (lon, lat) = lonlat.convert(x, y).unwrap();
+        let shift = match x < east_edge {
+            true => {
+                zone32 += 1;
+                0.0
+            }
+            false => {
+                zone33 += 1;
+                MIXED_SHIFT
+            }
+        };
+        close_warped(got, elevation(lon, lat) + shift, (x, y));
+    });
+    assert_eq!((zone32, zone33), (5000, 5000), "window missed a case");
+}
+
+/// the engine splits a pull into chunks, so a mixed-crs item is read once
+/// per chunk with its own planned window. those reads must land on the
+/// same item pixels the one-shot read of the whole window lands on
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunked_pull_equals_the_whole_window_across_crss() {
+    let (base, anchor) = start_mixed_crs_mock().await;
+    // two chunks wide at the source's 256 px chunking, taking in the holed
+    // rows the zone 33 item fills
+    let req = anchor.window(0, 0, 512, 256);
+
+    let whole = open_mixed(&base)
+        .await
+        .read(&req)
+        .await
+        .unwrap()
+        .into_raster()
+        .unwrap();
+
+    let mut graph = Graph::new();
+    let node = graph.add_source(Box::new(open_mixed(&base).await));
+    let engine = Engine::new(graph, 64 << 20).unwrap();
+    let chunked = engine.pull(node, req).await.unwrap().into_raster().unwrap();
+    assert_eq!(chunked.bbox, whole.bbox);
+
+    let lonlat = to_lonlat(ZONE_32);
+    let mut holed = 0;
+    each_pixel(&chunked, |_, x, y, got| {
+        let (lon, lat) = lonlat.convert(x, y).unwrap();
+        let in_hole = (100..120).contains(&anchor.row_at(y));
+        holed += usize::from(in_hole);
+        let shift = if in_hole { MIXED_SHIFT } else { 0.0 };
+        close_warped(got, elevation(lon, lat) + shift, (x, y));
+    });
+    assert_eq!(holed, 20 * 512, "the pull missed the holed rows");
+
+    let one = whole.bands.band(0).unwrap().data();
+    let many = chunked.bands.band(0).unwrap().data();
+    assert_eq!(one.len(), many.len());
+    for (i, (a, b)) in one.iter().zip(many).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-9,
+            "pixel {i}: whole {a} vs chunked {b}, the two plans disagree"
+        );
+    }
+}
+
+/// the same zone pair with one cog per band, the sentinel-2 layout: both
+/// assets of the zone 33 item are warped, so a window past the zone 32
+/// item comes back with the bands still in asset order
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_asset_cogs_of_an_item_in_another_crs_stay_in_order() {
+    let anchor = UtmGrid::at(ZONE_32, MIXED_LON, MIXED_LAT, MIXED_COLS, MIXED_ROWS);
+    let other = anchor.covering(ZONE_33, MIXED_MARGIN);
+    let (base, _mock) = start_mock_with(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert("z32_red.tif".into(), anchor.cog(0.0, false));
+        cogs.insert("z32_nir.tif".into(), anchor.cog(NIR_SHIFT, false));
+        cogs.insert("z33_red.tif".into(), other.cog(MIXED_SHIFT, false));
+        cogs.insert(
+            "z33_nir.tif".into(),
+            other.cog(NIR_SHIFT + MIXED_SHIFT, false),
+        );
+        let features = vec![
+            asset_item(
+                "z32",
+                "2024-06-01T00:00:00Z",
+                &[
+                    ("red", format!("{base}/cog/z32_red.tif")),
+                    ("nir", format!("{base}/cog/z32_nir.tif")),
+                ],
+                anchor.footprint(),
+                u32::from(ZONE_32),
+            ),
+            asset_item(
+                "z33",
+                "2020-01-01T00:00:00Z",
+                &[
+                    ("red", format!("{base}/cog/z33_red.tif")),
+                    ("nir", format!("{base}/cog/z33_nir.tif")),
+                ],
+                other.footprint(),
+                u32::from(ZONE_33),
+            ),
+        ];
+        (cogs, features)
+    })
+    .await;
+
+    let mut search = StacSearch::new(&base, "test-s2", "red", MIXED_SEARCH_BBOX);
+    search.assets = vec!["red".into(), "nir".into()];
+    let src = tokio::task::spawn_blocking(move || StacSrc::open(&search))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(src.item_count(), 2);
+    assert_eq!(src.bands(), 2);
+
+    // fifty cells past the zone 32 item, where only the warped item covers
+    let req = anchor.window(MIXED_COLS, 150, 50, 50);
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    assert_eq!(chunk.bands.band_count(), 2);
+    let lonlat = to_lonlat(ZONE_32);
+    let mut seen = 0;
+    each_pixel(&chunk, |bi, x, y, got| {
+        let (lon, lat) = lonlat.convert(x, y).unwrap();
+        let nir = if bi == 0 { 0.0 } else { NIR_SHIFT };
+        seen += 1;
+        close_warped(got, elevation(lon, lat) + MIXED_SHIFT + nir, (x, y));
+    });
+    assert_eq!(seen, 2 * 50 * 50);
 }
 
 fn population_std_dev(values: &[f64]) -> f64 {
