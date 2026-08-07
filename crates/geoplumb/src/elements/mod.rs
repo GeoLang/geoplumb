@@ -30,3 +30,5 @@ pub(crate) fn default_adapters() -> Vec<crate::element::Adapter> {
 pub use terrain::{Aspect, Hillshade, Slope};
 pub mod mask;
 pub use mask::QualityMask;
+pub mod focal;
+pub use focal::{Focal, FocalOp};
