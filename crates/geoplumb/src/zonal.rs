@@ -249,7 +249,7 @@ async fn for_each_tile(
     let grid = *engine.grid(node);
     let level = grid.snap_level(window.resolution);
     let resolution = grid.resolution_at(level);
-    let aligned = align_outward(&window.bbox, &grid, resolution);
+    let aligned = align_outward(&window.bbox, grid.origin_x, grid.origin_y, resolution);
     for key in grid.cover(&aligned, level) {
         let Some(bbox) = intersection(&grid.chunk_bbox(key), &aligned) else {
             continue;

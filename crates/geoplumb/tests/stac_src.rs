@@ -1,7 +1,8 @@
-//! stac source against a mock api: search, crs and band-count filtering,
+//! stac source against a mock api: search, band-count filtering,
 //! `next`-link pagination, lazy cog opens over range requests,
-//! most-recent-first mosaicking with deflate cogs band by band, and lazy
-//! per-window block searches past the open bbox
+//! most-recent-first mosaicking with deflate cogs band by band, items on
+//! another crs warped onto the anchor grid, and lazy per-window block
+//! searches past the open bbox
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -254,13 +255,6 @@ async fn start_mock() -> (String, Arc<Mock>) {
                 4326,
             ),
             item(
-                "utm",
-                "2019-01-01T00:00:00Z",
-                &format!("{base}/cog/missing.tif"),
-                [7.0, 46.6, 7.6, 47.0],
-                32632,
-            ),
-            item(
                 "right",
                 "2024-06-01T00:00:00Z",
                 &format!("{base}/cog/right.tif"),
@@ -385,10 +379,9 @@ async fn open_src(base: &str) -> StacSrc {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn search_filters_crs_and_anchors_the_grid() {
+async fn open_anchors_the_grid_on_the_newest_item() {
     let (base, _mock) = start_mock().await;
     let src = open_src(&base).await;
-    // the utm item is filtered, three wgs84 items remain
     assert_eq!(src.item_count(), 3);
     let g = src.grid();
     assert!((g.base_resolution - CELL).abs() < 1e-15);
@@ -586,11 +579,11 @@ async fn searches_spanning_pages_still_cover_the_window() {
         .await
         .unwrap()
         .unwrap();
-    // four features over the anchor bbox, one per page, the utm one dropped
+    // three features over the anchor bbox, one per page
     assert_eq!(src.item_count(), 3);
     assert_eq!(
         mock.searches.load(Ordering::SeqCst),
-        4,
+        3,
         "the open search did not page"
     );
 

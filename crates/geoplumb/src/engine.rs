@@ -295,7 +295,7 @@ impl Engine {
             let grid = self.nodes[node].grid;
             let level = grid.snap_level(req.resolution);
             let res = grid.resolution_at(level);
-            let aligned = align_outward(&req.bbox, &grid, res);
+            let aligned = align_outward(&req.bbox, grid.origin_x, grid.origin_y, res);
             // a mis-scaled source grid (base resolution far finer than the
             // request) would enumerate an astronomical key vector and abort,
             // so refuse before allocating. i128 keeps saturated index bounds
@@ -609,12 +609,12 @@ fn union(a: Bbox, b: Bbox) -> Bbox {
 }
 
 /// widen a bbox outward onto the node's pixel grid at the given resolution
-pub(crate) fn align_outward(bbox: &Bbox, grid: &GridSpec, res: f64) -> Bbox {
+pub(crate) fn align_outward(bbox: &Bbox, origin_x: f64, origin_y: f64, res: f64) -> Bbox {
     let eps = res * 1e-9;
-    let min_x = grid.origin_x + (((bbox.min_x - grid.origin_x) / res + eps).floor()) * res;
-    let max_x = grid.origin_x + (((bbox.max_x - grid.origin_x) / res - eps).ceil()) * res;
-    let max_y = grid.origin_y - (((grid.origin_y - bbox.max_y) / res + eps).floor()) * res;
-    let min_y = grid.origin_y - (((grid.origin_y - bbox.min_y) / res - eps).ceil()) * res;
+    let min_x = origin_x + (((bbox.min_x - origin_x) / res + eps).floor()) * res;
+    let max_x = origin_x + (((bbox.max_x - origin_x) / res - eps).ceil()) * res;
+    let max_y = origin_y - (((origin_y - bbox.max_y) / res + eps).floor()) * res;
+    let min_y = origin_y - (((origin_y - bbox.min_y) / res - eps).ceil()) * res;
     Bbox {
         min_x,
         min_y,

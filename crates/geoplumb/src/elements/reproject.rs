@@ -102,6 +102,69 @@ fn local_scale(t: &projicio_core::Transform, x: f64, y: f64, step: f64) -> f64 {
     }
 }
 
+/// the source window a warp reads to fill `bbox` at `resolution`: the
+/// inverse-projected envelope widened for the bilinear kernel, and the
+/// source resolution the local scale factor asks for
+pub(crate) fn inverse_window(
+    inverse: &projicio_core::Transform,
+    bbox: &Bbox,
+    resolution: f64,
+) -> (Bbox, f64) {
+    let cx = (bbox.min_x + bbox.max_x) / 2.0;
+    let cy = (bbox.min_y + bbox.max_y) / 2.0;
+    let source_resolution = local_scale(inverse, cx, cy, resolution);
+    let env = envelope(inverse, bbox).unwrap_or(*bbox);
+    (env.expand(2.0 * source_resolution), source_resolution)
+}
+
+/// resample `input` onto the output window by inverse-projecting every
+/// output pixel center and sampling there. the one warp both this element
+/// and a stac item on another crs go through, so a pixel looks the same
+/// whichever asked for it
+pub(crate) fn warp_to_grid(
+    input: &RasterChunk,
+    out: &WindowReq,
+    inverse: &projicio_core::Transform,
+    to: Crs,
+) -> Result<RasterChunk> {
+    let res = out.resolution;
+    let cols = (out.bbox.width() / res).round() as usize;
+    let rows = (out.bbox.height() / res).round() as usize;
+    let mut centers = Vec::with_capacity(cols * rows);
+    for row in 0..rows {
+        for col in 0..cols {
+            centers.push((
+                out.bbox.min_x + (col as f64 + 0.5) * res,
+                out.bbox.max_y - (row as f64 + 0.5) * res,
+            ));
+        }
+    }
+    let src_pts = inverse
+        .convert_batch(&centers)
+        .map_err(|e| Error::Projection(e.to_string()))?;
+    let bands: Vec<Raster> = input
+        .bands
+        .bands()
+        .iter()
+        .map(|band| {
+            let nodata = band.nodata;
+            let data = src_pts
+                .iter()
+                .map(|&(sx, sy)| {
+                    crate::resample::sample_bilinear(band, input, sx, sy).unwrap_or(nodata)
+                })
+                .collect();
+            Raster::from_vec(cols, rows, data, res, nodata).expect("reproject dims")
+        })
+        .collect();
+    Ok(RasterChunk {
+        bands: BandedRaster::new(bands).expect("uniform bands"),
+        bbox: out.bbox,
+        resolution: res,
+        crs: to,
+    })
+}
+
 /// canonical grid anchors for the common target crs, else the projected
 /// input origin
 fn canonical_origin(crs: Crs, projected_input_origin: (f64, f64)) -> (f64, f64) {
@@ -154,12 +217,8 @@ impl Transform for Reproject {
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
-        let env = envelope(self.inv(), &out.bbox).unwrap_or(out.bbox);
-        // local scale at the window center decides the upstream resolution
-        let cx = (out.bbox.min_x + out.bbox.max_x) / 2.0;
-        let cy = (out.bbox.min_y + out.bbox.max_y) / 2.0;
-        let in_res = local_scale(self.inv(), cx, cy, out.resolution);
-        out.with_window(env.expand(2.0 * in_res), in_res)
+        let (bbox, resolution) = inverse_window(self.inv(), &out.bbox, out.resolution);
+        out.with_window(bbox, resolution)
     }
 
     fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {
@@ -169,44 +228,7 @@ impl Transform for Reproject {
     }
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
-        let input = input.raster()?;
-        let res = out.resolution;
-        let cols = (out.bbox.width() / res).round() as usize;
-        let rows = (out.bbox.height() / res).round() as usize;
-        let mut centers = Vec::with_capacity(cols * rows);
-        for row in 0..rows {
-            for col in 0..cols {
-                centers.push((
-                    out.bbox.min_x + (col as f64 + 0.5) * res,
-                    out.bbox.max_y - (row as f64 + 0.5) * res,
-                ));
-            }
-        }
-        let src_pts = self
-            .inv()
-            .convert_batch(&centers)
-            .map_err(|e| Error::Projection(e.to_string()))?;
-        let bands: Vec<Raster> = input
-            .bands
-            .bands()
-            .iter()
-            .map(|band| {
-                let nodata = band.nodata;
-                let data = src_pts
-                    .iter()
-                    .map(|&(sx, sy)| {
-                        crate::resample::sample_bilinear(band, input, sx, sy).unwrap_or(nodata)
-                    })
-                    .collect();
-                Raster::from_vec(cols, rows, data, res, nodata).expect("reproject dims")
-            })
-            .collect();
-        Ok(Chunk::Raster(RasterChunk {
-            bands: BandedRaster::new(bands).expect("uniform bands"),
-            bbox: out.bbox,
-            resolution: res,
-            crs: self.to,
-        }))
+        warp_to_grid(input.raster()?, out, self.inv(), self.to).map(Chunk::Raster)
     }
 }
 
@@ -304,11 +326,8 @@ impl Transform for VecReproject {
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
-        let env = envelope(self.inv(), &out.bbox).unwrap_or(out.bbox);
-        let cx = (out.bbox.min_x + out.bbox.max_x) / 2.0;
-        let cy = (out.bbox.min_y + out.bbox.max_y) / 2.0;
-        let in_res = local_scale(self.inv(), cx, cy, out.resolution);
-        out.with_window(env.expand(2.0 * in_res), in_res)
+        let (bbox, resolution) = inverse_window(self.inv(), &out.bbox, out.resolution);
+        out.with_window(bbox, resolution)
     }
 
     fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {

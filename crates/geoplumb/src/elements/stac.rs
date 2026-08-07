@@ -2,10 +2,11 @@
 //! blocks cached for the source's lifetime, so coverage is not bound to
 //! the bbox given at open. open searches that bbox once to anchor the
 //! grid, crs and band count on the most recent item. items are filtered
-//! to the anchor crs and band counts, searches follow `next` links to the
-//! end, each item's cog assets open lazily over http range requests, and
-//! a pull mosaics its items most-recent-first, band by band. a search may
-//! name several assets (collections like sentinel-2 spread bands across
+//! to the anchor band counts, an item on another crs is read on its own
+//! grid and warped onto the anchor grid, searches follow `next` links to
+//! the end, each item's cog assets open lazily over http range requests,
+//! and a pull mosaics its items most-recent-first, band by band. a search
+//! may name several assets (collections like sentinel-2 spread bands across
 //! per-band cogs): an item is kept only when every asset is present, and
 //! a pull reads them all, bands concatenated in asset order. item reads
 //! run in parallel, capped across every pull in the process.
@@ -25,6 +26,8 @@ use crate::caps::{
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::elements::cog::{HttpRange, band_count, read_chunk};
+use crate::elements::reproject::{inverse_window, warp_to_grid};
+use crate::engine::align_outward;
 use crate::error::{Error, Result};
 use crate::window::{Bbox, GridSpec, TimeInterval, WindowReq};
 use futures::future::BoxFuture;
@@ -268,26 +271,46 @@ struct Item {
     /// one href per search asset, in asset order
     hrefs: Vec<String>,
     datetime: String,
-    /// footprint in the source crs, for skipping items a pull misses
+    /// footprint in the anchor crs, for skipping items a pull misses
     bbox: Bbox,
+    /// set only when the item's own crs is not the anchor's, in which case
+    /// a read warps it onto the anchor grid
+    reprojection: Option<Reprojection>,
     /// per-asset pools of opened readers: a read takes one out, opens
     /// fresh when the pool is empty, and puts it back after, so
     /// concurrent chunks of one pull do not serialize on an item
     readers: Vec<Mutex<Vec<CogReader<HttpRange>>>>,
 }
 
+/// what reading an item off the anchor crs needs: its own crs, and the
+/// anchor-to-item transform that both plans the region to read and
+/// inverse-maps the output pixel centers into it
+struct Reprojection {
+    crs: Crs,
+    from_anchor: projicio_core::Transform,
+}
+
+impl Reprojection {
+    fn new(anchor: Crs, crs: Crs) -> Result<Reprojection> {
+        let from_anchor = projicio_core::Transform::new(&anchor.authority(), &crs.authority())
+            .map_err(|e| Error::Projection(e.to_string()))?;
+        Ok(Reprojection { crs, from_anchor })
+    }
+}
+
 struct Inner {
     search: StacSearch,
     client: reqwest::blocking::Client,
+    /// the anchor item's crs, which every pull comes back on
     crs: Crs,
     /// per-asset band counts of the anchor item's cogs, which every kept
     /// item shares
     asset_bands: Vec<u16>,
     /// their sum, the band count a pull produces
     bands: u16,
-    /// lon/lat to source crs for item footprints, `None` when it is 4326
+    /// lon/lat to the anchor crs for item footprints, `None` when it is 4326
     to_native: Option<projicio_core::Transform>,
-    /// source crs to lon/lat for pull windows, `None` when it is 4326
+    /// the anchor crs to lon/lat for pull windows, `None` when it is 4326
     to_lonlat: Option<projicio_core::Transform>,
     /// blocks searched, per pull time. `None` is the search's own
     /// `datetime`, the only time there was before pulls carried one
@@ -530,7 +553,7 @@ impl StacSrc {
         self.inner.items.lock().unwrap().len()
     }
 
-    /// the crs all kept items share, from the most recent anchor item
+    /// the crs every pull comes back on, from the most recent anchor item
     pub fn crs(&self) -> Crs {
         self.crs
     }
@@ -571,12 +594,14 @@ impl Inner {
         }
     }
 
-    /// keep items matching the anchor's crs and per-asset band counts,
-    /// one shared copy per item, keyed by its first asset's href, and
-    /// record which of them `time`'s searches matched
+    /// keep items matching the anchor's per-asset band counts, one shared
+    /// copy per item, keyed by its first asset's href, and record which of
+    /// them `time`'s searches matched. an item on another crs is kept with
+    /// the transform its reads warp through
     fn insert(&self, found: Vec<Found>, time: Option<TimeInterval>) -> Result<()> {
         for f in found {
-            if f.epsg != self.crs.0 {
+            // an item declaring no crs cannot be placed on the anchor grid
+            if f.epsg == 0 {
                 continue;
             }
             if f.bands
@@ -588,11 +613,16 @@ impl Inner {
             }
             let key = f.hrefs[0].clone();
             if !self.items.lock().unwrap().contains_key(&key) {
+                let reprojection = match f.epsg == self.crs.0 {
+                    true => None,
+                    false => Some(Reprojection::new(self.crs, Crs(f.epsg))?),
+                };
                 let item = Arc::new(Item {
                     bbox: self.native_bbox(&f.bbox)?,
                     readers: f.hrefs.iter().map(|_| Mutex::new(Vec::new())).collect(),
                     hrefs: f.hrefs,
                     datetime: f.datetime,
+                    reprojection,
                 });
                 self.items.lock().unwrap().insert(key.clone(), item);
             }
@@ -646,7 +676,9 @@ impl Inner {
     }
 
     /// one item's window across every asset, bands concatenated in asset
-    /// order, each cog opening on first use
+    /// order, each cog opening on first use. an asset of an item on
+    /// another crs comes back warped onto the anchor grid, so every band
+    /// of the chunk is on the window the caller asked for either way
     fn read_item(&self, item: &Item, req: &WindowReq) -> Result<RasterChunk> {
         let mut bands = Vec::with_capacity(usize::from(self.bands));
         for (k, pool) in item.readers.iter().enumerate() {
@@ -663,7 +695,17 @@ impl Inner {
                     item.hrefs[k], self.asset_bands[k]
                 )));
             }
-            let chunk = read_chunk(&mut reader, req, meta.origin_x, meta.origin_y, self.crs)?;
+            let chunk = match &item.reprojection {
+                None => read_chunk(&mut reader, req, meta.origin_x, meta.origin_y, self.crs)?,
+                Some(reprojection) => read_warped(
+                    &mut reader,
+                    req,
+                    meta.origin_x,
+                    meta.origin_y,
+                    reprojection,
+                    self.crs,
+                )?,
+            };
             {
                 let mut pool = pool.lock().unwrap();
                 if pool.len() < POOLED_READERS_PER_ASSET {
@@ -763,6 +805,38 @@ impl Inner {
         items.sort_by(|a, b| b.datetime.cmp(&a.datetime));
         Ok(items)
     }
+}
+
+/// one asset of an item whose crs is not the anchor's: read the item
+/// region covering the output window, on the item's own pixel grid at its
+/// own level resolution, then warp that onto the output window. the read
+/// has to sit on the item grid because `read_chunk` places pixels by
+/// rounding the window onto it, and the warp samples what it gets back,
+/// so an off-grid window would misregister by up to half a pixel
+fn read_warped(
+    reader: &mut CogReader<HttpRange>,
+    req: &WindowReq,
+    origin_x: f64,
+    origin_y: f64,
+    reprojection: &Reprojection,
+    anchor: Crs,
+) -> Result<RasterChunk> {
+    let (region, wanted) = inverse_window(&reprojection.from_anchor, &req.bbox, req.resolution);
+    let level = reader.select_level(wanted);
+    let resolution = reader.levels()[level].pixel_width;
+    // widened again at the resolution actually being read, so every output
+    // pixel center keeps a full bilinear neighbourhood however coarse the
+    // item is: without it a window's edge pixels would fall back to their
+    // nearest neighbour and two adjoining windows would disagree there
+    let region = align_outward(
+        &region.expand(2.0 * resolution),
+        origin_x,
+        origin_y,
+        resolution,
+    );
+    let source = req.with_window(region, resolution);
+    let chunk = read_chunk(reader, &source, origin_x, origin_y, reprojection.crs)?;
+    warp_to_grid(&chunk, req, &reprojection.from_anchor, anchor)
 }
 
 /// one window read per item, `MAX_PARALLEL_ITEM_READS` in flight across
