@@ -1276,7 +1276,7 @@ dependencies = [
 [[package]]
 name = "terrano-core"
 version = "0.1.0"
-source = "git+https://github.com/GeoLang/terrano.git?branch=master#46ca0bbf40b50e9e6b26724b05aea7f7eb5dd99b"
+source = "git+https://github.com/GeoLang/terrano.git?branch=master#d11643d73e608f0e43b9db17c5d3c052dd4c3305"
 dependencies = [
  "flate2",
  "thiserror",
