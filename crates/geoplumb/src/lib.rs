@@ -19,6 +19,7 @@ pub mod solver;
 mod spill;
 pub mod tile;
 pub mod window;
+pub mod zonal;
 
 pub use caps::{Caps, CapsSet, Constraint, Crs};
 pub use chunk::{Chunk, PointChunk, RasterChunk, TensorChunk, VectorChunk, VectorFeature};
@@ -27,3 +28,6 @@ pub use engine::{Engine, Invalidation, materialize};
 pub use error::{Error, Result};
 pub use graph::{Graph, NodeId};
 pub use window::{Bbox, TimeInterval, WindowReq};
+pub use zonal::{
+    FeatureStatistics, PixelStatistics, Statistic, window_statistics, zonal_statistics,
+};

@@ -609,7 +609,7 @@ fn union(a: Bbox, b: Bbox) -> Bbox {
 }
 
 /// widen a bbox outward onto the node's pixel grid at the given resolution
-fn align_outward(bbox: &Bbox, grid: &GridSpec, res: f64) -> Bbox {
+pub(crate) fn align_outward(bbox: &Bbox, grid: &GridSpec, res: f64) -> Bbox {
     let eps = res * 1e-9;
     let min_x = grid.origin_x + (((bbox.min_x - grid.origin_x) / res + eps).floor()) * res;
     let max_x = grid.origin_x + (((bbox.max_x - grid.origin_x) / res - eps).ceil()) * res;
