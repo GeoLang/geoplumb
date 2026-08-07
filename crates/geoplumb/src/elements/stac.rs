@@ -6,10 +6,10 @@
 //! grid and warped onto the anchor grid, searches follow `next` links to
 //! the end, each item's cog assets open lazily over http range requests,
 //! and a pull mosaics its items most-recent-first, band by band. a search
-//! may name several assets (collections like sentinel-2 spread bands across
-//! per-band cogs): an item is kept only when every asset is present, and
-//! a pull reads them all, bands concatenated in asset order. item reads
-//! run in parallel, capped across every pull in the process.
+//! may name several assets (collections like sentinel-2 spread bands
+//! across per-band cogs): an item is kept only when every asset is
+//! present, and a pull reads them all, bands concatenated in asset order.
+//! item reads run in parallel, capped across every pull in the process.
 //!
 //! a pull may carry its own interval, which overrides the search's
 //! `datetime` for that pull: blocks are searched, and their item sets
@@ -807,12 +807,11 @@ impl Inner {
     }
 }
 
-/// one asset of an item whose crs is not the anchor's: read the item
-/// region covering the output window, on the item's own pixel grid at its
-/// own level resolution, then warp that onto the output window. the read
-/// has to sit on the item grid because `read_chunk` places pixels by
-/// rounding the window onto it, and the warp samples what it gets back,
-/// so an off-grid window would misregister by up to half a pixel
+/// one asset of an item whose crs is not the anchor's: read the region
+/// covering the output window on the item's own pixel grid, then warp it
+/// onto the window. the read has to sit on the item grid, `read_chunk`
+/// rounds the window onto it and the warp samples what comes back, so an
+/// off-grid window would misregister by up to half a pixel
 fn read_warped(
     reader: &mut CogReader<HttpRange>,
     req: &WindowReq,
@@ -824,10 +823,9 @@ fn read_warped(
     let (region, wanted) = inverse_window(&reprojection.from_anchor, &req.bbox, req.resolution);
     let level = reader.select_level(wanted);
     let resolution = reader.levels()[level].pixel_width;
-    // widened again at the resolution actually being read, so every output
-    // pixel center keeps a full bilinear neighbourhood however coarse the
-    // item is: without it a window's edge pixels would fall back to their
-    // nearest neighbour and two adjoining windows would disagree there
+    // widened at the resolution actually read, so an output pixel at the
+    // window edge keeps a full bilinear neighbourhood and two adjoining
+    // windows agree on it
     let region = align_outward(
         &region.expand(2.0 * resolution),
         origin_x,
