@@ -9,7 +9,7 @@ use crate::chunk::{RasterChunk, VectorFeature};
 use crate::engine::{Engine, align_outward};
 use crate::error::{Error, Result};
 use crate::graph::NodeId;
-use crate::window::{Bbox, WindowReq};
+use crate::window::{Bbox, TimeInterval, WindowReq};
 use terrano_core::Raster;
 use topoi_core::geojson::FeatureGeometry;
 use topoi_core::{GridWindow, rasterize};
@@ -135,6 +135,41 @@ pub async fn window_statistics(
     })
     .await?;
     Ok(merged)
+}
+
+/// one pull per step, steps in the order given, each yielding the per
+/// feature reduction of that step's window.
+///
+/// every step is a distinct pull interval, so a source holding per interval
+/// state holds one more set of it per step
+pub async fn zonal_time_series(
+    engine: &Engine,
+    node: NodeId,
+    features: &[VectorFeature],
+    window: WindowReq,
+    steps: &[TimeInterval],
+) -> Result<Vec<(TimeInterval, Vec<FeatureStatistics>)>> {
+    let mut series = Vec::with_capacity(steps.len());
+    for step in steps {
+        let rows = zonal_statistics(engine, node, features, window.with_time(Some(*step))).await?;
+        series.push((*step, rows));
+    }
+    Ok(series)
+}
+
+/// `zonal_time_series` with the whole window as one zone
+pub async fn window_time_series(
+    engine: &Engine,
+    node: NodeId,
+    window: WindowReq,
+    steps: &[TimeInterval],
+) -> Result<Vec<(TimeInterval, PixelStatistics)>> {
+    let mut series = Vec::with_capacity(steps.len());
+    for step in steps {
+        let statistics = window_statistics(engine, node, window.with_time(Some(*step))).await?;
+        series.push((*step, statistics));
+    }
+    Ok(series)
 }
 
 fn zone_shapes(features: &[VectorFeature]) -> Vec<(FeatureGeometry, f64)> {

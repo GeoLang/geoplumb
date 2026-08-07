@@ -1,5 +1,6 @@
-//! the zonal statistics driver: cross-tile merging against a brute force
-//! reduction of the same pixels, per id separation, nan exclusion
+//! the zonal statistics and time series drivers: cross-tile merging against a
+//! brute force reduction of the same pixels, per id separation, nan
+//! exclusion, and one reduction per time step
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -7,13 +8,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use geoplumb::caps::Constraint;
+use geoplumb::caps::{CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField};
 use geoplumb::element::Source;
 use geoplumb::elements::RasterSrc;
 use geoplumb::window::GridSpec;
 use geoplumb::{
-    Bbox, Chunk, Crs, Engine, Graph, NodeId, PixelStatistics, Statistic, VectorFeature, WindowReq,
-    zonal_statistics,
+    Bbox, Chunk, Crs, Engine, Graph, NodeId, PixelStatistics, RasterChunk, Statistic, TimeInterval,
+    VectorFeature, WindowReq, window_statistics, window_time_series, zonal_statistics,
+    zonal_time_series,
 };
 use terrano_core::{BandedRaster, Raster};
 use topoi_core::geojson::FeatureGeometry;
@@ -156,6 +158,60 @@ impl Source for CountingSrc {
                 widest.1 = widest.1.max(rows);
             }
             self.inner.read(req).await
+        })
+    }
+}
+
+/// a time varying source stamping every pixel with the day its pull interval
+/// starts on, so a step's reduction names the interval it was computed for
+struct ClockSrc;
+
+fn stamp(time: Option<TimeInterval>) -> f64 {
+    time.map_or(-1.0, |t| t.start_ms as f64 / 86_400_000.0)
+}
+
+impl Source for ClockSrc {
+    fn constraint(&self) -> Constraint {
+        Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
+            dtype: SetField::one(Dtype::F64),
+            bands: SetField::one(1),
+            crs: SetField::one(Crs::WGS84),
+            resolution: ResRange::at_least(CELL),
+            chunk_px: SetField::Any,
+        })))
+    }
+
+    fn grid(&self) -> GridSpec {
+        GridSpec {
+            origin_x: ORIGIN_X,
+            origin_y: ORIGIN_Y,
+            base_resolution: CELL,
+            chunk_px: CHUNK_PX as u32,
+        }
+    }
+
+    fn time_varying(&self) -> bool {
+        true
+    }
+
+    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, geoplumb::Result<Chunk>> {
+        Box::pin(async move {
+            let cols = (req.bbox.width() / req.resolution).round() as usize;
+            let rows = (req.bbox.height() / req.resolution).round() as usize;
+            let band = Raster::from_vec(
+                cols,
+                rows,
+                vec![stamp(req.time); cols * rows],
+                req.resolution,
+                f64::NAN,
+            )
+            .unwrap();
+            Ok(Chunk::Raster(RasterChunk {
+                bands: BandedRaster::new(vec![band]).unwrap(),
+                bbox: req.bbox,
+                resolution: req.resolution,
+                crs: Crs::WGS84,
+            }))
         })
     }
 }
@@ -329,4 +385,61 @@ async fn a_window_past_the_source_edge_counts_only_real_pixels() {
         only(&stats, 1),
         rectangle_statistics(elevation, 0..WIDTH, 0..HEIGHT)
     );
+}
+
+#[tokio::test]
+async fn a_time_series_reduces_each_step_on_its_own() {
+    let (engine, node) = engine_over(Box::new(ClockSrc));
+    let feature = rectangle(5, 10..590, 5..395);
+    let june = TimeInterval::new(1_717_200_000_000, 1_719_792_000_000);
+    let july = TimeInterval::new(1_719_792_000_000, 1_722_470_400_000);
+
+    let series = zonal_time_series(
+        &engine,
+        node,
+        std::slice::from_ref(&feature),
+        request(window(0..WIDTH, 0..HEIGHT)),
+        &[june, july],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        series.iter().map(|(step, _)| *step).collect::<Vec<_>>(),
+        vec![june, july]
+    );
+    let means: Vec<f64> = series
+        .iter()
+        .map(|(_, rows)| only(rows, 5).value(Statistic::Mean))
+        .collect();
+    assert_eq!(means, vec![stamp(Some(june)), stamp(Some(july))]);
+    assert_ne!(means[0], means[1]);
+    let counts: Vec<usize> = series.iter().map(|(_, rows)| only(rows, 5).count).collect();
+    assert_eq!(counts, vec![580 * 390, 580 * 390]);
+}
+
+#[tokio::test]
+async fn a_whole_window_time_series_needs_no_features() {
+    let (engine, node) = engine_over(Box::new(ClockSrc));
+    let june = TimeInterval::new(1_717_200_000_000, 1_719_792_000_000);
+    let july = TimeInterval::new(1_719_792_000_000, 1_722_470_400_000);
+    let request = request(window(0..WIDTH, 0..HEIGHT));
+
+    let series = window_time_series(&engine, node, request, &[june, july])
+        .await
+        .unwrap();
+
+    assert_eq!(series.len(), 2);
+    for (step, statistics) in &series {
+        assert_eq!(statistics.count, WIDTH * HEIGHT);
+        assert_eq!(statistics.minimum, stamp(Some(*step)));
+        assert_eq!(statistics.maximum, stamp(Some(*step)));
+        assert_eq!(statistics.value(Statistic::Mean), stamp(Some(*step)));
+    }
+    assert_ne!(series[0].1.mean(), series[1].1.mean());
+
+    let single = window_statistics(&engine, node, request.with_time(Some(june)))
+        .await
+        .unwrap();
+    assert_eq!(single, series[0].1);
 }

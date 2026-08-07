@@ -29,5 +29,6 @@ pub use error::{Error, Result};
 pub use graph::{Graph, NodeId};
 pub use window::{Bbox, TimeInterval, WindowReq};
 pub use zonal::{
-    FeatureStatistics, PixelStatistics, Statistic, window_statistics, zonal_statistics,
+    FeatureStatistics, PixelStatistics, Statistic, window_statistics, window_time_series,
+    zonal_statistics, zonal_time_series,
 };
