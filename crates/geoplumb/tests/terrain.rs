@@ -87,10 +87,10 @@ async fn assert_uniform_aspect(elevation: fn(usize, usize) -> f64, want: f64) {
 
 #[tokio::test]
 async fn a_plane_faces_one_way_over_its_whole_window() {
-    // terrano measures the angle counterclockwise from east, so a surface
-    // rising eastward reads 180 and one rising northward reads 270
-    assert_uniform_aspect(|col, _| col as f64 * 10.0, 180.0).await;
-    assert_uniform_aspect(|_, row| (H - row) as f64 * 10.0, 270.0).await;
+    // compass aspect faces downslope: rising eastward faces west (270),
+    // rising northward faces south (180)
+    assert_uniform_aspect(|col, _| col as f64 * 10.0, 270.0).await;
+    assert_uniform_aspect(|_, row| (H - row) as f64 * 10.0, 180.0).await;
 }
 
 #[tokio::test]
