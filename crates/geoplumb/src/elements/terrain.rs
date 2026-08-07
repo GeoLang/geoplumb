@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::window::{Bbox, WindowReq};
 use terrano_core::{BandedRaster, Raster};
 
-const HALO_CELLS: f64 = 2.0;
+const HALO_CELLS: f64 = 1.0;
 
 fn single_band() -> CapsSet {
     CapsSet::one(CapsPattern::Raster(RasterPattern {
