@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-08-07
+
+- mixed-crs stac collections: an item whose crs differs from the anchor's is kept and warped onto the anchor grid at read (the region covering the output window is read on the item's own pixel grid, then inverse-mapped through the same bilinear sampling `Reproject` uses, extracted as shared helpers), so a sentinel-2 layer no longer dies at utm zone boundaries. Same-crs items take exactly the old path. Known remainder: an item footprint converts to the anchor crs through two corners, under-covering a rotated cross-zone quad by up to a couple of km on the far side
+- zonal statistics over http: `POST /zonal/{layer}` (FeatureCollection, lon/lat per rfc 7946, projected onto the layer grid server-side) answers per-feature count/sum/minimum/maximum/mean in request order, `POST /zonal/{layer}/series` does one pull per step. Caps as constants: 4096x4096 pixels summed over steps, 256 features, 64 steps, 20k positions, axum's 2 MB body. Non-finite statistics serialize as null. Non-areal geometry, out-of-range or web-mercator-pole coordinates, and anything the interval parser refuses answer 400. No per-request timeout or concurrency limit yet, that belongs at the edge
+
 ## 2026-08-06
 
 - seven GEE-parity operators. Temporal composites gain `Percentile(f64)` (0..=100 clamped, linear interpolation between ranks), `StdDev` (population) and `Count`, all reachable from layer toml (`"stddev"`, `"count"`, `{ percentile = 90.0 }`). `BandMath` gains the six comparisons yielding 1.0/0.0 below arithmetic precedence, `where(cond, a, b)`, `log` and `exp`, NaN propagating through all of them. `Aspect` joins the terrain elements, compass degrees with flat cells nodata, on terrano's fixed `aspect` (it previously returned the raw counterclockwise-from-east atan2 angle and gave flat cells 180)
