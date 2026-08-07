@@ -1103,3 +1103,104 @@ async fn a_stack_deeper_than_the_read_cap_reduces_and_fills_in_order() {
         close(got, elevation(x, y) + 4761.0, (x, y));
     });
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn percentile_interpolates_between_the_neighbouring_ranks() {
+    let (base, _mock) = start_deep_stack_mock().await;
+    // shifts are 0,1,4,..,4761, so rank 62.1 of the seventy sits a tenth of
+    // the way from 3844 to 3969, a value no item carries
+    for (percent, want_shift) in [(0.0, 0.0), (50.0, 1190.5), (90.0, 3856.5), (100.0, 4761.0)] {
+        let src = open_composite(&base, Composite::Percentile(percent)).await;
+        let chunk = src.read(&STACK).await.unwrap().into_raster().unwrap();
+        each_pixel(&chunk, |_, x, y, got| {
+            close(got, elevation(x, y) + want_shift, (x, y));
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_percent_outside_the_range_clamps_to_min_and_max() {
+    let (base, _mock) = start_mock().await;
+    for (percent, want_shift) in [(-10.0, 0.0), (110.0, 1000.0)] {
+        let src = open_composite(&base, Composite::Percentile(percent)).await;
+        let chunk = src.read(&OVERLAP).await.unwrap().into_raster().unwrap();
+        each_pixel(&chunk, |_, x, y, got| {
+            // the hole leaves the old item alone, at +1000 either way
+            let shift = if (100..120).contains(&scene_row(y)) {
+                1000.0
+            } else {
+                want_shift
+            };
+            close(got, elevation(x, y) + shift, (x, y));
+        });
+    }
+}
+
+fn population_std_dev(values: &[f64]) -> f64 {
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    (values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / values.len() as f64).sqrt()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn std_dev_is_the_population_spread_of_the_stack() {
+    // two shifts 900 apart spread 450 either side of their mean, which pins
+    // the divisor at n rather than n-1
+    assert_eq!(population_std_dev(&[100.0, 1000.0]), 450.0);
+
+    let (base, _mock) = start_composite_mock().await;
+    let src = open_composite(&base, Composite::StdDev).await;
+    let chunk = src.read(&OVERLAP).await.unwrap().into_raster().unwrap();
+    let (mut three_deep, mut two_deep) = (0, 0);
+    each_pixel(&chunk, |_, x, y, got| {
+        // the elevation is common to every item, so only the shifts spread
+        if (100..120).contains(&scene_row(y)) {
+            two_deep += 1;
+            close(got, population_std_dev(&[100.0, 1000.0]), (x, y));
+        } else {
+            three_deep += 1;
+            close(got, population_std_dev(&[0.0, 100.0, 1000.0]), (x, y));
+        }
+    });
+    assert!(three_deep > 1000 && two_deep > 1000, "window missed a case");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn count_reports_how_many_items_had_a_value() {
+    let (base, _mock) = start_mock().await;
+    let src = open_composite(&base, Composite::Count).await;
+    let chunk = src.read(&OVERLAP).await.unwrap().into_raster().unwrap();
+    let (mut both, mut old_only) = (0, 0);
+    each_pixel(&chunk, |_, _, y, got| {
+        // left and old both cover this window, left holing out rows 100..120
+        if (100..120).contains(&scene_row(y)) {
+            old_only += 1;
+            assert_eq!(got, 1.0);
+        } else {
+            both += 1;
+            assert_eq!(got, 2.0);
+        }
+    });
+    assert!(both > 1000 && old_only > 1000, "window missed a case");
+
+    // past the east edge of every item nothing is counted, the pixel is
+    // nodata rather than zero
+    let req = WindowReq {
+        bbox: Bbox {
+            min_x: 7.5,
+            max_x: 7.7,
+            ..OVERLAP.bbox
+        },
+        ..OVERLAP
+    };
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    let mut bare = 0;
+    each_pixel(&chunk, |_, x, _, got| {
+        if x < 7.6 {
+            assert_eq!(got, 2.0);
+        } else {
+            bare += 1;
+            assert!(got.is_nan(), "({x:.4}) past every item: {got}");
+        }
+    });
+    assert!(bare > 1000, "window missed the uncovered half");
+}

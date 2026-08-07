@@ -162,6 +162,37 @@ fn config_parses_sources_ops_and_their_order() {
 }
 
 #[test]
+fn every_composite_spelling_reaches_the_search() {
+    let cases = [
+        ("\"latest\"", geoplumb::elements::Composite::Latest),
+        ("\"mean\"", geoplumb::elements::Composite::Mean),
+        ("\"min\"", geoplumb::elements::Composite::Min),
+        ("\"max\"", geoplumb::elements::Composite::Max),
+        ("\"stddev\"", geoplumb::elements::Composite::StdDev),
+        ("\"count\"", geoplumb::elements::Composite::Count),
+        (
+            "{ percentile = 90.0 }",
+            geoplumb::elements::Composite::Percentile(90.0),
+        ),
+    ];
+    for (toml_value, want) in cases {
+        let text = format!(
+            r#"
+[[layer]]
+name = "stack"
+source = {{ kind = "stac", api = "https://example.test/v1", collection = "c", assets = ["data"], bbox = [7.0, 46.3, 8.0, 46.9], composite = {toml_value} }}
+"#
+        );
+        let config = Config::parse(&text).unwrap_or_else(|e| panic!("{toml_value}: {e}"));
+        let search = config.layers[0]
+            .source
+            .stac_search()
+            .expect("a stac source");
+        assert_eq!(search.composite, want, "{toml_value}");
+    }
+}
+
+#[test]
 fn config_rejects_files_it_cannot_serve() {
     let cases = [
         ("not toml at all {{{", "syntax"),

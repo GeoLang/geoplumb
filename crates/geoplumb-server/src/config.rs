@@ -54,6 +54,10 @@ pub enum CompositeConfig {
     Median,
     Min,
     Max,
+    /// takes the percent, e.g. `composite = { percentile = 90.0 }`
+    Percentile(f64),
+    StdDev,
+    Count,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +83,9 @@ impl From<CompositeConfig> for Composite {
             CompositeConfig::Median => Composite::Median,
             CompositeConfig::Min => Composite::Min,
             CompositeConfig::Max => Composite::Max,
+            CompositeConfig::Percentile(percent) => Composite::Percentile(percent),
+            CompositeConfig::StdDev => Composite::StdDev,
+            CompositeConfig::Count => Composite::Count,
         }
     }
 }

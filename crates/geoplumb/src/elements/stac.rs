@@ -199,7 +199,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// pull's own interval where it has one, picks the interval and this
 /// picks what the interval collapses to. the composite is fixed at the
 /// source either way, only the interval moves per pull
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Composite {
     /// most recent item wins each pixel, older ones fill its nodata
     #[default]
@@ -208,6 +208,14 @@ pub enum Composite {
     Median,
     Min,
     Max,
+    /// the value at this percent of the sorted stack, 0..=100, linearly
+    /// interpolated between the two neighbouring ranks. a percent outside
+    /// the range clamps into it
+    Percentile(f64),
+    /// population standard deviation of the stack
+    StdDev,
+    /// how many items had a value at the pixel
+    Count,
 }
 
 #[derive(Clone)]
@@ -842,9 +850,12 @@ async fn reduce_window(
     crate::engine::offload(move || inner.reduce_chunks(&chunks, &req, op).map(Some)).await
 }
 
+const MIN_PERCENT: f64 = 0.0;
+const MAX_PERCENT: f64 = 100.0;
+
 /// reduce one pixel's finite values across items. `vals` holds only finite
 /// values, so min and max cannot fold a NaN into the answer, and a pixel
-/// no item had a value at stays nodata
+/// no item had a value at stays nodata, count included
 fn reduce_values(vals: &mut [f64], op: Composite) -> f64 {
     if vals.is_empty() {
         return f64::NAN;
@@ -864,6 +875,21 @@ fn reduce_values(vals: &mut [f64], op: Composite) -> f64 {
                 (vals[mid - 1] + vals[mid]) / 2.0
             }
         }
+        Composite::Percentile(percent) => {
+            vals.sort_by(f64::total_cmp);
+            let rank =
+                percent.clamp(MIN_PERCENT, MAX_PERCENT) / MAX_PERCENT * (vals.len() - 1) as f64;
+            let below = rank.floor() as usize;
+            let above = rank.ceil() as usize;
+            vals[below] + (vals[above] - vals[below]) * (rank - below as f64)
+        }
+        Composite::StdDev => {
+            let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+            let variance =
+                vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / vals.len() as f64;
+            variance.sqrt()
+        }
+        Composite::Count => vals.len() as f64,
     }
 }
 
