@@ -27,4 +27,4 @@ pub use vector::{Burn, Rasterize, VecSrc};
 pub(crate) fn default_adapters() -> Vec<crate::element::Adapter> {
     vec![Reproject::adapter(), VecReproject::adapter()]
 }
-pub use terrain::{Hillshade, Slope};
+pub use terrain::{Aspect, Hillshade, Slope};

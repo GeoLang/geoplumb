@@ -91,3 +91,27 @@ impl Transform for Slope {
         crop(sloped, input, out)
     }
 }
+
+/// downslope direction in degrees. a flat cell has no direction, so it
+/// comes out nodata rather than pointing north
+pub struct Aspect;
+
+impl Transform for Aspect {
+    fn constraint(&self) -> Constraint {
+        Constraint::Identity(single_band())
+    }
+
+    fn plan(&self, out: &WindowReq) -> WindowReq {
+        plan_with_halo(out)
+    }
+
+    fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {
+        dirty.expand(HALO_CELLS * resolution)
+    }
+
+    fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
+        let input = input.raster()?;
+        let faced = terrano_core::aspect(dem_band(input)?);
+        crop(faced, input, out)
+    }
+}
