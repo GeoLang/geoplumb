@@ -10,6 +10,8 @@ rust-version.workspace = true
 
 [dependencies]
 geoplumb = { path = "../geoplumb" }
+topoi-core.workspace = true
+projicio-core.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }

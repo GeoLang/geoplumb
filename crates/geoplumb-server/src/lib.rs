@@ -7,6 +7,7 @@
 //! public collections, the same policy tiletopia's public tiles follow
 
 pub mod config;
+mod zonal;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use axum::Router;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
 use geoplumb::elements::{Aspect, BandMath, CogSrc, Hillshade, Reproject, Slope, StacSrc};
@@ -219,6 +220,8 @@ pub fn router(layers: Vec<Layer>) -> Router {
         .route("/health", get(health))
         .route("/layers", get(list_layers))
         .route("/tiles/{layer}/{z}/{x}/{y}", get(tile))
+        .route("/zonal/{layer}", post(zonal::statistics))
+        .route("/zonal/{layer}/series", post(zonal::series))
         .with_state(Arc::new(layers))
 }
 

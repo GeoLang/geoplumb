@@ -342,6 +342,7 @@ dependencies = [
  "axum",
  "geoplumb",
  "png",
+ "projicio-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -349,6 +350,7 @@ dependencies = [
  "terrano-core",
  "tokio",
  "toml",
+ "topoi-core",
  "tower",
 ]
 
