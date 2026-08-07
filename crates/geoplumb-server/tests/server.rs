@@ -70,7 +70,8 @@ kind = "hillshade"
 azimuth = 315.0
 altitude = 45.0
 "#,
-        path.display()
+        // windows temp paths hold `\U`, a unicode escape in a basic toml string
+        path.display().to_string().replace('\\', "/")
     )
 }
 
