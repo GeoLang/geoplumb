@@ -13,7 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -r -s /bin/false geoplumb
+RUN useradd -r -s /bin/false geoplumb \
+    && mkdir -p /cache && chown geoplumb:geoplumb /cache
 
 COPY --from=builder /app/target/release/geoplumb-server /usr/local/bin/geoplumb-server
 
