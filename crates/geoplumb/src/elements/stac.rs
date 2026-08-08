@@ -1,5 +1,5 @@
-//! stac collection source: pulls search the api lazily, in whole-degree
-//! blocks cached for the source's lifetime, so coverage is not bound to
+//! stac collection source: pulls search the api lazily, in two-degree
+//! blocks kept in a bounded lru, so coverage is not bound to
 //! the bbox given at open. open searches that bbox once to anchor the
 //! grid, crs and band count on the most recent item. items are filtered
 //! to the anchor band counts, an item on another crs is read on its own
@@ -18,7 +18,7 @@
 //! it
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use crate::caps::{
     CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
@@ -45,6 +45,12 @@ const MAX_BLOCK_SEARCHES: usize = 32;
 /// reason: past this the mosaic is not something a pull should be doing
 const MAX_SEARCH_ITEMS: usize = 1000;
 
+/// completed block searches retained by one source
+const MAX_CACHED_SEARCHES: usize = 256;
+
+/// item references retained across one source's completed searches
+const MAX_CACHED_SEARCH_MATCHES: usize = 8192;
+
 /// item reads in flight across every pull in the process. each read is
 /// blocking http offloaded to the runtime's blocking pool, so without a
 /// shared cap n concurrent pulls would stack n windows' worth of threads
@@ -53,9 +59,8 @@ const MAX_PARALLEL_ITEM_READS: usize = 64;
 static ITEM_READ_PERMITS: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(MAX_PARALLEL_ITEM_READS));
 
-/// readers an item keeps per asset once a read returns them. each pooled
-/// reader holds its own http client and client thread, so an uncapped
-/// pool retains one thread per concurrent read it ever saw
+/// readers an item keeps per asset once a read returns them. the cap
+/// bounds retained decoder state after a burst of concurrent reads
 const POOLED_READERS_PER_ASSET: usize = 4;
 
 /// epoch milliseconds from an rfc 3339 timestamp, the form stac item and
@@ -298,6 +303,77 @@ impl Reprojection {
     }
 }
 
+type SearchKey = (i32, i32, Option<TimeInterval>);
+type ItemPool = Arc<Mutex<HashMap<String, Weak<Item>>>>;
+
+struct SearchResult {
+    items: Vec<Arc<Item>>,
+    item_pool: ItemPool,
+}
+
+impl Drop for SearchResult {
+    fn drop(&mut self) {
+        self.items.clear();
+        self.item_pool
+            .lock()
+            .unwrap()
+            .retain(|_, item| item.strong_count() > 0);
+    }
+}
+
+struct CachedSearch {
+    result: Arc<SearchResult>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct SearchCache {
+    entries: HashMap<SearchKey, CachedSearch>,
+    match_references: usize,
+    tick: u64,
+}
+
+impl SearchCache {
+    fn get(&mut self, key: &SearchKey) -> Option<Arc<SearchResult>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = tick;
+        Some(entry.result.clone())
+    }
+
+    fn insert(&mut self, key: SearchKey, result: Arc<SearchResult>) -> Arc<SearchResult> {
+        if let Some(cached) = self.get(&key) {
+            return cached;
+        }
+        self.tick += 1;
+        let last_used = self.tick;
+        self.match_references += result.items.len();
+        self.entries.insert(
+            key,
+            CachedSearch {
+                result: result.clone(),
+                last_used,
+            },
+        );
+        while self.entries.len() > MAX_CACHED_SEARCHES
+            || self.match_references > MAX_CACHED_SEARCH_MATCHES
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .map(|(key, entry)| (entry.last_used, *key))
+                .min();
+            let Some((_, oldest_key)) = oldest else {
+                break;
+            };
+            let removed = self.entries.remove(&oldest_key).unwrap();
+            self.match_references -= removed.result.items.len();
+        }
+        result
+    }
+}
+
 struct Inner {
     search: StacSearch,
     client: reqwest::blocking::Client,
@@ -312,15 +388,13 @@ struct Inner {
     to_native: Option<projicio_core::Transform>,
     /// the anchor crs to lon/lat for pull windows, `None` when it is 4326
     to_lonlat: Option<projicio_core::Transform>,
-    /// blocks searched, per pull time. `None` is the search's own
-    /// `datetime`, the only time there was before pulls carried one
-    searched: Mutex<HashSet<(i32, i32, Option<TimeInterval>)>>,
-    /// every item seen so far, keyed by href so blocks and pull times
-    /// share one copy, its pooled readers included
-    items: Mutex<HashMap<String, Arc<Item>>>,
-    /// the hrefs each pull time's searches matched, so two times over one
-    /// block do not pool their items into one mosaic
-    matched: Mutex<HashMap<Option<TimeInterval>, HashSet<String>>>,
+    /// the open search is fixed configuration state, capped by
+    /// `MAX_SEARCH_ITEMS`, and supplies the anchor reader pool
+    anchor_items: Vec<Arc<Item>>,
+    /// live items keyed by href, so blocks and pull times share reader pools
+    item_pool: ItemPool,
+    /// completed block searches, keyed by block and pull time
+    searches: Mutex<SearchCache>,
 }
 
 pub struct StacSrc {
@@ -509,7 +583,8 @@ impl StacSrc {
             .collect::<Result<Vec<u16>>>()?;
         let bands = asset_bands.iter().sum();
 
-        let inner = Inner {
+        let item_pool = Arc::new(Mutex::new(HashMap::new()));
+        let mut inner = Inner {
             search: search.clone(),
             client,
             crs,
@@ -517,18 +592,15 @@ impl StacSrc {
             bands,
             to_native,
             to_lonlat,
-            searched: Mutex::new(HashSet::new()),
-            items: Mutex::new(HashMap::new()),
-            matched: Mutex::new(HashMap::new()),
+            anchor_items: Vec::new(),
+            item_pool,
+            searches: Mutex::new(SearchCache::default()),
         };
-        // the anchor search ran on the search's own datetime, so its
-        // items belong to the `None` time
-        inner.insert(found, None)?;
+        inner.anchor_items = inner.intern(found)?;
         let anchor = inner
-            .items
-            .lock()
-            .unwrap()
-            .get(&anchor_key)
+            .anchor_items
+            .iter()
+            .find(|item| item.hrefs[0] == anchor_key)
             .cloned()
             .ok_or_else(|| {
                 Error::Source(format!(
@@ -548,9 +620,11 @@ impl StacSrc {
         })
     }
 
-    /// items discovered so far, across the open search and every block
+    /// live items retained by the open search, cached blocks or active pulls
     pub fn item_count(&self) -> usize {
-        self.inner.items.lock().unwrap().len()
+        let mut items = self.inner.item_pool.lock().unwrap();
+        items.retain(|_, item| item.strong_count() > 0);
+        items.len()
     }
 
     /// the crs every pull comes back on, from the most recent anchor item
@@ -594,13 +668,12 @@ impl Inner {
         }
     }
 
-    /// keep items matching the anchor's per-asset band counts, one shared
-    /// copy per item, keyed by its first asset's href, and record which of
-    /// them `time`'s searches matched. an item on another crs is kept with
-    /// the transform its reads warp through
-    fn insert(&self, found: Vec<Found>, time: Option<TimeInterval>) -> Result<()> {
+    /// keep items matching the anchor's per-asset band counts, sharing
+    /// live items by their first asset's href
+    fn intern(&self, found: Vec<Found>) -> Result<Vec<Arc<Item>>> {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
         for f in found {
-            // an item declaring no crs cannot be placed on the anchor grid
             if f.epsg == 0 {
                 continue;
             }
@@ -612,45 +685,85 @@ impl Inner {
                 continue;
             }
             let key = f.hrefs[0].clone();
-            if !self.items.lock().unwrap().contains_key(&key) {
-                let reprojection = match f.epsg == self.crs.0 {
-                    true => None,
-                    false => Some(Reprojection::new(self.crs, Crs(f.epsg))?),
-                };
-                let item = Arc::new(Item {
-                    bbox: self.native_bbox(&f.bbox)?,
-                    readers: f.hrefs.iter().map(|_| Mutex::new(Vec::new())).collect(),
-                    hrefs: f.hrefs,
-                    datetime: f.datetime,
-                    reprojection,
-                });
-                self.items.lock().unwrap().insert(key.clone(), item);
+            if !seen.insert(key.clone()) {
+                continue;
             }
-            self.matched
+            if let Some(item) = self
+                .item_pool
                 .lock()
                 .unwrap()
-                .entry(time)
-                .or_default()
-                .insert(key);
+                .get(&key)
+                .and_then(Weak::upgrade)
+            {
+                candidates.push((key, item));
+                continue;
+            }
+            let reprojection = match f.epsg == self.crs.0 {
+                true => None,
+                false => Some(Reprojection::new(self.crs, Crs(f.epsg))?),
+            };
+            let candidate = Arc::new(Item {
+                bbox: self.native_bbox(&f.bbox)?,
+                readers: f.hrefs.iter().map(|_| Mutex::new(Vec::new())).collect(),
+                hrefs: f.hrefs,
+                datetime: f.datetime,
+                reprojection,
+            });
+            candidates.push((key, candidate));
         }
-        Ok(())
+        let mut pool = self.item_pool.lock().unwrap();
+        Ok(candidates
+            .into_iter()
+            .map(
+                |(key, candidate)| match pool.get(&key).and_then(Weak::upgrade) {
+                    Some(item) => item,
+                    None => {
+                        pool.insert(key, Arc::downgrade(&candidate));
+                        candidate
+                    }
+                },
+            )
+            .collect())
     }
 
-    /// search every block the lon/lat window touches that has not been
-    /// searched at this time yet. concurrent pulls may race a block, the
-    /// href dedup in `insert` makes that harmless. the cold-block cap
-    /// applies per time, the way it applies per source
-    fn ensure_coverage(&self, w: &[f64; 4], time: Option<TimeInterval>) -> Result<()> {
+    fn search_block(&self, key: SearchKey) -> Result<Arc<SearchResult>> {
+        if let Some(result) = self.searches.lock().unwrap().get(&key) {
+            return Ok(result);
+        }
+        let (ix, iy, time) = key;
+        let bbox = [
+            (f64::from(ix) * BLOCK_DEG).max(-180.0),
+            (f64::from(iy) * BLOCK_DEG).max(-90.0),
+            (f64::from(ix + 1) * BLOCK_DEG).min(180.0),
+            (f64::from(iy + 1) * BLOCK_DEG).min(90.0),
+        ];
+        let found = search_page(&self.client, &self.search, bbox, time)?;
+        let result = Arc::new(SearchResult {
+            items: self.intern(found)?,
+            item_pool: self.item_pool.clone(),
+        });
+        Ok(self.searches.lock().unwrap().insert(key, result))
+    }
+
+    /// return every cached or freshly searched block the window touches
+    fn search_results(
+        &self,
+        w: &[f64; 4],
+        time: Option<TimeInterval>,
+    ) -> Result<Vec<Arc<SearchResult>>> {
         let block = |v: f64, lo: f64, hi: f64| (v.clamp(lo, hi) / BLOCK_DEG).floor() as i32;
         let (ix0, ix1) = (block(w[0], -180.0, 180.0), block(w[2], -180.0, 180.0));
         let (iy0, iy1) = (block(w[1], -90.0, 90.0), block(w[3], -90.0, 90.0));
+        let mut results = Vec::new();
         let mut missing = Vec::new();
         {
-            let searched = self.searched.lock().unwrap();
+            let mut searches = self.searches.lock().unwrap();
             for iy in iy0..=iy1 {
                 for ix in ix0..=ix1 {
-                    if !searched.contains(&(ix, iy, time)) {
-                        missing.push((ix, iy));
+                    let key = (ix, iy, time);
+                    match searches.get(&key) {
+                        Some(result) => results.push(result),
+                        None => missing.push(key),
                     }
                 }
             }
@@ -661,18 +774,10 @@ impl Inner {
                 missing.len()
             )));
         }
-        for (ix, iy) in missing {
-            let bbox = [
-                (f64::from(ix) * BLOCK_DEG).max(-180.0),
-                (f64::from(iy) * BLOCK_DEG).max(-90.0),
-                (f64::from(ix + 1) * BLOCK_DEG).min(180.0),
-                (f64::from(iy + 1) * BLOCK_DEG).min(90.0),
-            ];
-            let found = search_page(&self.client, &self.search, bbox, time)?;
-            self.insert(found, time)?;
-            self.searched.lock().unwrap().insert((ix, iy, time));
+        for key in missing {
+            results.push(self.search_block(key)?);
         }
-        Ok(())
+        Ok(results)
     }
 
     /// one item's window across every asset, bands concatenated in asset
@@ -781,27 +886,26 @@ impl Inner {
         })
     }
 
-    /// search coverage for the window at the pull's time, then every item
-    /// that time matched which touches the window. most recent first, so
-    /// Latest fills in the right order. the reducers do not care, they
-    /// share the sort anyway
+    /// search coverage for the window at the pull's time, then collect
+    /// the matching items once across every touched block
     fn intersecting_items(&self, req: &WindowReq) -> Result<Vec<Arc<Item>>> {
-        self.ensure_coverage(&self.lonlat_bbox(&req.bbox)?, req.time)?;
-        let hrefs = self
-            .matched
-            .lock()
-            .unwrap()
-            .get(&req.time)
-            .cloned()
-            .unwrap_or_default();
-        let all = self.items.lock().unwrap();
-        let mut items: Vec<Arc<Item>> = hrefs
-            .iter()
-            .filter_map(|href| all.get(href))
-            .filter(|i| i.bbox.intersects(&req.bbox))
-            .cloned()
-            .collect();
-        drop(all);
+        let results = self.search_results(&self.lonlat_bbox(&req.bbox)?, req.time)?;
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        if req.time.is_none() {
+            for item in &self.anchor_items {
+                if item.bbox.intersects(&req.bbox) && seen.insert(item.hrefs[0].clone()) {
+                    items.push(item.clone());
+                }
+            }
+        }
+        for result in results {
+            for item in &result.items {
+                if item.bbox.intersects(&req.bbox) && seen.insert(item.hrefs[0].clone()) {
+                    items.push(item.clone());
+                }
+            }
+        }
         items.sort_by(|a, b| b.datetime.cmp(&a.datetime));
         Ok(items)
     }
@@ -1006,5 +1110,92 @@ impl Source for StacSrc {
                 None => crate::engine::offload(move || inner.empty(&req).map(Chunk::Raster)).await,
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn result(item_pool: &ItemPool, id: usize, matches: usize) -> Arc<SearchResult> {
+        let href = format!("https://example.test/{id}.tif");
+        let item = Arc::new(Item {
+            hrefs: vec![href.clone()],
+            datetime: String::new(),
+            bbox: Bbox::new(0.0, 0.0, 1.0, 1.0),
+            reprojection: None,
+            readers: Vec::new(),
+        });
+        item_pool
+            .lock()
+            .unwrap()
+            .insert(href, Arc::downgrade(&item));
+        Arc::new(SearchResult {
+            items: vec![item; matches],
+            item_pool: item_pool.clone(),
+        })
+    }
+
+    #[test]
+    fn search_cache_evicts_the_least_recently_used_entry() {
+        let item_pool = Arc::new(Mutex::new(HashMap::new()));
+        let mut cache = SearchCache::default();
+        for index in 0..MAX_CACHED_SEARCHES {
+            cache.insert((index as i32, 0, None), result(&item_pool, index, 0));
+        }
+        cache.get(&(0, 0, None)).unwrap();
+        cache.insert(
+            (MAX_CACHED_SEARCHES as i32, 0, None),
+            result(&item_pool, MAX_CACHED_SEARCHES, 0),
+        );
+
+        assert_eq!(cache.entries.len(), MAX_CACHED_SEARCHES);
+        assert!(cache.entries.contains_key(&(0, 0, None)));
+        assert!(!cache.entries.contains_key(&(1, 0, None)));
+    }
+
+    #[test]
+    fn search_cache_bounds_match_references() {
+        let item_pool = Arc::new(Mutex::new(HashMap::new()));
+        let mut cache = SearchCache::default();
+        let matches_per_search = MAX_SEARCH_ITEMS;
+        let searches = MAX_CACHED_SEARCH_MATCHES / matches_per_search + 1;
+        for index in 0..searches {
+            cache.insert(
+                (index as i32, 0, None),
+                result(&item_pool, index, matches_per_search),
+            );
+        }
+
+        assert!(cache.match_references <= MAX_CACHED_SEARCH_MATCHES);
+        assert_eq!(
+            cache.match_references,
+            cache
+                .entries
+                .values()
+                .map(|entry| entry.result.items.len())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn active_result_survives_eviction_and_releases_its_item() {
+        let item_pool = Arc::new(Mutex::new(HashMap::new()));
+        let mut cache = SearchCache::default();
+        let active = result(&item_pool, 0, 1);
+        cache.insert((0, 0, None), active.clone());
+        for index in 1..=MAX_CACHED_SEARCHES {
+            cache.insert((index as i32, 0, None), result(&item_pool, index, 0));
+        }
+
+        assert!(!cache.entries.contains_key(&(0, 0, None)));
+        assert_eq!(active.items.len(), 1);
+        drop(active);
+        assert!(
+            !item_pool
+                .lock()
+                .unwrap()
+                .contains_key("https://example.test/0.tif")
+        );
     }
 }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-08
+
+- bounded stac search retention: completed searches now sit in an lru keyed by two-degree block and pull interval, capped at 256 searches and 8192 matched item references. Active pulls keep their results through eviction, while a weak href index shares live items and reader pools without retaining items after their last search result. This replaces the lifetime searched-block, matched-href and item maps, so public requests using fresh intervals cannot grow source state without bound
+
 ## 2026-08-07
 
 - mixed-crs stac collections: an item whose crs differs from the anchor's is kept and warped onto the anchor grid at read (the region covering the output window is read on the item's own pixel grid, then inverse-mapped through the same bilinear sampling `Reproject` uses, extracted as shared helpers), so a sentinel-2 layer no longer dies at utm zone boundaries. Same-crs items take exactly the old path. Known remainder: an item footprint converts to the anchor crs through two corners, under-covering a rotated cross-zone quad by up to a couple of km on the far side
