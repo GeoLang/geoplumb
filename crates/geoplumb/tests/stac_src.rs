@@ -1472,6 +1472,175 @@ async fn a_window_past_the_two_corner_footprint_still_finds_the_item() {
     assert_eq!(seen, 10 * 64);
 }
 
+/// the two-degree search block boundary the tilted window reaches over
+const BLOCK_EDGE_LAT: f64 = 46.0;
+
+/// the window reaching over it: wide enough that the anchor grid's
+/// rotation against lon/lat carries its south-east corner past the
+/// boundary, tall enough that both corners the conversion once used stay
+/// north of it
+const BLOCK_EDGE_COLS: usize = 1800;
+const BLOCK_EDGE_ROWS: usize = 70;
+
+/// the anchor item sits this many cells north of the window, far enough
+/// that its own envelope does not reach it: the window's only cover is
+/// the item past the boundary
+const BLOCK_EDGE_ANCHOR_ROWS: usize = 40;
+const BLOCK_EDGE_GAP_ROWS: usize = 150;
+
+/// the zone 33 item covering the corner past the boundary, and how far
+/// south of the boundary its northernmost corner sits, so its whole
+/// footprint falls in the block past it
+const BLOCK_EDGE_COVER_COLS: usize = 800;
+const BLOCK_EDGE_COVER_ROWS: usize = 100;
+const BLOCK_EDGE_COVER_CLEARANCE: f64 = 0.002;
+
+/// cells of the cover item a checked pixel keeps clear of its edge, past
+/// which a warped sample falls back to the nearest cell it has
+const BLOCK_EDGE_INSET: f64 = 2.0;
+
+/// pixels of the window the cover item reaches once that inset is taken
+/// off, well under the near three thousand it actually fills
+const BLOCK_EDGE_MIN_COVERED: usize = 1000;
+
+/// the anchor grid whose south-east corner tilts past `BLOCK_EDGE_LAT`:
+/// the window's south edge crosses the boundary at its midpoint, leaving
+/// half the tilt on either side
+fn block_edge_anchor() -> UtmGrid {
+    let (x, y) = from_lonlat(ZONE_32)
+        .convert(MIXED_LON, BLOCK_EDGE_LAT)
+        .unwrap();
+    let to_south_edge = BLOCK_EDGE_ANCHOR_ROWS + BLOCK_EDGE_GAP_ROWS + BLOCK_EDGE_ROWS;
+    UtmGrid {
+        epsg: ZONE_32,
+        origin_x: x - BLOCK_EDGE_COLS as f64 / 2.0 * UTM_CELL,
+        origin_y: y + to_south_edge as f64 * UTM_CELL,
+        cols: BLOCK_EDGE_COLS,
+        rows: BLOCK_EDGE_ANCHOR_ROWS,
+    }
+}
+
+/// the zone 33 item covering the window's corner past the boundary. its
+/// north edge climbs eastward where the window's south edge falls, so
+/// they cross and leave a wedge of shared ground
+fn block_edge_cover(req: &WindowReq) -> UtmGrid {
+    let (lon, _) = to_lonlat(ZONE_32)
+        .convert(req.bbox.max_x, req.bbox.min_y)
+        .unwrap();
+    let (x, y) = from_lonlat(ZONE_33)
+        .convert(lon, BLOCK_EDGE_LAT - BLOCK_EDGE_COVER_CLEARANCE)
+        .unwrap();
+    UtmGrid {
+        epsg: ZONE_33,
+        origin_x: x - BLOCK_EDGE_COVER_COLS as f64 * UTM_CELL,
+        origin_y: y,
+        cols: BLOCK_EDGE_COVER_COLS,
+        rows: BLOCK_EDGE_COVER_ROWS,
+    }
+}
+
+/// a window on the anchor grid is rotated against lon/lat too, so its
+/// south-east corner sits in a search block that two opposite corners of
+/// its bbox never name. the item covering that corner lives only in that
+/// block, and used to be searched for only where the window was not
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_tilted_past_a_block_boundary_searches_that_block() {
+    let anchor = block_edge_anchor();
+    let req = anchor.window(
+        0,
+        BLOCK_EDGE_ANCHOR_ROWS + BLOCK_EDGE_GAP_ROWS,
+        BLOCK_EDGE_COLS,
+        BLOCK_EDGE_ROWS,
+    );
+    let cover = block_edge_cover(&req);
+
+    let corners = to_lonlat(ZONE_32)
+        .convert_batch(&[
+            (req.bbox.min_x, req.bbox.min_y),
+            (req.bbox.max_x, req.bbox.max_y),
+            (req.bbox.max_x, req.bbox.min_y),
+        ])
+        .unwrap();
+    let two_corner_min_lat = corners[0].1.min(corners[1].1);
+    assert!(
+        corners[2].1 < BLOCK_EDGE_LAT && two_corner_min_lat > BLOCK_EDGE_LAT,
+        "the window does not straddle the boundary the way the case needs: \
+         corner {}, two-corner {two_corner_min_lat}",
+        corners[2].1
+    );
+    assert!(
+        cover.footprint()[3] < BLOCK_EDGE_LAT && anchor.footprint()[1] > BLOCK_EDGE_LAT,
+        "the two items do not sit on opposite sides of the boundary"
+    );
+
+    let (base, _mock) = start_mock_with(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert("edge_anchor.tif".into(), anchor.cog(0.0, false));
+        cogs.insert("edge_cover.tif".into(), cover.cog(MIXED_SHIFT, false));
+        let features = vec![
+            item(
+                "edge_anchor",
+                "2024-06-01T00:00:00Z",
+                &format!("{base}/cog/edge_anchor.tif"),
+                anchor.footprint(),
+                u32::from(ZONE_32),
+            ),
+            item(
+                "edge_cover",
+                "2020-01-01T00:00:00Z",
+                &format!("{base}/cog/edge_cover.tif"),
+                cover.footprint(),
+                u32::from(ZONE_33),
+            ),
+        ];
+        (cogs, features)
+    })
+    .await;
+
+    // the open search covers the anchor item alone, so the cover item can
+    // only arrive through the block search the window drives
+    let search = StacSearch::new(&base, "test-s2", "data", anchor.footprint());
+    let src = tokio::task::spawn_blocking(move || StacSrc::open(&search))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        src.item_count(),
+        1,
+        "the open search reached the cover item"
+    );
+
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    assert_eq!(
+        src.item_count(),
+        2,
+        "the block past the boundary was never searched"
+    );
+
+    let lonlat = to_lonlat(ZONE_32);
+    let to_cover = projicio_core::Transform::new("EPSG:32632", "EPSG:32633").unwrap();
+    let mut covered = 0;
+    each_pixel(&chunk, |_, x, y, got| {
+        let (cx, cy) = to_cover.convert(x, y).unwrap();
+        let col = (cx - cover.origin_x) / UTM_CELL;
+        let row = (cover.origin_y - cy) / UTM_CELL;
+        let inside = col > BLOCK_EDGE_INSET
+            && row > BLOCK_EDGE_INSET
+            && col < cover.cols as f64 - BLOCK_EDGE_INSET
+            && row < cover.rows as f64 - BLOCK_EDGE_INSET;
+        if !inside {
+            return;
+        }
+        let (lon, lat) = lonlat.convert(x, y).unwrap();
+        covered += 1;
+        close_warped(got, elevation(lon, lat) + MIXED_SHIFT, (x, y));
+    });
+    assert!(
+        covered > BLOCK_EDGE_MIN_COVERED,
+        "only {covered} window pixels came back from the cover item"
+    );
+}
+
 /// the engine splits a pull into chunks, so a mixed-crs item is read once
 /// per chunk with its own planned window. those reads must land on the
 /// same item pixels the one-shot read of the whole window lands on

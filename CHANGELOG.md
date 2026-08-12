@@ -2,6 +2,7 @@
 
 ## 2026-08-11
 
+- densified pull windows: a window's bbox now converts back to lon/lat through the same sixteen segments per edge the item footprints use, so a window rotated against lon/lat names every two-degree block it overlaps. A wide window on a utm grid tilts its far corner a kilometre past what two opposite corners reach, which used to drop the block search covering that corner and with it every item found only there
 - densified item footprints: an item's lon/lat footprint now converts to the anchor crs through sixteen segments per edge instead of two opposite corners, closing the couple of km a rotated cross-zone quad lost on its far side, so a chunk lying entirely inside that strip selects the item. Same-crs footprints widen slightly by the same envelope
 
 ## 2026-08-08

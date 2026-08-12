@@ -45,9 +45,23 @@ const MAX_BLOCK_SEARCHES: usize = 32;
 /// reason: past this the mosaic is not something a pull should be doing
 const MAX_SEARCH_ITEMS: usize = 1000;
 
-/// segments each footprint edge is cut into before converting to the
-/// anchor crs. two corners alone lose kilometres off a rotated one
-const FOOTPRINT_EDGE_SEGMENTS: usize = 16;
+/// segments each bbox edge is cut into before converting it to the other
+/// crs, item footprint and pull window alike. two corners alone lose
+/// kilometres off a rotated one
+const BBOX_EDGE_SEGMENTS: usize = 16;
+
+/// a bbox as points along its four edges, which is what a converted
+/// envelope needs to keep the ground the corners alone cut off
+fn densified_edges(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<(f64, f64)> {
+    let mut edges = Vec::with_capacity(4 * (BBOX_EDGE_SEGMENTS + 1));
+    for step in 0..=BBOX_EDGE_SEGMENTS {
+        let along = step as f64 / BBOX_EDGE_SEGMENTS as f64;
+        let x = min_x + (max_x - min_x) * along;
+        let y = min_y + (max_y - min_y) * along;
+        edges.extend([(x, min_y), (x, max_y), (min_x, y), (max_x, y)]);
+    }
+    edges
+}
 
 /// completed block searches retained by one source
 const MAX_CACHED_SEARCHES: usize = 256;
@@ -648,13 +662,7 @@ impl Inner {
         match &self.to_native {
             None => Ok(Bbox::new(b[0], b[1], b[2], b[3])),
             Some(t) => {
-                let mut edges = Vec::with_capacity(4 * (FOOTPRINT_EDGE_SEGMENTS + 1));
-                for step in 0..=FOOTPRINT_EDGE_SEGMENTS {
-                    let along = step as f64 / FOOTPRINT_EDGE_SEGMENTS as f64;
-                    let lon = b[0] + (b[2] - b[0]) * along;
-                    let lat = b[1] + (b[3] - b[1]) * along;
-                    edges.extend([(lon, b[1]), (lon, b[3]), (b[0], lat), (b[2], lat)]);
-                }
+                let edges = densified_edges(b[0], b[1], b[2], b[3]);
                 let converted = t
                     .convert_batch(&edges)
                     .map_err(|e| Error::Source(e.to_string()))?;
@@ -673,14 +681,25 @@ impl Inner {
         match &self.to_lonlat {
             None => Ok([b.min_x, b.min_y, b.max_x, b.max_y]),
             Some(t) => {
-                let fail = |detail: String| Error::Source(detail);
-                let (x0, y0) = t
-                    .convert(b.min_x, b.min_y)
-                    .map_err(|e| fail(e.to_string()))?;
-                let (x1, y1) = t
-                    .convert(b.max_x, b.max_y)
-                    .map_err(|e| fail(e.to_string()))?;
-                Ok([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)])
+                let edges = densified_edges(b.min_x, b.min_y, b.max_x, b.max_y);
+                let converted = t
+                    .convert_batch(&edges)
+                    .map_err(|e| Error::Source(e.to_string()))?;
+                let mut out = [
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ];
+                for (lon, lat) in converted {
+                    out = [
+                        out[0].min(lon),
+                        out[1].min(lat),
+                        out[2].max(lon),
+                        out[3].max(lat),
+                    ];
+                }
+                Ok(out)
             }
         }
     }
