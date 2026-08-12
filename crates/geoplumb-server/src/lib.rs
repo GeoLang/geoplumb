@@ -19,6 +19,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use geoplumb::elements::{Aspect, BandMath, CogSrc, Hillshade, Reproject, Slope, StacSrc};
 use geoplumb::tile::{XyzTile, render_tile_at};
@@ -213,24 +214,33 @@ pub fn parse_time(t: Option<&str>) -> Result<Option<TimeInterval>, String> {
     })
 }
 
-type Layers = Arc<Vec<Layer>>;
+/// what every handler shares: the built layers, and the reduction slots the
+/// zonal endpoints take one of each
+struct ServerState {
+    layers: Vec<Layer>,
+    reductions: Arc<Semaphore>,
+}
 
 pub fn router(layers: Vec<Layer>) -> Router {
+    let state = Arc::new(ServerState {
+        layers,
+        reductions: Arc::new(Semaphore::new(zonal::MAX_CONCURRENT_REDUCTIONS)),
+    });
     Router::new()
         .route("/health", get(health))
         .route("/layers", get(list_layers))
         .route("/tiles/{layer}/{z}/{x}/{y}", get(tile))
         .route("/zonal/{layer}", post(zonal::statistics))
         .route("/zonal/{layer}/series", post(zonal::series))
-        .with_state(Arc::new(layers))
+        .with_state(state)
 }
 
 async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({ "status": "ok" }))
 }
 
-async fn list_layers(State(layers): State<Layers>) -> axum::Json<Vec<LayerInfo>> {
-    axum::Json(layers.iter().map(|l| l.info.clone()).collect())
+async fn list_layers(State(state): State<Arc<ServerState>>) -> axum::Json<Vec<LayerInfo>> {
+    axum::Json(state.layers.iter().map(|l| l.info.clone()).collect())
 }
 
 #[derive(Deserialize)]
@@ -239,11 +249,11 @@ struct TileQuery {
 }
 
 async fn tile(
-    State(layers): State<Layers>,
+    State(state): State<Arc<ServerState>>,
     UrlPath((name, z, x, y)): UrlPath<(String, u8, u32, String)>,
     Query(query): Query<TileQuery>,
 ) -> Response {
-    let Some(layer) = layers.iter().find(|l| l.info.name == name) else {
+    let Some(layer) = state.layers.iter().find(|l| l.info.name == name) else {
         return (StatusCode::NOT_FOUND, format!("unknown layer {name}")).into_response();
     };
     let Ok(y) = y.trim_end_matches(".png").parse::<u32>() else {

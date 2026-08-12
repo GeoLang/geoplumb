@@ -38,6 +38,7 @@ const NEXT_STEP: &str = "2024-07-01T00:00:00Z/2024-08-01T00:00:00Z";
 const FEATURES_CAP: usize = 256;
 const STEPS_CAP: usize = 64;
 const POSITIONS_CAP: usize = 20_000;
+const REDUCTION_SLOTS: usize = 4;
 
 const WEB_MERCATOR_EXTENT: f64 = 20037508.342789244;
 
@@ -111,6 +112,24 @@ fn zone(west: f64, south: f64, east: f64, north: f64) -> Value {
     .iter()
     .map(|(lon, lat)| json!([lon, lat]))
     .collect();
+    json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": { "type": "Polygon", "coordinates": [ring] }
+    })
+}
+
+/// the same rectangle with its southern edge subdivided, so one zone gives
+/// the burn that many edges to walk per raster row
+fn dense_zone(west: f64, south: f64, east: f64, north: f64, positions: usize) -> Value {
+    let step = (east - west) / positions as f64;
+    let mut ring: Vec<Value> = (0..positions)
+        .map(|index| json!([west + index as f64 * step, south]))
+        .collect();
+    ring.push(json!([east, south]));
+    ring.push(json!([east, north]));
+    ring.push(json!([west, north]));
+    ring.push(json!([west, south]));
     json!({
         "type": "Feature",
         "properties": {},
@@ -722,6 +741,99 @@ async fn a_body_past_the_buffered_limit_is_refused_unparsed() {
 
     let (status, _) = post_raw(&app, "/zonal/dem", padded.into_bytes()).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn overlapping_zones_go_to_whichever_burned_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&split_layer_file(dir.path()));
+    // both wholly inside the west half, the second wholly inside the first
+    let outer = zone(7.05, 46.65, 7.25, 46.85);
+    let inner = zone(7.10, 46.70, 7.15, 46.75);
+
+    let (status, body) = post(
+        &app,
+        "/zonal/dem",
+        json!({
+            "features": [inner.clone(), outer.clone()],
+            "resolution": RESOLUTION,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let contained_first = rows(&body);
+    assert_eq!(
+        count_of(&contained_first[0]),
+        0,
+        "the contained zone kept pixels the zone after it burned over"
+    );
+    assert!(
+        contained_first[0]["mean"].is_null(),
+        "{}",
+        contained_first[0]
+    );
+    let whole = count_of(&contained_first[1]);
+    assert!(whole > 0, "the containing zone caught no pixel");
+
+    let (status, body) = post(
+        &app,
+        "/zonal/dem",
+        json!({ "features": [outer, inner], "resolution": RESOLUTION }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let contained_last = rows(&body);
+    let inner_count = count_of(&contained_last[1]);
+    assert!(
+        inner_count > 0,
+        "the contained zone burned last caught nothing"
+    );
+    assert_eq!(
+        count_of(&contained_last[0]) + inner_count,
+        whole,
+        "the overlap was counted twice or lost"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_reductions_is_refused_past_the_slots_rather_than_queued() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&split_layer_file(dir.path()));
+    // a burn long enough that the first requests still hold their slots when
+    // the rest of the burst arrives
+    let body = json!({
+        "features": [dense_zone(7.02, 46.62, 7.58, 46.88, POSITIONS_CAP - 1000)],
+        "resolution": 1.0,
+    });
+
+    let mut burst = tokio::task::JoinSet::new();
+    for _ in 0..REDUCTION_SLOTS * 4 {
+        let app = app.clone();
+        let body = body.clone();
+        burst.spawn(async move { post(&app, "/zonal/dem", body).await });
+    }
+
+    let mut refused = 0;
+    while let Some(answer) = burst.join_next().await {
+        let (status, body) = answer.expect("a request task");
+        match status {
+            StatusCode::OK => assert_eq!(rows(&body).len(), 1),
+            StatusCode::SERVICE_UNAVAILABLE => {
+                refused += 1;
+                let message = String::from_utf8(body).unwrap();
+                assert!(message.contains("reduction slots are busy"), "{message}");
+            }
+            other => panic!(
+                "the burst answered {other}: {}",
+                String::from_utf8_lossy(&body)
+            ),
+        }
+    }
+    assert!(refused > 0, "the burst never found the slots full");
+
+    // the slots come back, so a refused burst does not leave the endpoint dead
+    let (status, body) = post(&app, "/zonal/dem", body).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }
 
 #[tokio::test]

@@ -3,13 +3,18 @@
 //!
 //! a request names its own window, so every number in it is a cap to check
 //! before an engine is touched: nothing here is clamped to fit, a request
-//! past a cap is refused. the endpoints are as public as the tiles are.
+//! past a cap is refused. those caps bound one request, and the slots below
+//! bound how many run at once, which a proxy in front of the service could
+//! only do for the callers that come through it. the endpoints are as public
+//! as the tiles are.
 //!
 //! zone coordinates and the bbox are lon/lat degrees, what rfc 7946 says
 //! geojson carries, and the server projects them onto the layer's own grid,
 //! web mercator, the crs every layer graph ends in.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path as UrlPath, State};
@@ -17,6 +22,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use projicio_core::Transform;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OwnedSemaphorePermit;
 
 use geoplumb::window::GridSpec;
 use geoplumb::{
@@ -26,7 +32,17 @@ use geoplumb::{
 use topoi_core::geojson::FeatureGeometry;
 use topoi_core::{Coord, Envelope, MultiPolygon, Polygon, Ring};
 
-use crate::{Layer, Layers, bad_request, parse_time};
+use crate::{Layer, ServerState, bad_request, parse_time};
+
+/// reductions the service runs at once. one holds a blocking thread for its
+/// whole run and pulls the tiles the tile path wants, so a burst of them is
+/// what starves it
+pub(crate) const MAX_CONCURRENT_REDUCTIONS: usize = 4;
+
+/// how long a caller waits before its reduction is answered a timeout. the
+/// reduction is a `block_on` and cannot be cancelled, so this bounds the
+/// wait and not the work
+const REDUCTION_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// pixels one request may reduce, summed over its steps. 4096 squared f64
 /// pixels is 128 MiB a band, the budget tiletopia's export path caps at
@@ -145,11 +161,15 @@ fn zone_rows(found: &[FeatureStatistics], zones: usize) -> Vec<Row> {
 }
 
 pub async fn statistics(
-    State(layers): State<Layers>,
+    State(state): State<Arc<ServerState>>,
     UrlPath(name): UrlPath<String>,
     body: Bytes,
 ) -> Response {
-    let Some(index) = layers.iter().position(|layer| layer.info.name == name) else {
+    let Some(index) = state
+        .layers
+        .iter()
+        .position(|layer| layer.info.name == name)
+    else {
         return (StatusCode::NOT_FOUND, format!("unknown layer {name}")).into_response();
     };
     let request: ZonalRequest = match serde_json::from_slice(&body) {
@@ -164,7 +184,7 @@ pub async fn statistics(
         Err(reason) => return bad_request(reason),
     };
     let plan = match plan(
-        &layers[index],
+        &state.layers[index],
         &request.features,
         request.bbox,
         request.resolution,
@@ -174,11 +194,14 @@ pub async fn statistics(
         Ok(plan) => plan,
         Err(reason) => return bad_request(reason),
     };
+    let Ok(slot) = state.reductions.clone().try_acquire_owned() else {
+        return slots_busy();
+    };
 
     let zones = plan.zones.len();
     let handle = tokio::runtime::Handle::current();
-    let reduced = offload(move || {
-        let layer = &layers[index];
+    let reduced = offload(slot, move || {
+        let layer = &state.layers[index];
         handle.block_on(async {
             match plan.zones.is_empty() {
                 true => window_statistics(&layer.engine, layer.node, plan.window)
@@ -193,16 +216,20 @@ pub async fn statistics(
     .await;
     match reduced {
         Ok(rows) => axum::Json(ZonalResponse { rows }).into_response(),
-        Err(reason) => (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+        Err(refusal) => refusal,
     }
 }
 
 pub async fn series(
-    State(layers): State<Layers>,
+    State(state): State<Arc<ServerState>>,
     UrlPath(name): UrlPath<String>,
     body: Bytes,
 ) -> Response {
-    let Some(index) = layers.iter().position(|layer| layer.info.name == name) else {
+    let Some(index) = state
+        .layers
+        .iter()
+        .position(|layer| layer.info.name == name)
+    else {
         return (StatusCode::NOT_FOUND, format!("unknown layer {name}")).into_response();
     };
     let request: SeriesRequest = match serde_json::from_slice(&body) {
@@ -217,7 +244,7 @@ pub async fn series(
         Err(reason) => return bad_request(reason),
     };
     let plan = match plan(
-        &layers[index],
+        &state.layers[index],
         &request.features,
         request.bbox,
         request.resolution,
@@ -227,11 +254,14 @@ pub async fn series(
         Ok(plan) => plan,
         Err(reason) => return bad_request(reason),
     };
+    let Ok(slot) = state.reductions.clone().try_acquire_owned() else {
+        return slots_busy();
+    };
 
     let zones = plan.zones.len();
     let handle = tokio::runtime::Handle::current();
-    let reduced = offload(move || {
-        let layer = &layers[index];
+    let reduced = offload(slot, move || {
+        let layer = &state.layers[index];
         handle.block_on(async {
             match plan.zones.is_empty() {
                 true => window_time_series(&layer.engine, layer.node, plan.window, &steps)
@@ -265,22 +295,55 @@ pub async fn series(
                 .collect(),
         })
         .into_response(),
-        Err(reason) => (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+        Err(refusal) => refusal,
     }
 }
 
-/// run a driver off the async workers. the engine already sends each node's
-/// compute to the blocking pool, but the per-tile burn and reduce the zonal
-/// drivers add run inline, and a zonal window is many tiles of it: left on
-/// a worker thread that starves the tile path. a driver that panics comes
-/// back as a join error rather than taking the service down
+/// what a request gets when every reduction slot is taken. queueing instead
+/// would answer late rather than never, but every waiter would still hold its
+/// window and its connection while it waited
+fn slots_busy() -> Response {
+    fail(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("all {MAX_CONCURRENT_REDUCTIONS} reduction slots are busy, retry later"),
+    )
+}
+
+/// run a driver off the async workers under the request timeout. the engine
+/// already sends each node's compute to the blocking pool, but the per-tile
+/// burn and reduce the zonal drivers add run inline, and a zonal window is
+/// many tiles of it: left on a worker thread that starves the tile path. a
+/// driver that panics comes back as a join error rather than taking the
+/// service down
 async fn offload<T: Send + 'static>(
+    slot: OwnedSemaphorePermit,
     work: impl FnOnce() -> geoplumb::Result<T> + Send + 'static,
-) -> Result<T, String> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|_| "the reduction did not finish".to_string())?
-        .map_err(|error| error.to_string())
+) -> Result<T, Response> {
+    let running = tokio::task::spawn_blocking(move || {
+        // the slot goes back when the reduction ends, not when the caller
+        // stops waiting for it: a timed-out reduction keeps running
+        let _slot = slot;
+        work()
+    });
+    match tokio::time::timeout(REDUCTION_TIMEOUT, running).await {
+        Err(_) => Err(fail(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "the reduction outran the {} second limit and its result is dropped",
+                REDUCTION_TIMEOUT.as_secs()
+            ),
+        )),
+        Ok(Err(_)) => Err(fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the reduction did not finish".to_string(),
+        )),
+        Ok(Ok(Err(error))) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
+        Ok(Ok(Ok(value))) => Ok(value),
+    }
+}
+
+fn fail(status: StatusCode, reason: String) -> Response {
+    (status, reason).into_response()
 }
 
 /// the zones and the window a request asks for, every cap already checked
@@ -591,5 +654,55 @@ impl Zones<'_> {
         check_degrees(longitude, latitude)?;
         let (x, y) = project(self.transform, longitude, latitude)?;
         Ok(Coord::new(x, y))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::Semaphore;
+
+    async fn reason(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a refusal carries its reason");
+        String::from_utf8(body.to_vec()).expect("a reason is text")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reduction_past_the_deadline_answers_a_timeout_and_keeps_its_slot() {
+        let reductions = Arc::new(Semaphore::new(1));
+        let slot = reductions
+            .clone()
+            .try_acquire_owned()
+            .expect("the one slot is free");
+        let (release, releases) = std::sync::mpsc::channel::<()>();
+
+        // the clock is driven by hand: a blocking task keeps the runtime from
+        // auto-advancing it, and this one is still running when time runs out
+        let (answer, ()) = tokio::join!(
+            offload(slot, move || {
+                releases.recv().expect("the test releases the work");
+                Ok(())
+            }),
+            tokio::time::advance(REDUCTION_TIMEOUT + Duration::from_secs(1)),
+        );
+        let refusal = answer.expect_err("the work outran the deadline");
+        assert_eq!(refusal.status(), StatusCode::GATEWAY_TIMEOUT);
+        let message = reason(refusal).await;
+        assert!(message.contains("outran"), "{message}");
+        assert_eq!(
+            reductions.available_permits(),
+            0,
+            "the timed-out reduction is still running and gave its slot back"
+        );
+
+        release.send(()).unwrap();
+        tokio::time::resume();
+        let returned = tokio::time::timeout(Duration::from_secs(10), reductions.acquire()).await;
+        assert!(
+            returned.is_ok(),
+            "the slot never came back once the work ended"
+        );
     }
 }

@@ -13,7 +13,13 @@ geoplumb = { path = "../geoplumb" }
 topoi-core.workspace = true
 projicio-core.workspace = true
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -24,6 +30,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 
 [dev-dependencies]
 terrano-core.workspace = true
+tokio = { version = "1", features = ["test-util"] }
 png = "0.17"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
