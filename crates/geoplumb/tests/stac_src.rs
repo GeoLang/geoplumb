@@ -1106,6 +1106,19 @@ async fn a_stack_deeper_than_the_read_cap_reduces_and_fills_in_order() {
         // every item covers every pixel, the newest must win them all
         close(got, elevation(x, y) + 4761.0, (x, y));
     });
+
+    // the folding reducers see the same stack one wave at a time, so a fold
+    // reset or dropped at a wave boundary shows here and nowhere shallower
+    let src = open_composite(&base, Composite::Mean).await;
+    let chunk = src.read(&STACK).await.unwrap().into_raster().unwrap();
+    each_pixel(&chunk, |_, x, y, got| {
+        // the shifts are the squares 0..69, whose mean is 1598.5
+        close(got, elevation(x, y) + 1598.5, (x, y));
+    });
+
+    let src = open_composite(&base, Composite::Count).await;
+    let chunk = src.read(&STACK).await.unwrap().into_raster().unwrap();
+    each_pixel(&chunk, |_, _, _, got| assert_eq!(got, 70.0));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

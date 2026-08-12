@@ -72,7 +72,7 @@ const MAX_CACHED_SEARCH_MATCHES: usize = 8192;
 /// item reads in flight across every pull in the process. each read is
 /// blocking http offloaded to the runtime's blocking pool, so without a
 /// shared cap n concurrent pulls would stack n windows' worth of threads
-const MAX_PARALLEL_ITEM_READS: usize = 64;
+pub const MAX_PARALLEL_ITEM_READS: usize = 64;
 
 static ITEM_READ_PERMITS: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(MAX_PARALLEL_ITEM_READS));
@@ -863,41 +863,6 @@ impl Inner {
         })
     }
 
-    /// every chunk reduced per pixel per band, one chunk per item. a
-    /// reducer needs the whole stack, the caller reads it first
-    fn reduce_chunks(
-        &self,
-        chunks: &[RasterChunk],
-        req: &WindowReq,
-        op: Composite,
-    ) -> Result<RasterChunk> {
-        let (cols, rows) = (chunks[0].width(), chunks[0].height());
-        let mut bands = Vec::with_capacity(usize::from(self.bands));
-        for bi in 0..usize::from(self.bands) {
-            let planes: Vec<&[f64]> = chunks
-                .iter()
-                .map(|c| c.bands.band(bi).expect("equal band counts").data())
-                .collect();
-            let mut values = Vec::with_capacity(planes.len());
-            let mut data = Vec::with_capacity(cols * rows);
-            for p in 0..cols * rows {
-                values.clear();
-                values.extend(planes.iter().map(|pl| pl[p]).filter(|v| v.is_finite()));
-                data.push(reduce_values(&mut values, op));
-            }
-            bands.push(
-                terrano_core::Raster::from_vec(cols, rows, data, req.resolution, f64::NAN)
-                    .map_err(Error::Terrano)?,
-            );
-        }
-        Ok(RasterChunk {
-            bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
-            bbox: req.bbox,
-            resolution: req.resolution,
-            crs: self.crs,
-        })
-    }
-
     /// nothing intersects: an all-nodata window on the source grid
     fn empty(&self, req: &WindowReq) -> Result<RasterChunk> {
         let cols = (req.bbox.width() / req.resolution).round() as usize;
@@ -1047,6 +1012,43 @@ async fn latest_window(
     Ok(merged)
 }
 
+/// every chunk reduced per pixel per band, one chunk per item. these
+/// reducers need every value at a pixel at once, so the caller reads the
+/// whole stack first and holds it here
+fn reduce_chunks(
+    chunks: &[RasterChunk],
+    req: &WindowReq,
+    bands: u16,
+    crs: Crs,
+    op: Composite,
+) -> Result<RasterChunk> {
+    let (cols, rows) = (chunks[0].width(), chunks[0].height());
+    let mut planes = Vec::with_capacity(usize::from(bands));
+    for bi in 0..usize::from(bands) {
+        let stack: Vec<&[f64]> = chunks
+            .iter()
+            .map(|c| c.bands.band(bi).expect("equal band counts").data())
+            .collect();
+        let mut values = Vec::with_capacity(stack.len());
+        let mut data = Vec::with_capacity(cols * rows);
+        for p in 0..cols * rows {
+            values.clear();
+            values.extend(stack.iter().map(|pl| pl[p]).filter(|v| v.is_finite()));
+            data.push(reduce_values(&mut values, op));
+        }
+        planes.push(
+            terrano_core::Raster::from_vec(cols, rows, data, req.resolution, f64::NAN)
+                .map_err(Error::Terrano)?,
+        );
+    }
+    Ok(RasterChunk {
+        bands: terrano_core::BandedRaster::new(planes).map_err(Error::Terrano)?,
+        bbox: req.bbox,
+        resolution: req.resolution,
+        crs,
+    })
+}
+
 async fn reduce_window(
     inner: &Arc<Inner>,
     items: &[Arc<Item>],
@@ -1057,9 +1059,176 @@ async fn reduce_window(
     if chunks.is_empty() {
         return Ok(None);
     }
-    let inner = inner.clone();
-    let req = *req;
-    crate::engine::offload(move || inner.reduce_chunks(&chunks, &req, op).map(Some)).await
+    let (bands, crs, req) = (inner.bands, inner.crs, *req);
+    crate::engine::offload(move || reduce_chunks(&chunks, &req, bands, crs, op).map(Some)).await
+}
+
+/// the reducers whose answer folds item by item, so a window holds one
+/// wave of item chunks however deep the stack. the rest need every value
+/// at a pixel at once and go through `reduce_chunks`
+#[derive(Clone, Copy)]
+enum FoldOp {
+    Mean,
+    Min,
+    Max,
+    StdDev,
+    Count,
+}
+
+impl FoldOp {
+    fn of(op: Composite) -> Option<FoldOp> {
+        match op {
+            Composite::Mean => Some(FoldOp::Mean),
+            Composite::Min => Some(FoldOp::Min),
+            Composite::Max => Some(FoldOp::Max),
+            Composite::StdDev => Some(FoldOp::StdDev),
+            Composite::Count => Some(FoldOp::Count),
+            Composite::Latest | Composite::Median | Composite::Percentile(_) => None,
+        }
+    }
+}
+
+/// one pixel's running state: how many items had a value there, plus the
+/// running sum, extreme or mean the op folds beside it
+#[derive(Clone, Copy)]
+struct PixelFold {
+    count: u32,
+    value: f64,
+    /// welford's running sum of squared deviations, `StdDev` alone
+    squared_deviations: f64,
+}
+
+impl PixelFold {
+    fn new(op: FoldOp) -> PixelFold {
+        let value = match op {
+            FoldOp::Min => f64::INFINITY,
+            FoldOp::Max => f64::NEG_INFINITY,
+            FoldOp::Mean | FoldOp::StdDev | FoldOp::Count => 0.0,
+        };
+        PixelFold {
+            count: 0,
+            value,
+            squared_deviations: 0.0,
+        }
+    }
+
+    /// items arrive in the same order the stack path sees them, so summing
+    /// as they land matches its sum term for term
+    fn absorb(&mut self, value: f64, op: FoldOp) {
+        self.count += 1;
+        match op {
+            FoldOp::Count => {}
+            FoldOp::Min => self.value = self.value.min(value),
+            FoldOp::Max => self.value = self.value.max(value),
+            FoldOp::Mean => self.value += value,
+            FoldOp::StdDev => {
+                let from_old_mean = value - self.value;
+                self.value += from_old_mean / f64::from(self.count);
+                self.squared_deviations += from_old_mean * (value - self.value);
+            }
+        }
+    }
+
+    fn finish(&self, op: FoldOp) -> f64 {
+        if self.count == 0 {
+            return f64::NAN;
+        }
+        let count = f64::from(self.count);
+        match op {
+            FoldOp::Count => count,
+            FoldOp::Min | FoldOp::Max => self.value,
+            FoldOp::Mean => self.value / count,
+            FoldOp::StdDev => (self.squared_deviations / count).sqrt(),
+        }
+    }
+}
+
+/// running state for one window, one plane of pixels per band. its size is
+/// the window's, never the stack's
+struct WindowFold {
+    op: FoldOp,
+    cols: usize,
+    rows: usize,
+    planes: Vec<Vec<PixelFold>>,
+}
+
+impl WindowFold {
+    fn new(op: FoldOp, bands: u16, cols: usize, rows: usize) -> WindowFold {
+        WindowFold {
+            op,
+            cols,
+            rows,
+            planes: (0..usize::from(bands))
+                .map(|_| vec![PixelFold::new(op); cols * rows])
+                .collect(),
+        }
+    }
+
+    /// only finite values fold in, so min and max cannot take a NaN and a
+    /// pixel no item had a value at stays nodata, count included
+    fn absorb(&mut self, chunk: &RasterChunk) {
+        for (plane, band) in self.planes.iter_mut().zip(chunk.bands.bands()) {
+            for (pixel, value) in plane.iter_mut().zip(band.data()) {
+                if value.is_finite() {
+                    pixel.absorb(*value, self.op);
+                }
+            }
+        }
+    }
+
+    fn finish(self, req: &WindowReq, crs: Crs) -> Result<RasterChunk> {
+        let planes = self
+            .planes
+            .iter()
+            .map(|plane| {
+                let data = plane.iter().map(|pixel| pixel.finish(self.op)).collect();
+                terrano_core::Raster::from_vec(self.cols, self.rows, data, req.resolution, f64::NAN)
+            })
+            .collect::<core::result::Result<Vec<_>, _>>()
+            .map_err(Error::Terrano)?;
+        Ok(RasterChunk {
+            bands: terrano_core::BandedRaster::new(planes).map_err(Error::Terrano)?,
+            bbox: req.bbox,
+            resolution: req.resolution,
+            crs,
+        })
+    }
+}
+
+/// each chunk folds into the running state and is dropped with the wave
+fn fold_wave(
+    mut fold: Option<WindowFold>,
+    chunks: Vec<RasterChunk>,
+    bands: u16,
+    op: FoldOp,
+) -> Option<WindowFold> {
+    for chunk in chunks {
+        fold.get_or_insert_with(|| WindowFold::new(op, bands, chunk.width(), chunk.height()))
+            .absorb(&chunk);
+    }
+    fold
+}
+
+/// the folding twin of `reduce_window`: items are read in waves and each
+/// wave is folded away before the next is read, so peak residency is one
+/// wave plus the running state rather than the whole stack
+async fn fold_window(
+    inner: &Arc<Inner>,
+    items: &[Arc<Item>],
+    req: &WindowReq,
+    op: FoldOp,
+) -> Result<Option<RasterChunk>> {
+    let mut fold: Option<WindowFold> = None;
+    for wave in items.chunks(MAX_PARALLEL_ITEM_READS) {
+        let chunks = read_items(inner, wave, req).await?;
+        let bands = inner.bands;
+        fold = crate::engine::offload(move || fold_wave(fold, chunks, bands, op)).await;
+    }
+    let Some(fold) = fold else {
+        return Ok(None);
+    };
+    let (crs, req) = (inner.crs, *req);
+    crate::engine::offload(move || fold.finish(&req, crs).map(Some)).await
 }
 
 const MIN_PERCENT: f64 = 0.0;
@@ -1067,7 +1236,9 @@ const MAX_PERCENT: f64 = 100.0;
 
 /// reduce one pixel's finite values across items. `vals` holds only finite
 /// values, so min and max cannot fold a NaN into the answer, and a pixel
-/// no item had a value at stays nodata, count included
+/// no item had a value at stays nodata, count included. only median and
+/// percentile reach this from a pull, the folding reducers keep their arm
+/// as the reference `fold_matches_the_stack_reduction` pins them against
 fn reduce_values(vals: &mut [f64], op: Composite) -> f64 {
     if vals.is_empty() {
         return f64::NAN;
@@ -1137,15 +1308,152 @@ impl Source for StacSrc {
                 let inner = inner.clone();
                 crate::engine::offload(move || inner.intersecting_items(&req)).await?
             };
-            let merged = match inner.search.composite {
-                Composite::Latest => latest_window(&inner, &items, &req).await?,
-                op => reduce_window(&inner, &items, &req, op).await?,
+            let composite = inner.search.composite;
+            let merged = if composite == Composite::Latest {
+                latest_window(&inner, &items, &req).await?
+            } else if let Some(op) = FoldOp::of(composite) {
+                fold_window(&inner, &items, &req, op).await?
+            } else {
+                reduce_window(&inner, &items, &req, composite).await?
             };
             match merged {
                 Some(chunk) => Ok(Chunk::Raster(chunk)),
                 None => crate::engine::offload(move || inner.empty(&req).map(Chunk::Raster)).await,
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    const FOLD_COLS: usize = 7;
+    const FOLD_ROWS: usize = 5;
+    const FOLD_BANDS: u16 = 2;
+    const FOLD_RES: f64 = 10.0;
+
+    /// items per wave, small enough that a nine-item stack crosses two wave
+    /// boundaries and ends on a short one
+    const FOLD_WAVE: usize = 4;
+
+    const FOLD_REQ: WindowReq = WindowReq {
+        bbox: Bbox {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: FOLD_COLS as f64 * FOLD_RES,
+            max_y: FOLD_ROWS as f64 * FOLD_RES,
+        },
+        resolution: FOLD_RES,
+        time: None,
+    };
+
+    /// thirds, so a pixel's stack summed in another order would not round
+    /// back to the same f64
+    fn value(item: usize, band: usize, pixel: usize) -> f64 {
+        (item as f64 * 13.0 + band as f64 * 101.0 + pixel as f64 * 7.0) / 3.0
+    }
+
+    /// nodata varying with item, band and pixel, so pixels come out one
+    /// deep, several deep, and (pixel 0) covered by no item at all
+    fn holed(item: usize, band: usize, pixel: usize) -> bool {
+        pixel == 0 || (pixel + band + item) % 5 == 0
+    }
+
+    fn stack(items: usize) -> Vec<RasterChunk> {
+        (0..items)
+            .map(|item| {
+                let planes = (0..usize::from(FOLD_BANDS))
+                    .map(|band| {
+                        let data = (0..FOLD_COLS * FOLD_ROWS)
+                            .map(|pixel| match holed(item, band, pixel) {
+                                true => f64::NAN,
+                                false => value(item, band, pixel),
+                            })
+                            .collect();
+                        terrano_core::Raster::from_vec(
+                            FOLD_COLS,
+                            FOLD_ROWS,
+                            data,
+                            FOLD_RES,
+                            f64::NAN,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                RasterChunk {
+                    bands: terrano_core::BandedRaster::new(planes).unwrap(),
+                    bbox: FOLD_REQ.bbox,
+                    resolution: FOLD_RES,
+                    crs: Crs::WGS84,
+                }
+            })
+            .collect()
+    }
+
+    fn fold_in_waves(chunks: &[RasterChunk], op: FoldOp) -> RasterChunk {
+        let mut fold = None;
+        for wave in chunks.chunks(FOLD_WAVE) {
+            fold = fold_wave(fold, wave.to_vec(), FOLD_BANDS, op);
+        }
+        fold.unwrap().finish(&FOLD_REQ, Crs::WGS84).unwrap()
+    }
+
+    fn assert_matches(stacked: &RasterChunk, folded: &RasterChunk, tolerance: f64, what: &str) {
+        let (mut covered, mut bare) = (0, 0);
+        for (bi, band) in stacked.bands.bands().iter().enumerate() {
+            let got = folded.bands.band(bi).unwrap().data();
+            for (pixel, want) in band.data().iter().enumerate() {
+                let got = got[pixel];
+                if want.is_nan() {
+                    bare += 1;
+                    assert!(
+                        got.is_nan(),
+                        "{what} band {bi} px {pixel}: {got}, want nodata"
+                    );
+                    continue;
+                }
+                covered += 1;
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "{what} band {bi} px {pixel}: {got} vs {want}"
+                );
+            }
+        }
+        assert!(covered > 0 && bare > 0, "{what} missed the nodata case");
+    }
+
+    #[test]
+    fn fold_matches_the_stack_reduction() {
+        let chunks = stack(9);
+        for (composite, op) in [
+            (Composite::Mean, FoldOp::Mean),
+            (Composite::Min, FoldOp::Min),
+            (Composite::Max, FoldOp::Max),
+            (Composite::Count, FoldOp::Count),
+        ] {
+            let stacked =
+                reduce_chunks(&chunks, &FOLD_REQ, FOLD_BANDS, Crs::WGS84, composite).unwrap();
+            let folded = fold_in_waves(&chunks, op);
+            assert_matches(&stacked, &folded, 0.0, &format!("{composite:?}"));
+        }
+
+        // welford rounds along a different path than the two-pass stack
+        // variance, so this one agrees to precision, not bit for bit
+        let stacked = reduce_chunks(
+            &chunks,
+            &FOLD_REQ,
+            FOLD_BANDS,
+            Crs::WGS84,
+            Composite::StdDev,
+        )
+        .unwrap();
+        assert_matches(
+            &stacked,
+            &fold_in_waves(&chunks, FoldOp::StdDev),
+            1e-9,
+            "StdDev",
+        );
     }
 }
 

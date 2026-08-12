@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-12
+
+- streaming composite reductions: `Mean`, `Min`, `Max`, `StdDev` and `Count` fold each item into per-pixel running state and drop its window, reading in waves of the 64-item parallel cap, so a pull's peak is one wave plus the running state instead of the whole stack. Measured by a counting global allocator over 64 items against 256: the folding peak grows 6.7 MB, the stack path's grows 96 MB, on a 512 KB window per item. `Mean`, `Min`, `Max` and `Count` are bit-identical to the stack reduction, items folding in the order it summed them; `StdDev` moves to Welford's method and agrees to precision, not bit for bit. `Median` and `Percentile` need every value at a pixel at once and keep the stack path unchanged. Latency is untouched: every intersecting item is still read
+
 ## 2026-08-11
 
 - densified pull windows: a window's bbox now converts back to lon/lat through the same sixteen segments per edge the item footprints use, so a window rotated against lon/lat names every two-degree block it overlaps. A wide window on a utm grid tilts its far corner a kilometre past what two opposite corners reach, which used to drop the block search covering that corner and with it every item found only there
