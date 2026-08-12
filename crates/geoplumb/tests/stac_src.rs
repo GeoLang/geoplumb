@@ -1433,6 +1433,45 @@ async fn a_window_straddling_two_crss_composites_both() {
     assert_eq!((zone32, zone33), (5000, 5000), "window missed a case");
 }
 
+/// the easting two opposite corners of a lon/lat footprint reach in the
+/// anchor crs, the way item footprints once converted
+fn two_corner_max_x(footprint: [f64; 4]) -> f64 {
+    let to_native = from_lonlat(ZONE_32);
+    let (west, _) = to_native.convert(footprint[0], footprint[1]).unwrap();
+    let (east, _) = to_native.convert(footprint[2], footprint[3]).unwrap();
+    west.max(east)
+}
+
+/// the zone 33 item's footprint comes out rotated in the anchor crs, so
+/// its far corner reaches east of what two opposite corners of its
+/// lon/lat bbox convert to. a window on that ground is covered by the
+/// item and used to be skipped for it, coming back empty
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_past_the_two_corner_footprint_still_finds_the_item() {
+    let (base, anchor) = start_mixed_crs_mock().await;
+    let src = open_mixed(&base).await;
+
+    let other = anchor.covering(ZONE_33, MIXED_MARGIN);
+    let first_col = (two_corner_max_x(other.footprint()) - anchor.origin_x) / UTM_CELL;
+    // the first anchor column past that easting, over rows where the
+    // item's rotated corner still has six cells of cover to spare
+    let req = anchor.window(first_col.ceil() as usize, 373, 10, 64);
+    assert!(
+        req.bbox.min_x > anchor.origin_x + MIXED_COLS as f64 * UTM_CELL,
+        "the window is not clear of the zone 32 item"
+    );
+
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    let lonlat = to_lonlat(ZONE_32);
+    let mut seen = 0;
+    each_pixel(&chunk, |_, x, y, got| {
+        let (lon, lat) = lonlat.convert(x, y).unwrap();
+        seen += 1;
+        close_warped(got, elevation(lon, lat) + MIXED_SHIFT, (x, y));
+    });
+    assert_eq!(seen, 10 * 64);
+}
+
 /// the engine splits a pull into chunks, so a mixed-crs item is read once
 /// per chunk with its own planned window. those reads must land on the
 /// same item pixels the one-shot read of the whole window lands on

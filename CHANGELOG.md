@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-11
+
+- densified item footprints: an item's lon/lat footprint now converts to the anchor crs through sixteen segments per edge instead of two opposite corners, closing the couple of km a rotated cross-zone quad lost on its far side, so a chunk lying entirely inside that strip selects the item. Same-crs footprints widen slightly by the same envelope
+
 ## 2026-08-08
 
 - bounded stac search retention: completed searches now sit in an lru keyed by two-degree block and pull interval, capped at 256 searches and 8192 matched item references. Active pulls keep their results through eviction, while a weak href index shares live items and reader pools without retaining items after their last search result. This replaces the lifetime searched-block, matched-href and item maps, so public requests using fresh intervals cannot grow source state without bound

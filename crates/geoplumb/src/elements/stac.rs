@@ -45,6 +45,10 @@ const MAX_BLOCK_SEARCHES: usize = 32;
 /// reason: past this the mosaic is not something a pull should be doing
 const MAX_SEARCH_ITEMS: usize = 1000;
 
+/// segments each footprint edge is cut into before converting to the
+/// anchor crs. two corners alone lose kilometres off a rotated one
+const FOOTPRINT_EDGE_SEGMENTS: usize = 16;
+
 /// completed block searches retained by one source
 const MAX_CACHED_SEARCHES: usize = 256;
 
@@ -644,10 +648,23 @@ impl Inner {
         match &self.to_native {
             None => Ok(Bbox::new(b[0], b[1], b[2], b[3])),
             Some(t) => {
-                let fail = |detail: String| Error::Source(detail);
-                let (x0, y0) = t.convert(b[0], b[1]).map_err(|e| fail(e.to_string()))?;
-                let (x1, y1) = t.convert(b[2], b[3]).map_err(|e| fail(e.to_string()))?;
-                Ok(Bbox::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)))
+                let mut edges = Vec::with_capacity(4 * (FOOTPRINT_EDGE_SEGMENTS + 1));
+                for step in 0..=FOOTPRINT_EDGE_SEGMENTS {
+                    let along = step as f64 / FOOTPRINT_EDGE_SEGMENTS as f64;
+                    let lon = b[0] + (b[2] - b[0]) * along;
+                    let lat = b[1] + (b[3] - b[1]) * along;
+                    edges.extend([(lon, b[1]), (lon, b[3]), (b[0], lat), (b[2], lat)]);
+                }
+                let converted = t
+                    .convert_batch(&edges)
+                    .map_err(|e| Error::Source(e.to_string()))?;
+                let mut min = (f64::INFINITY, f64::INFINITY);
+                let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for (x, y) in converted {
+                    min = (min.0.min(x), min.1.min(y));
+                    max = (max.0.max(x), max.1.max(y));
+                }
+                Ok(Bbox::new(min.0, min.1, max.0, max.1))
             }
         }
     }
