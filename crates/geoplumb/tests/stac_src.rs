@@ -11,7 +11,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
 use geoplumb::element::Source;
-use geoplumb::elements::{Composite, StacSearch, StacSrc, stac::s3_to_https};
+use geoplumb::elements::{
+    Composite, StacSearch, StacSrc,
+    stac::{STACK_VALUE_BUDGET, s3_to_https},
+};
 use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, TimeInterval, WindowReq};
 use terrano_core::{BandedRaster, CogParams, Raster, write_cog, write_cog_bands};
 
@@ -1132,6 +1135,158 @@ async fn percentile_interpolates_between_the_neighbouring_ranks() {
         each_pixel(&chunk, |_, x, y, got| {
             close(got, elevation(x, y) + want_shift, (x, y));
         });
+    }
+}
+
+/// items of the wide stack, all covering the whole window, so a strip of
+/// it reduces exactly the stack the whole window reduces
+const WIDE_ITEMS: usize = 32;
+const WIDE_COLS: usize = 512;
+const WIDE_ROWS: usize = 300;
+
+/// nodata rows of every other item, straddling the row the strips break
+/// at, so a strip boundary meets a change in stack depth
+const WIDE_HOLE: std::ops::Range<usize> = 250..262;
+
+/// rows of each reference pull, shallow enough to reduce in one piece and
+/// cut at a row the strips do not break at
+const WIDE_HALF: usize = 150;
+
+const WIDE_BBOX: [f64; 4] = [
+    ORIGIN_X,
+    ORIGIN_Y - WIDE_ROWS as f64 * CELL,
+    ORIGIN_X + WIDE_COLS as f64 * CELL,
+    ORIGIN_Y,
+];
+
+const WIDE: WindowReq = WindowReq {
+    bbox: Bbox {
+        min_x: WIDE_BBOX[0],
+        min_y: WIDE_BBOX[1],
+        max_x: WIDE_BBOX[2],
+        max_y: WIDE_BBOX[3],
+    },
+    resolution: CELL,
+    time: None,
+};
+
+/// `cog` over the whole wide window, holing out `WIDE_HOLE` rather than
+/// the fixed rows the narrow scene holes
+fn wide_cog(shift: f64, hole: bool) -> Vec<u8> {
+    let mut data = Vec::with_capacity(WIDE_COLS * WIDE_ROWS);
+    for row in 0..WIDE_ROWS {
+        for col in 0..WIDE_COLS {
+            let lon = ORIGIN_X + col as f64 * CELL + 0.5 * CELL;
+            let lat = ORIGIN_Y - row as f64 * CELL - 0.5 * CELL;
+            data.push(if hole && WIDE_HOLE.contains(&row) {
+                f64::NAN
+            } else {
+                elevation(lon, lat) + shift
+            });
+        }
+    }
+    let raster = Raster::from_vec(WIDE_COLS, WIDE_ROWS, data, CELL, f64::NAN).unwrap();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    write_cog(&raster, &params(0), &mut buf).unwrap();
+    buf.into_inner()
+}
+
+/// co-located items over a window wide enough that their stack passes what
+/// a reduction holds at once, shifts spaced unevenly so a median cannot
+/// pass as a mean, every other item holed
+async fn start_wide_stack_mock() -> (String, Arc<Mock>) {
+    start_mock_with(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        let mut features = Vec::new();
+        for i in 0..WIDE_ITEMS {
+            let name = format!("wide_{i}.tif");
+            cogs.insert(name.clone(), wide_cog((i * i) as f64, i % 2 == 0));
+            features.push(item(
+                &format!("wide_{i}"),
+                &format!("2024-{:02}-{:02}T00:00:00Z", i / 28 + 1, i % 28 + 1),
+                &format!("{base}/cog/{name}"),
+                WIDE_BBOX,
+                4326,
+            ));
+        }
+        (cogs, features)
+    })
+    .await
+}
+
+/// the stack over this window holds more values than a reduction may, so
+/// it reads in strips. the same rows pulled as windows that each fit take
+/// the one-strip path, which is the read and the reduce a whole window did
+/// before, and the two must agree pixel for pixel
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reduction_in_strips_matches_one_in_a_single_piece() {
+    const {
+        assert!(
+            WIDE_COLS * WIDE_ROWS * WIDE_ITEMS > STACK_VALUE_BUDGET
+                && WIDE_COLS * WIDE_HALF * WIDE_ITEMS <= STACK_VALUE_BUDGET,
+            "the window no longer straddles the budget it is here to cross"
+        )
+    };
+    let (base, _mock) = start_wide_stack_mock().await;
+    for (op, deep_shift, holed_shift) in [
+        // shifts are the squares 0..31: the median of the thirty-two is
+        // (225 + 256) / 2, and of the sixteen odd ones left in the holed
+        // rows (225 + 289) / 2
+        (Composite::Median, 240.5, 257.0),
+        // rank 27.9 of thirty-two sits nine tenths from 729 to 784, rank
+        // 13.5 of sixteen halfway from 729 to 841
+        (Composite::Percentile(90.0), 778.5, 785.0),
+    ] {
+        let src = open_composite(&base, op).await;
+        assert_eq!(src.item_count(), WIDE_ITEMS);
+        let whole = src.read(&WIDE).await.unwrap().into_raster().unwrap();
+        let mut holed = 0;
+        each_pixel(&whole, |_, x, y, got| {
+            let shift = if WIDE_HOLE.contains(&scene_row(y)) {
+                holed += 1;
+                holed_shift
+            } else {
+                deep_shift
+            };
+            close(got, elevation(x, y) + shift, (x, y));
+        });
+        assert!(holed > 1000, "{op:?} missed the holed rows");
+
+        let seam = WIDE.bbox.max_y - WIDE_HALF as f64 * CELL;
+        let halves = [
+            (
+                0,
+                Bbox {
+                    min_y: seam,
+                    ..WIDE.bbox
+                },
+            ),
+            (
+                WIDE_HALF,
+                Bbox {
+                    max_y: seam,
+                    ..WIDE.bbox
+                },
+            ),
+        ];
+        let want = whole.bands.band(0).unwrap().data();
+        for (from, bbox) in halves {
+            let part = src
+                .read(&WindowReq { bbox, ..WIDE })
+                .await
+                .unwrap()
+                .into_raster()
+                .unwrap();
+            let band = part.bands.band(0).unwrap();
+            assert_eq!(band.height(), WIDE_HALF);
+            let at = from * WIDE_COLS;
+            assert_eq!(
+                band.data(),
+                &want[at..at + WIDE_HALF * WIDE_COLS],
+                "{op:?} rows {from}..{}",
+                from + WIDE_HALF
+            );
+        }
     }
 }
 

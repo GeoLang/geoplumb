@@ -11,7 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
 use geoplumb::element::Source;
-use geoplumb::elements::stac::MAX_PARALLEL_ITEM_READS;
+use geoplumb::elements::stac::{MAX_PARALLEL_ITEM_READS, STACK_VALUE_BUDGET};
 use geoplumb::elements::{Composite, StacSearch, StacSrc};
 use geoplumb::{Bbox, WindowReq};
 use terrano_core::{CogParams, Raster, write_cog};
@@ -76,6 +76,10 @@ const WINDOW_BYTES: usize = SIDE * SIDE * size_of::<f64>();
 /// cap, and four of them
 const SHALLOW: usize = MAX_PARALLEL_ITEM_READS;
 const DEEP: usize = 4 * MAX_PARALLEL_ITEM_READS;
+
+/// deepest stack this window still reduces in one strip, the depth the
+/// control below measures under
+const FITTING: usize = STACK_VALUE_BUDGET / (SIDE * SIDE);
 
 const WINDOW: WindowReq = WindowReq {
     bbox: Bbox {
@@ -202,12 +206,20 @@ async fn pull(items: usize, composite: Composite) -> (usize, f64) {
     (growth, got)
 }
 
-/// the memory half of the dense-collection limit: a folding reducer's peak
-/// must not follow the item count, while the stack path's still does. the
-/// stack path is the control, without it the bound below would pass on a
+/// the memory half of the dense-collection limit: neither peak may follow
+/// the item count, the folding reducer because it drops each wave and the
+/// stack reducer because it reads the window in strips. the control is the
+/// stack reducer under the budget, where a deeper stack really is another
+/// resident window per item: without it both bounds would pass on a
 /// harness too noisy to measure anything
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_folding_composite_peaks_flat_in_the_stack_depth() {
+async fn a_composite_peaks_flat_in_the_stack_depth() {
+    const {
+        assert!(
+            FITTING < DEEP,
+            "the deep stack no longer passes what a reduction holds at once"
+        )
+    };
     let extra_items = DEEP - SHALLOW;
 
     let (shallow_fold, shallow_mean) = pull(SHALLOW, Composite::Mean).await;
@@ -215,18 +227,32 @@ async fn a_folding_composite_peaks_flat_in_the_stack_depth() {
     assert_eq!(shallow_mean, (SHALLOW - 1) as f64 / 2.0);
     assert_eq!(deep_mean, (DEEP - 1) as f64 / 2.0);
 
-    let (shallow_stack, _) = pull(SHALLOW, Composite::Median).await;
-    let (deep_stack, _) = pull(DEEP, Composite::Median).await;
+    let (shallow_stack, shallow_median) = pull(SHALLOW, Composite::Median).await;
+    let (deep_stack, deep_median) = pull(DEEP, Composite::Median).await;
+    // item i is flat at i, so an even stack's median is (n - 1) / 2 and a
+    // strip that lost or repeated an item would miss it
+    assert_eq!(shallow_median, (SHALLOW - 1) as f64 / 2.0);
+    assert_eq!(deep_median, (DEEP - 1) as f64 / 2.0);
+
+    let (small_stack, _) = pull(FITTING / 4, Composite::Median).await;
+    let (fitting_stack, _) = pull(FITTING, Composite::Median).await;
 
     let fold_step = deep_fold.saturating_sub(shallow_fold);
     let stack_step = deep_stack.saturating_sub(shallow_stack);
+    let control_step = fitting_stack.saturating_sub(small_stack);
     assert!(
         fold_step < extra_items / 4 * WINDOW_BYTES,
         "folding peak grew {fold_step} bytes over {extra_items} more items"
     );
     assert!(
-        stack_step > extra_items / 2 * WINDOW_BYTES,
-        "stack peak grew only {stack_step} bytes over {extra_items} more items, \
-         the measurement is not sensitive enough to mean anything"
+        stack_step < extra_items / 4 * WINDOW_BYTES,
+        "stack peak grew {stack_step} bytes over {extra_items} more items"
+    );
+    let control_items = FITTING - FITTING / 4;
+    assert!(
+        control_step > control_items / 2 * WINDOW_BYTES,
+        "under the budget the stack peak grew only {control_step} bytes over \
+         {control_items} more items, the measurement is not sensitive enough \
+         to mean anything"
     );
 }

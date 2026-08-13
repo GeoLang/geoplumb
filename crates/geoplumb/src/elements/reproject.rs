@@ -95,7 +95,7 @@ fn envelope(t: &projicio_core::Transform, b: &Bbox) -> Result<Bbox> {
 
 /// ground distance a `step` at (x, y) maps to under `t`, the local scale
 /// factor that rescales a resolution across the projection
-fn local_scale(t: &projicio_core::Transform, x: f64, y: f64, step: f64) -> f64 {
+pub(crate) fn local_scale(t: &projicio_core::Transform, x: f64, y: f64, step: f64) -> f64 {
     match (t.convert(x, y), t.convert(x + step, y)) {
         (Ok((x0, y0)), Ok((x1, y1))) => (x1 - x0).hypot(y1 - y0).max(1e-12),
         _ => step,

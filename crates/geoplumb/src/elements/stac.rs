@@ -26,7 +26,7 @@ use crate::caps::{
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::elements::cog::{HttpRange, band_count, read_chunk};
-use crate::elements::reproject::{inverse_window, warp_to_grid};
+use crate::elements::reproject::{inverse_window, local_scale, warp_to_grid};
 use crate::engine::align_outward;
 use crate::error::{Error, Result};
 use crate::window::{Bbox, GridSpec, TimeInterval, WindowReq};
@@ -820,7 +820,7 @@ impl Inner {
     /// order, each cog opening on first use. an asset of an item on
     /// another crs comes back warped onto the anchor grid, so every band
     /// of the chunk is on the window the caller asked for either way
-    fn read_item(&self, item: &Item, req: &WindowReq) -> Result<RasterChunk> {
+    fn read_item(&self, item: &Item, req: &WindowReq, scale_window: &Bbox) -> Result<RasterChunk> {
         let mut bands = Vec::with_capacity(usize::from(self.bands));
         for (k, pool) in item.readers.iter().enumerate() {
             let taken = pool.lock().unwrap().pop();
@@ -845,6 +845,7 @@ impl Inner {
                     meta.origin_y,
                     reprojection,
                     self.crs,
+                    scale_window,
                 )?,
             };
             {
@@ -924,8 +925,18 @@ fn read_warped(
     origin_y: f64,
     reprojection: &Reprojection,
     anchor: Crs,
+    scale_window: &Bbox,
 ) -> Result<RasterChunk> {
-    let (region, wanted) = inverse_window(&reprojection.from_anchor, &req.bbox, req.resolution);
+    let (region, _) = inverse_window(&reprojection.from_anchor, &req.bbox, req.resolution);
+    // the source resolution comes from the whole pull window, so a strip of
+    // a chunked read picks the overview the whole window picks and two
+    // strips cannot land on different ones
+    let wanted = local_scale(
+        &reprojection.from_anchor,
+        (scale_window.min_x + scale_window.max_x) / 2.0,
+        (scale_window.min_y + scale_window.max_y) / 2.0,
+        req.resolution,
+    );
     let level = reader.select_level(wanted);
     let resolution = reader.levels()[level].pixel_width;
     // widened at the resolution actually read, so an output pixel at the
@@ -943,22 +954,26 @@ fn read_warped(
 }
 
 /// one window read per item, `MAX_PARALLEL_ITEM_READS` in flight across
-/// the whole process, results in item order
+/// the whole process, results in item order. `scale_window` is the whole
+/// pull window, which `req` is a strip of when a reduction reads the pull
+/// in strips
 async fn read_items(
     inner: &Arc<Inner>,
     items: &[Arc<Item>],
     req: &WindowReq,
+    scale_window: &Bbox,
 ) -> Result<Vec<RasterChunk>> {
     let reads = items.iter().map(|item| {
         let inner = inner.clone();
         let item = item.clone();
         let req = *req;
+        let scale_window = *scale_window;
         async move {
             let _permit = ITEM_READ_PERMITS
                 .acquire()
                 .await
                 .expect("semaphore is never closed");
-            crate::engine::offload(move || inner.read_item(&item, &req)).await
+            crate::engine::offload(move || inner.read_item(&item, &req, &scale_window)).await
         }
     });
     futures::future::try_join_all(reads).await
@@ -1003,7 +1018,7 @@ async fn latest_window(
 ) -> Result<Option<RasterChunk>> {
     let mut merged: Option<RasterChunk> = None;
     for wave in items.chunks(MAX_PARALLEL_ITEM_READS) {
-        let chunks = read_items(inner, wave, req).await?;
+        let chunks = read_items(inner, wave, req, &req.bbox).await?;
         merged = crate::engine::offload(move || fill_latest(merged, chunks)).await;
         if merged.as_ref().is_some_and(complete) {
             break;
@@ -1014,7 +1029,7 @@ async fn latest_window(
 
 /// every chunk reduced per pixel per band, one chunk per item. these
 /// reducers need every value at a pixel at once, so the caller reads the
-/// whole stack first and holds it here
+/// stack over one strip of the window first and holds it here
 fn reduce_chunks(
     chunks: &[RasterChunk],
     req: &WindowReq,
@@ -1049,18 +1064,102 @@ fn reduce_chunks(
     })
 }
 
+/// values one reduction holds at once: every item's value at every pixel
+/// of one strip, eight bytes each, so a pull peaks around 32 mb of stack
+/// however deep the collection is and a materialize can still have several
+/// pulls in flight
+pub const STACK_VALUE_BUDGET: usize = 4 << 20;
+
+/// rows of the window one strip covers: the budget over what a row of the
+/// stack costs, at least one row and never more than the window has
+fn rows_per_strip(cols: usize, rows: usize, bands: u16, depth: usize) -> usize {
+    let row_values = cols.max(1) * usize::from(bands).max(1) * depth.max(1);
+    (STACK_VALUE_BUDGET / row_values).clamp(1, rows.max(1))
+}
+
+/// the window cut into strips of at most `strip_rows` rows, each on the
+/// window's own pixel grid so a strip read lands on exactly the pixels the
+/// whole window would. one strip when the stack fits the budget
+fn row_strips(req: &WindowReq, rows: usize, strip_rows: usize) -> Vec<WindowReq> {
+    (0..rows.max(1))
+        .step_by(strip_rows)
+        .map(|from| {
+            let to = (from + strip_rows).min(rows);
+            let bbox = Bbox {
+                max_y: req.bbox.max_y - from as f64 * req.resolution,
+                // the last strip keeps the window's own edge rather than a
+                // recomputed one
+                min_y: if to >= rows {
+                    req.bbox.min_y
+                } else {
+                    req.bbox.max_y - to as f64 * req.resolution
+                },
+                ..req.bbox
+            };
+            req.with_window(bbox, req.resolution)
+        })
+        .collect()
+}
+
+/// the strips' results laid back into the window they were cut from, in
+/// row order
+fn join_strips(
+    parts: Vec<RasterChunk>,
+    req: &WindowReq,
+    bands: u16,
+    crs: Crs,
+) -> Result<RasterChunk> {
+    let cols = parts[0].width();
+    let rows = parts.iter().map(|p| p.height()).sum();
+    let planes = (0..usize::from(bands))
+        .map(|bi| {
+            let mut data = Vec::with_capacity(cols * rows);
+            for part in &parts {
+                data.extend_from_slice(part.bands.band(bi).expect("equal band counts").data());
+            }
+            terrano_core::Raster::from_vec(cols, rows, data, req.resolution, f64::NAN)
+        })
+        .collect::<core::result::Result<Vec<_>, _>>()
+        .map_err(Error::Terrano)?;
+    Ok(RasterChunk {
+        bands: terrano_core::BandedRaster::new(planes).map_err(Error::Terrano)?,
+        bbox: req.bbox,
+        resolution: req.resolution,
+        crs,
+    })
+}
+
+/// the stack path bounded spatially: the window is read and reduced strip
+/// by strip, so the stack resident at once is the budget rather than every
+/// item's whole window. strips run one after another, each reading its
+/// items in parallel the way a whole window did, and the shared item list
+/// never changes, so a strip reduces exactly the stack the window would
+/// have at those rows
 async fn reduce_window(
     inner: &Arc<Inner>,
     items: &[Arc<Item>],
     req: &WindowReq,
     op: Composite,
 ) -> Result<Option<RasterChunk>> {
-    let chunks = read_items(inner, items, req).await?;
-    if chunks.is_empty() {
+    if items.is_empty() {
         return Ok(None);
     }
-    let (bands, crs, req) = (inner.bands, inner.crs, *req);
-    crate::engine::offload(move || reduce_chunks(&chunks, &req, bands, crs, op).map(Some)).await
+    let cols = (req.bbox.width() / req.resolution).round() as usize;
+    let rows = (req.bbox.height() / req.resolution).round() as usize;
+    let strip_rows = rows_per_strip(cols, rows, inner.bands, items.len());
+    let (bands, crs) = (inner.bands, inner.crs);
+    let mut parts = Vec::new();
+    for strip in row_strips(req, rows, strip_rows) {
+        let chunks = read_items(inner, items, &strip, &req.bbox).await?;
+        parts.push(
+            crate::engine::offload(move || reduce_chunks(&chunks, &strip, bands, crs, op)).await?,
+        );
+    }
+    if parts.len() == 1 {
+        return Ok(parts.pop());
+    }
+    let req = *req;
+    crate::engine::offload(move || join_strips(parts, &req, bands, crs).map(Some)).await
 }
 
 /// the reducers whose answer folds item by item, so a window holds one
@@ -1220,7 +1319,7 @@ async fn fold_window(
 ) -> Result<Option<RasterChunk>> {
     let mut fold: Option<WindowFold> = None;
     for wave in items.chunks(MAX_PARALLEL_ITEM_READS) {
-        let chunks = read_items(inner, wave, req).await?;
+        let chunks = read_items(inner, wave, req, &req.bbox).await?;
         let bands = inner.bands;
         fold = crate::engine::offload(move || fold_wave(fold, chunks, bands, op)).await;
     }
@@ -1321,6 +1420,68 @@ impl Source for StacSrc {
                 None => crate::engine::offload(move || inner.empty(&req).map(Chunk::Raster)).await,
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::*;
+
+    const STRIP_RES: f64 = 10.0;
+
+    fn window(cols: usize, rows: usize) -> WindowReq {
+        WindowReq {
+            bbox: Bbox {
+                min_x: 300.0,
+                min_y: 700.0,
+                max_x: 300.0 + cols as f64 * STRIP_RES,
+                max_y: 700.0 + rows as f64 * STRIP_RES,
+            },
+            resolution: STRIP_RES,
+            time: None,
+        }
+    }
+
+    #[test]
+    fn strips_tile_the_window_and_hold_the_budget() {
+        for (cols, rows, bands, depth) in [
+            (1000, 1000, 1u16, 1usize),
+            (1000, 1000, 1, 100),
+            (600, 400, 3, 40),
+            (2048, 2048, 4, 500),
+            (37, 41, 2, 7),
+        ] {
+            let req = window(cols, rows);
+            let strip_rows = rows_per_strip(cols, rows, bands, depth);
+            let strips = row_strips(&req, rows, strip_rows);
+            let counted: usize = strips
+                .iter()
+                .map(|s| (s.bbox.height() / STRIP_RES).round() as usize)
+                .sum();
+            assert_eq!(counted, rows, "{cols}x{rows} b{bands} d{depth}");
+            assert_eq!(strips[0].bbox.max_y, req.bbox.max_y);
+            assert_eq!(strips.last().unwrap().bbox.min_y, req.bbox.min_y);
+            for pair in strips.windows(2) {
+                assert_eq!(pair[0].bbox.min_y, pair[1].bbox.max_y);
+                assert_eq!(pair[0].bbox.min_x, req.bbox.min_x);
+                assert_eq!(pair[0].bbox.max_x, req.bbox.max_x);
+            }
+            let held = cols * strip_rows * usize::from(bands) * depth;
+            assert!(
+                held <= STACK_VALUE_BUDGET || strip_rows == 1,
+                "{cols}x{rows} b{bands} d{depth} holds {held} values a strip"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stack_inside_the_budget_reads_as_one_strip() {
+        let (cols, rows, depth) = (256, 256, 16);
+        let strip_rows = rows_per_strip(cols, rows, 1, depth);
+        let req = window(cols, rows);
+        let strips = row_strips(&req, rows, strip_rows);
+        assert_eq!(strips.len(), 1);
+        assert_eq!(strips[0], req);
     }
 }
 
