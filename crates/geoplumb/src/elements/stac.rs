@@ -821,6 +821,11 @@ impl Inner {
     /// another crs comes back warped onto the anchor grid, so every band
     /// of the chunk is on the window the caller asked for either way
     fn read_item(&self, item: &Item, req: &WindowReq, scale_window: &Bbox) -> Result<RasterChunk> {
+        // the pull filters items against the whole window, a strip of it can
+        // still miss one, and opening its cogs to find that out costs a fetch
+        if !item.bbox.intersects(&req.bbox) {
+            return self.empty(req);
+        }
         let mut bands = Vec::with_capacity(usize::from(self.bands));
         for (k, pool) in item.readers.iter().enumerate() {
             let taken = pool.lock().unwrap().pop();
@@ -1129,12 +1134,21 @@ fn join_strips(
     })
 }
 
+/// the items whose footprint reaches a window, by the test the pull uses
+/// against the whole window, so a strip and the pull agree on an item
+fn items_intersecting(items: &[Arc<Item>], bbox: &Bbox) -> Vec<Arc<Item>> {
+    items
+        .iter()
+        .filter(|item| item.bbox.intersects(bbox))
+        .cloned()
+        .collect()
+}
+
 /// the stack path bounded spatially: the window is read and reduced strip
 /// by strip, so the stack resident at once is the budget rather than every
-/// item's whole window. strips run one after another, each reading its
-/// items in parallel the way a whole window did, and the shared item list
-/// never changes, so a strip reduces exactly the stack the window would
-/// have at those rows
+/// item's whole window. strips run one after another, each reading the
+/// items its own rows touch in parallel the way a whole window did, and an
+/// item the strip misses only ever contributed nodata to those rows
 async fn reduce_window(
     inner: &Arc<Inner>,
     items: &[Arc<Item>],
@@ -1150,7 +1164,12 @@ async fn reduce_window(
     let (bands, crs) = (inner.bands, inner.crs);
     let mut parts = Vec::new();
     for strip in row_strips(req, rows, strip_rows) {
-        let chunks = read_items(inner, items, &strip, &req.bbox).await?;
+        let over_strip = items_intersecting(items, &strip.bbox);
+        if over_strip.is_empty() {
+            parts.push(inner.empty(&strip)?);
+            continue;
+        }
+        let chunks = read_items(inner, &over_strip, &strip, &req.bbox).await?;
         parts.push(
             crate::engine::offload(move || reduce_chunks(&chunks, &strip, bands, crs, op)).await?,
         );
@@ -1472,6 +1491,48 @@ mod strip_tests {
                 "{cols}x{rows} b{bands} d{depth} holds {held} values a strip"
             );
         }
+    }
+
+    fn item_over(name: &str, bbox: Bbox) -> Arc<Item> {
+        Arc::new(Item {
+            hrefs: vec![name.to_string()],
+            datetime: String::new(),
+            bbox,
+            reprojection: None,
+            readers: Vec::new(),
+        })
+    }
+
+    /// rows `from..to` of the window as a footprint
+    fn rows_bbox(req: &WindowReq, from: usize, to: usize) -> Bbox {
+        Bbox {
+            max_y: req.bbox.max_y - from as f64 * STRIP_RES,
+            min_y: req.bbox.max_y - to as f64 * STRIP_RES,
+            ..req.bbox
+        }
+    }
+
+    #[test]
+    fn a_strip_takes_only_the_items_its_rows_touch() {
+        let (cols, rows) = (40, 30);
+        let req = window(cols, rows);
+        let items = vec![
+            item_over("top", rows_bbox(&req, 0, 10)),
+            item_over("bottom", rows_bbox(&req, 20, 30)),
+        ];
+        let names = |bbox: &Bbox| -> Vec<String> {
+            items_intersecting(&items, bbox)
+                .iter()
+                .map(|item| item.hrefs[0].clone())
+                .collect()
+        };
+        assert_eq!(names(&req.bbox), ["top", "bottom"]);
+
+        let strips = row_strips(&req, rows, 10);
+        assert_eq!(strips.len(), 3);
+        assert_eq!(names(&strips[0].bbox), ["top"]);
+        assert!(names(&strips[1].bbox).is_empty());
+        assert_eq!(names(&strips[2].bbox), ["bottom"]);
     }
 
     #[test]

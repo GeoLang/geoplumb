@@ -868,13 +868,17 @@ fn s3_hrefs_rewrite_to_https() {
     assert_eq!(s3_to_https("https://x/y.tif"), "https://x/y.tif");
 }
 
-async fn open_composite(base: &str, composite: Composite) -> StacSrc {
-    let mut search = StacSearch::new(base, "test-dem", "data", [7.0, 46.6, 7.6, 47.0]);
+async fn open_composite_over(base: &str, composite: Composite, bbox: [f64; 4]) -> StacSrc {
+    let mut search = StacSearch::new(base, "test-dem", "data", bbox);
     search.composite = composite;
     tokio::task::spawn_blocking(move || StacSrc::open(&search))
         .await
         .unwrap()
         .unwrap()
+}
+
+async fn open_composite(base: &str, composite: Composite) -> StacSrc {
+    open_composite_over(base, composite, [7.0, 46.6, 7.6, 47.0]).await
 }
 
 /// walks every band and pixel of an exactly-sized read, handing the check
@@ -1288,6 +1292,146 @@ async fn a_reduction_in_strips_matches_one_in_a_single_piece() {
             );
         }
     }
+}
+
+/// items covering one row band each: `GAP_ITEMS` over the top band,
+/// `GAP_ITEMS` over the bottom one, and rows `GAP_TOP..GAP_BOTTOM` covered
+/// by nothing. the strips break at both band edges, so one strip reads the
+/// top items alone, one the bottom items alone, and the middle one nothing
+const GAP_ITEMS: usize = 16;
+const GAP_COLS: usize = 1024;
+const GAP_ROWS: usize = 300;
+const GAP_TOP: usize = 128;
+const GAP_BOTTOM: usize = 256;
+
+/// the medians of the two bands' shifts: the even squares up to 30 over the
+/// top band, the odd squares up to 31 over the bottom one
+const GAP_TOP_MEDIAN: f64 = 226.0;
+const GAP_BOTTOM_MEDIAN: f64 = 257.0;
+
+const GAP: WindowReq = WindowReq {
+    bbox: Bbox {
+        min_x: ORIGIN_X,
+        min_y: ORIGIN_Y - GAP_ROWS as f64 * CELL,
+        max_x: ORIGIN_X + GAP_COLS as f64 * CELL,
+        max_y: ORIGIN_Y,
+    },
+    resolution: CELL,
+    time: None,
+};
+
+const GAP_OPEN: [f64; 4] = [
+    GAP.bbox.min_x,
+    GAP.bbox.min_y,
+    GAP.bbox.max_x,
+    GAP.bbox.max_y,
+];
+
+fn gap_shift(top: bool, i: usize) -> f64 {
+    let rank = 2 * i + usize::from(!top);
+    (rank * rank) as f64
+}
+
+/// `cog` over `rows` rows of the scene from scene row `row0`, so an item
+/// can cover a band of the window rather than all of it
+fn band_cog(row0: usize, rows: usize, shift: f64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(GAP_COLS * rows);
+    for row in 0..rows {
+        for col in 0..GAP_COLS {
+            let lon = ORIGIN_X + col as f64 * CELL + 0.5 * CELL;
+            let lat = ORIGIN_Y - (row0 + row) as f64 * CELL - 0.5 * CELL;
+            data.push(elevation(lon, lat) + shift);
+        }
+    }
+    let raster = Raster::from_vec(GAP_COLS, rows, data, CELL, f64::NAN).unwrap();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    write_cog(
+        &raster,
+        &CogParams {
+            origin_y: ORIGIN_Y - row0 as f64 * CELL,
+            ..params(0)
+        },
+        &mut buf,
+    )
+    .unwrap();
+    buf.into_inner()
+}
+
+fn band_bbox(row0: usize, rows: usize) -> [f64; 4] {
+    [
+        ORIGIN_X,
+        ORIGIN_Y - (row0 + rows) as f64 * CELL,
+        ORIGIN_X + GAP_COLS as f64 * CELL,
+        ORIGIN_Y - row0 as f64 * CELL,
+    ]
+}
+
+async fn start_gap_mock() -> (String, Arc<Mock>) {
+    start_mock_with(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        let mut features = Vec::new();
+        for (band, top, row0, rows) in [
+            ("top", true, 0, GAP_TOP),
+            ("bottom", false, GAP_BOTTOM, GAP_ROWS - GAP_BOTTOM),
+        ] {
+            for i in 0..GAP_ITEMS {
+                let name = format!("gap_{band}_{i}.tif");
+                cogs.insert(name.clone(), band_cog(row0, rows, gap_shift(top, i)));
+                features.push(item(
+                    &format!("gap_{band}_{i}"),
+                    &format!("2024-01-{:02}T00:00:00Z", i + 1),
+                    &format!("{base}/cog/{name}"),
+                    band_bbox(row0, rows),
+                    4326,
+                ));
+            }
+        }
+        (cogs, features)
+    })
+    .await
+}
+
+/// a strip reduces the items its own rows touch, which is the stack the
+/// whole window has at those rows, and a strip no item reaches comes back
+/// nodata rather than reading every item to find out
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_strip_reduces_the_items_over_its_own_rows() {
+    const {
+        assert!(
+            STACK_VALUE_BUDGET / (GAP_COLS * 2 * GAP_ITEMS) == GAP_TOP
+                && GAP_BOTTOM == 2 * GAP_TOP
+                && GAP_ROWS > GAP_BOTTOM,
+            "the strips no longer break at the row bands this test needs"
+        )
+    };
+    let (base, _mock) = start_gap_mock().await;
+    let src = open_composite_over(&base, Composite::Median, GAP_OPEN).await;
+    assert_eq!(src.item_count(), 2 * GAP_ITEMS);
+
+    let whole = src.read(&GAP).await.unwrap().into_raster().unwrap();
+    let (mut top, mut gap, mut bottom) = (0, 0, 0);
+    each_pixel(&whole, |_, x, y, got| match scene_row(y) {
+        row if row < GAP_TOP => {
+            top += 1;
+            close(got, elevation(x, y) + GAP_TOP_MEDIAN, (x, y));
+        }
+        row if row < GAP_BOTTOM => {
+            gap += 1;
+            assert!(got.is_nan(), "({x:.4},{y:.4}) has {got} over the gap");
+        }
+        _ => {
+            bottom += 1;
+            close(got, elevation(x, y) + GAP_BOTTOM_MEDIAN, (x, y));
+        }
+    });
+    assert_eq!(
+        (top, gap, bottom),
+        (
+            GAP_TOP * GAP_COLS,
+            (GAP_BOTTOM - GAP_TOP) * GAP_COLS,
+            (GAP_ROWS - GAP_BOTTOM) * GAP_COLS
+        )
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
