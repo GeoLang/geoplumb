@@ -7,13 +7,17 @@ A pull-based geospatial compute pipeline for the GeoLang GIS stack.
 
 Build a dag of sources and transforms, negotiate caps once, then pull windows: a demand (bbox plus resolution) flows sink to source, each element rewriting it on the way up (kernel halo, inverse projection), and chunks flow back, cached and coalesced per node. Nothing is computed until something asks, and only the asked-for window is computed.
 
-- **Caps negotiation** — every element declares a constraint over its link caps (dtype, bands, CRS, resolution range, chunk size), per chunk kind (raster, point cloud, vector or tensor). A solver adapted from [glass2glass](https://github.com/Glass2GlassHQ/glass2glass) fixates the graph or fails naming the incompatible link.
+- **Caps negotiation** — every element declares a constraint over its link caps, per chunk kind (raster, point cloud, vector or tensor). A raster or tensor pattern carries dtype, bands or channels, CRS, resolution range and chunk size; the point cloud and vector patterns carry only CRS, resolution and chunk size. A solver adapted from [glass2glass](https://github.com/Glass2GlassHQ/glass2glass) fixates the graph or fails naming the incompatible link.
 - **Window-native pull** — requests snap to a per-node chunk grid on a power-of-two resolution ladder, so results are cacheable and concurrent pulls of one chunk share a single computation.
 - **Seam-free kernels** — a transform widens its upstream request by its halo and crops it back, so hillshade at chunk borders equals whole-raster hillshade.
 - **Batch = pull** — materializing a pyramid is a driver loop over the chunk grid, the same graph the live server pulls.
 - **Live = invalidate + re-pull** — declare a window dirty and the engine drops overlapping cache downstream (halo-spread, projected across CRS changes) and publishes events for re-rendering.
 
-Elements in v1: in-memory GeoTIFF source, windowed COG source (only the tiles a pull touches are fetched, locally or over HTTP range requests, from the file overview nearest the request, single- or multi-band), STAC collection source (items searched lazily per pulled window, paged to the end of the api's results, and combined band by band as a most-recent-first mosaic or a mean, median, min, max, percentile, standard deviation or count temporal composite over the searched interval, streamed the same way, see `examples/stac_tiles.rs` for live Copernicus DEM hillshade), LAS point cloud source with per-level voxel thinning and IDW gridding to raster (nubis), GeoJSON vector source with per-level simplification, per-fragment filter, schema map and boundary clip, and rasterization by constant or property (topoi), windowed tensors (raster bands to CHW f32 channels and back, 3x3 convolution per channel), reproject for rasters and vectors (projicio, auto-plugged wherever a link disagrees only on CRS), hillshade, slope, aspect, focal statistics, map algebra and reclassify over terrano, quality masking, band math over an expression on the input bands (NDVI and friends, parsed at construction), mosaic and two-input algebra over fan-in nodes, zonal statistics and time-series pull drivers, an XYZ tile adapter, PNG and GeoTIFF encoders.
+Elements in v1 split into what a served layer file can name and what only Rust code against the crate can reach.
+
+Reachable from a layer file: the windowed COG source (only the tiles a pull touches are fetched, locally or over HTTP range requests, from the file overview nearest the request, single- or multi-band), the STAC collection source (items searched lazily per pulled window, paged to the end of the api's results, and combined band by band as a most-recent-first mosaic or a mean, median, min, max, percentile, standard deviation or count temporal composite over the searched interval, see `examples/stac_tiles.rs` for live Copernicus DEM hillshade), and the four ops `hillshade`, `slope`, `aspect` and `bandmath`. Reproject to web mercator and PNG encoding are appended to every layer, not named. Mean, min, max, standard deviation and count fold item by item, so a pull's peak memory is one wave however deep the stack; median and percentile instead need every value at a pixel at once and hold a horizontal strip's whole stack under a fixed value budget.
+
+Library-only, meaning no layer file can name them: the in-memory GeoTIFF source, the LAS point cloud source with per-level voxel thinning and IDW gridding to raster (nubis), the GeoJSON vector source with per-level simplification, per-fragment filter, schema map and boundary clip, and rasterization by constant or property (topoi), windowed tensors (raster bands to CHW f32 channels and back, 3x3 convolution per channel), explicit reproject for rasters and vectors (projicio, auto-plugged wherever a link disagrees only on CRS), focal statistics, map algebra and reclassify over terrano, quality masking, mosaic and two-input algebra over fan-in nodes, zonal statistics and time-series pull drivers, the XYZ tile adapter and the GeoTIFF encoder.
 
 ## Quick start
 
@@ -34,6 +38,12 @@ cp crates/geoplumb-server/examples/layers.toml /tmp/layers.toml   # then edit it
 GEOPLUMB_LAYERS=/tmp/layers.toml cargo run --release -p geoplumb-server
 curl localhost:3000/layers
 ```
+
+The `ndvi` layer in that example file is a Sentinel-2 median composite with no
+cloud masking, which is not what you would deploy. Masking would need
+`QualityMask` over the SCL band, and `OpConfig` has no variant for it, so a
+layer file cannot ask for it. Build the graph in Rust when you need masked
+optical imagery.
 
 ```toml
 # the smallest useful layer file: hillshade over a public collection
@@ -69,7 +79,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Pure Rust, no GDAL. Depends on sibling GeoLang crates `terrano-core` (raster kernels) and `projicio-core` (CRS transforms), tracked at master.
+Pure Rust, no GDAL. Depends on sibling GeoLang crates `terrano-core` (raster kernels), `projicio-core` (CRS transforms), `nubis-core` (point clouds) and `topoi-core` (vector geometry), all tracked at master.
 
 See [DESIGN.md](DESIGN.md) for the architecture and [CHANGELOG.md](CHANGELOG.md) for history.
 
