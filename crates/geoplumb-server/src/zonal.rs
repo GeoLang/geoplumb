@@ -216,7 +216,7 @@ pub async fn statistics(
     .await;
     match reduced {
         Ok(rows) => axum::Json(ZonalResponse { rows }).into_response(),
-        Err(refusal) => refusal,
+        Err(refusal) => *refusal,
     }
 }
 
@@ -295,7 +295,7 @@ pub async fn series(
                 .collect(),
         })
         .into_response(),
-        Err(refusal) => refusal,
+        Err(refusal) => *refusal,
     }
 }
 
@@ -318,7 +318,7 @@ fn slots_busy() -> Response {
 async fn offload<T: Send + 'static>(
     slot: OwnedSemaphorePermit,
     work: impl FnOnce() -> geoplumb::Result<T> + Send + 'static,
-) -> Result<T, Response> {
+) -> Result<T, Box<Response>> {
     let running = tokio::task::spawn_blocking(move || {
         // the slot goes back when the reduction ends, not when the caller
         // stops waiting for it: a timed-out reduction keeps running
@@ -326,18 +326,21 @@ async fn offload<T: Send + 'static>(
         work()
     });
     match tokio::time::timeout(REDUCTION_TIMEOUT, running).await {
-        Err(_) => Err(fail(
+        Err(_) => Err(Box::new(fail(
             StatusCode::GATEWAY_TIMEOUT,
             format!(
                 "the reduction outran the {} second limit and its result is dropped",
                 REDUCTION_TIMEOUT.as_secs()
             ),
-        )),
-        Ok(Err(_)) => Err(fail(
+        ))),
+        Ok(Err(_)) => Err(Box::new(fail(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the reduction did not finish".to_string(),
-        )),
-        Ok(Ok(Err(error))) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
+        ))),
+        Ok(Ok(Err(error))) => Err(Box::new(fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
+        ))),
         Ok(Ok(Ok(value))) => Ok(value),
     }
 }
@@ -689,7 +692,7 @@ mod tests {
         );
         let refusal = answer.expect_err("the work outran the deadline");
         assert_eq!(refusal.status(), StatusCode::GATEWAY_TIMEOUT);
-        let message = reason(refusal).await;
+        let message = reason(*refusal).await;
         assert!(message.contains("outran"), "{message}");
         assert_eq!(
             reductions.available_permits(),
