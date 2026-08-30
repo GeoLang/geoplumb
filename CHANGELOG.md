@@ -1,6 +1,9 @@
 # Changelog
 
-## 2026-08-13
+## 2026-08-30
+
+- every single-input raster transform the crate ships is now nameable in a layer file, taking `OpConfig` from four variants to nine: `focal` (`op` of mean, median, min or max, plus `radius`), `mask` (`band` and `valid_values`), `reclassify` (`classes` of `{ min, max, value }`, min inclusive and max exclusive), `unary` (`op` of `sqrt`, `abs`, `log`, or `{ add = c }` or `{ multiply = c }`) and `convolve` (a 3x3 `kernel`, plus a `scales` and `offsets` per band defaulting to one band unchanged), which the server builds as the three-transform raster to tensor, convolution, tensor to raster chain. What stays out of reach of a layer file is what needs a second input or another chunk kind: `Mosaic`, `Combine`, the vector and point sources, and the GeoTIFF encoder
+- a layer may name `gray = { min, max }`, the value range the png encoding stretches over, overriding the range its ops imply. `focal`, `mask`, `unary` and `convolve` keep the range of the op before them, and `reclassify` leaves class numbers no op range covers, so a layer whose ops end in one is a parse error until it names its own `gray`
 
 - composite reductions stop reading items a strip cannot use: a strip reads only the items whose footprint reaches its own rows, by the same footprint test the pull applies to the whole window, so strip time and pull time agree on an item, and a strip no item reaches comes back nodata without a read at all. `read_item` carries the same test before it opens an item's cogs, so any window that misses an item costs neither a reader open nor a decoded all-nodata chunk, on every path that reads an item. Values are unchanged: an item a strip misses only ever contributed nodata to those rows, and every reducer already skipped nodata
 

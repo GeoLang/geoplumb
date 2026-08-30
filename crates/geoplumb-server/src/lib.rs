@@ -21,7 +21,11 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use geoplumb::elements::{Aspect, BandMath, CogSrc, Hillshade, Reproject, Slope, StacSrc};
+use geoplumb::elements::algebra::AlgebraOp;
+use geoplumb::elements::{
+    Aspect, BandMath, CogSrc, Focal, Hillshade, MapAlgebra, QualityMask, Reproject, Slope, StacSrc,
+    TensorConv, ToRaster, ToTensor,
+};
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Crs, Engine, Graph, NodeId, Source, TimeInterval};
 
@@ -30,14 +34,6 @@ use config::{Config, LayerConfig, OpConfig, SourceConfig};
 /// past this a tile index stops fitting the zoom arithmetic, and no
 /// viewer asks for it
 const MAX_ZOOM: u8 = 24;
-
-/// the gray range png encoding stretches over when no bandmath op names
-/// one, hillshade's own range
-const DEFAULT_GRAY: (f64, f64) = (0.0, 255.0);
-/// slope is degrees from horizontal
-const SLOPE_GRAY: (f64, f64) = (0.0, 90.0);
-/// aspect is compass degrees
-const ASPECT_GRAY: (f64, f64) = (0.0, 360.0);
 
 /// disk tier size per layer, derived from the memory budget rather than
 /// given its own knob: the tier only exists when a disk dir is set
@@ -93,25 +89,48 @@ impl Layer {
     fn build(cfg: &LayerConfig, budget_bytes: usize, disk: Option<&Path>) -> Result<Layer, String> {
         let (source, info) = open_source(cfg)?;
         let mut graph = Graph::new();
+        let gray = cfg.gray_range()?;
         let mut node = graph.add_source(source);
-        let mut gray = DEFAULT_GRAY;
         for op in &cfg.ops {
             node = match op {
                 OpConfig::Hillshade { azimuth, altitude } => {
                     graph.add_transform(node, Box::new(Hillshade::new(*azimuth, *altitude)))
                 }
-                OpConfig::Bandmath { expr, min, max } => {
-                    gray = (*min, *max);
+                OpConfig::Bandmath { expr, .. } => {
                     let math = BandMath::new(expr).map_err(|e| e.to_string())?;
                     graph.add_transform(node, Box::new(math))
                 }
-                OpConfig::Slope => {
-                    gray = SLOPE_GRAY;
-                    graph.add_transform(node, Box::new(Slope))
+                OpConfig::Slope => graph.add_transform(node, Box::new(Slope)),
+                OpConfig::Aspect => graph.add_transform(node, Box::new(Aspect)),
+                OpConfig::Focal { op, radius } => {
+                    graph.add_transform(node, Box::new(Focal::new((*op).into(), *radius)))
                 }
-                OpConfig::Aspect => {
-                    gray = ASPECT_GRAY;
-                    graph.add_transform(node, Box::new(Aspect))
+                OpConfig::Mask { band, valid_values } => graph.add_transform(
+                    node,
+                    Box::new(QualityMask::new(*band, valid_values.clone())),
+                ),
+                OpConfig::Reclassify { classes } => {
+                    let ranges = classes.iter().map(|c| (c.min, c.max, c.value)).collect();
+                    let algebra = MapAlgebra::new(AlgebraOp::Reclassify(ranges));
+                    graph.add_transform(node, Box::new(algebra))
+                }
+                OpConfig::Unary { op } => {
+                    let algebra = MapAlgebra::new(AlgebraOp::Unary((*op).into()));
+                    graph.add_transform(node, Box::new(algebra))
+                }
+                OpConfig::Convolve {
+                    kernel,
+                    scales,
+                    offsets,
+                } => {
+                    let to_tensor = ToTensor {
+                        scales: scales.clone(),
+                        offsets: offsets.clone(),
+                    };
+                    let tensor = graph.add_transform(node, Box::new(to_tensor));
+                    let convolved =
+                        graph.add_transform(tensor, Box::new(TensorConv { kernel: *kernel }));
+                    graph.add_transform(convolved, Box::new(ToRaster))
                 }
             };
         }

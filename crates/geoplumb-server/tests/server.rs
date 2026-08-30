@@ -2,12 +2,13 @@
 //! built from a synthetic geotiff written at test time, so nothing here
 //! touches the network
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use geoplumb_server::config::{Config, OpConfig, SourceConfig};
+use geoplumb_server::config::{Config, FocalOpConfig, OpConfig, SourceConfig, UnaryOpConfig};
 use geoplumb_server::{Layer, parse_time, router};
 use terrano_core::{CogParams, Raster, write_cog};
 use tower::ServiceExt;
@@ -55,10 +56,17 @@ fn tile_of(z: u8, lon: f64, lat: f64) -> (u32, u32) {
     (x, y)
 }
 
-/// a one-layer file over a cog written into `dir`
-fn cog_layer_file(dir: &Path) -> String {
+/// writes the fixture into `dir` and gives back the path a layer file
+/// names it by
+fn write_dem(dir: &Path) -> String {
     let path = dir.join("dem.tif");
     std::fs::write(&path, dem_cog()).unwrap();
+    // windows temp paths hold `\U`, a unicode escape in a basic toml string
+    path.display().to_string().replace('\\', "/")
+}
+
+/// a one-layer file over a cog written into `dir`
+fn cog_layer_file(dir: &Path) -> String {
     format!(
         r#"
 [[layer]]
@@ -70,8 +78,7 @@ kind = "hillshade"
 azimuth = 315.0
 altitude = 45.0
 "#,
-        // windows temp paths hold `\U`, a unicode escape in a basic toml string
-        path.display().to_string().replace('\\', "/")
+        write_dem(dir)
     )
 }
 
@@ -94,9 +101,10 @@ async fn get(app: &Router, uri: &str) -> (StatusCode, Vec<u8>) {
     (status, body.to_vec())
 }
 
-/// pixels the png marks opaque, so an empty tile is distinguishable from
-/// one that actually rendered data
-fn opaque_pixels(bytes: &[u8]) -> usize {
+/// the gray value of every pixel the png marks opaque, so an empty tile
+/// is distinguishable from one that actually rendered data and two tiles
+/// are comparable pixel by pixel
+fn opaque_grays(bytes: &[u8]) -> Vec<u8> {
     let mut reader = png::Decoder::new(bytes).read_info().expect("a png");
     let mut buf = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).unwrap();
@@ -104,7 +112,12 @@ fn opaque_pixels(bytes: &[u8]) -> usize {
     buf[..info.buffer_size()]
         .chunks_exact(2)
         .filter(|px| px[1] == 255)
-        .count()
+        .map(|px| px[0])
+        .collect()
+}
+
+fn opaque_pixels(bytes: &[u8]) -> usize {
+    opaque_grays(bytes).len()
 }
 
 const FULL: &str = r#"
@@ -142,6 +155,96 @@ source = { kind = "cog", path = "/data/dem.tif" }
 kind = "aspect"
 "#;
 
+/// one layer per single-input raster op, each over the same cog, with the
+/// path filled in at test time. the dem is a smooth 300 to 700 surface and
+/// the tile the render test asks for holds roughly 310 to 393 of it, which
+/// is what the class break and every gray range here are picked against
+const EVERY_OP: &str = r#"
+[[layer]]
+name = "plain"
+source = { kind = "cog", path = "COG_PATH" }
+gray = { min = 300.0, max = 400.0 }
+
+[[layer]]
+name = "focal"
+source = { kind = "cog", path = "COG_PATH" }
+gray = { min = 300.0, max = 400.0 }
+
+[[layer.op]]
+kind = "focal"
+op = "mean"
+radius = 2
+
+[[layer]]
+name = "reclassified"
+source = { kind = "cog", path = "COG_PATH" }
+gray = { min = 0.0, max = 3.0 }
+
+[[layer.op]]
+kind = "reclassify"
+classes = [
+    { min = 0.0, max = 350.0, value = 1.0 },
+    { min = 350.0, max = 1000.0, value = 2.0 },
+]
+
+[[layer]]
+name = "masked"
+source = { kind = "cog", path = "COG_PATH" }
+gray = { min = 0.0, max = 3.0 }
+
+[[layer.op]]
+kind = "reclassify"
+classes = [
+    { min = 0.0, max = 350.0, value = 1.0 },
+    { min = 350.0, max = 1000.0, value = 2.0 },
+]
+
+[[layer.op]]
+kind = "mask"
+band = 0
+valid_values = [1.0]
+
+[[layer]]
+name = "rooted"
+source = { kind = "cog", path = "COG_PATH" }
+gray = { min = 17.0, max = 20.0 }
+
+[[layer.op]]
+kind = "unary"
+op = "sqrt"
+
+[[layer]]
+name = "convolved"
+source = { kind = "cog", path = "COG_PATH" }
+gray = { min = 300.0, max = 400.0 }
+
+[[layer.op]]
+kind = "convolve"
+kernel = [
+    [0.0625, 0.125, 0.0625],
+    [0.125, 0.25, 0.125],
+    [0.0625, 0.125, 0.0625],
+]
+"#;
+
+const EVERY_OP_LAYER: [&str; 6] = [
+    "plain",
+    "focal",
+    "reclassified",
+    "masked",
+    "rooted",
+    "convolved",
+];
+
+/// class 1 and class 2 stretched over the `gray = { min = 0.0, max = 3.0 }`
+/// the reclassified layers name
+const CLASS_ONE_GRAY: u8 = 85;
+const CLASS_TWO_GRAY: u8 = 170;
+
+fn every_op_layer_file(dir: &Path) -> String {
+    EVERY_OP.replace("COG_PATH", &write_dem(dir))
+}
+
 #[test]
 fn config_parses_sources_ops_and_their_order() {
     let config = Config::parse(FULL).unwrap();
@@ -175,6 +278,127 @@ fn config_parses_sources_ops_and_their_order() {
     assert!(matches!(dem.ops[..], [OpConfig::Hillshade { .. }]));
     assert!(matches!(config.layers[2].ops[..], [OpConfig::Slope]));
     assert!(matches!(config.layers[3].ops[..], [OpConfig::Aspect]));
+}
+
+#[test]
+fn config_parses_every_single_input_op() {
+    let config = Config::parse(EVERY_OP).unwrap();
+    let named = |name: &str| {
+        config
+            .layers
+            .iter()
+            .find(|l| l.name == name)
+            .unwrap_or_else(|| panic!("no layer {name}"))
+    };
+    assert_eq!(config.layers.len(), EVERY_OP_LAYER.len());
+    assert!(named("plain").ops.is_empty());
+
+    match &named("focal").ops[..] {
+        [OpConfig::Focal { op, radius }] => {
+            assert!(matches!(op, FocalOpConfig::Mean));
+            assert_eq!(*radius, 2);
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    match &named("reclassified").ops[..] {
+        [OpConfig::Reclassify { classes }] => {
+            assert_eq!(classes.len(), 2);
+            assert_eq!(
+                (classes[0].min, classes[0].max, classes[0].value),
+                (0.0, 350.0, 1.0)
+            );
+            assert_eq!(
+                (classes[1].min, classes[1].max, classes[1].value),
+                (350.0, 1000.0, 2.0)
+            );
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    match &named("masked").ops[..] {
+        [
+            OpConfig::Reclassify { .. },
+            OpConfig::Mask { band, valid_values },
+        ] => {
+            assert_eq!(*band, 0);
+            assert_eq!(valid_values, &[1.0]);
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    match &named("rooted").ops[..] {
+        [OpConfig::Unary { op }] => assert!(matches!(op, UnaryOpConfig::Sqrt)),
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    match &named("convolved").ops[..] {
+        [
+            OpConfig::Convolve {
+                kernel,
+                scales,
+                offsets,
+            },
+        ] => {
+            assert_eq!(kernel[1][1], 0.25);
+            assert_eq!(kernel[0], [0.0625, 0.125, 0.0625]);
+            // a convolve naming neither runs one channel through unchanged
+            assert_eq!(scales, &[1.0]);
+            assert_eq!(offsets, &[0.0]);
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    let gray = named("plain").gray.expect("a gray range");
+    assert_eq!((gray.min, gray.max), (300.0, 400.0));
+}
+
+#[test]
+fn the_shipped_example_layer_file_parses() {
+    let text = include_str!("../examples/layers.toml");
+    Config::parse(text).expect("the file the readme tells people to copy");
+}
+
+#[test]
+fn a_unary_op_takes_its_constant_where_it_has_one() {
+    let text = r#"
+[[layer]]
+name = "doubled"
+source = { kind = "cog", path = "/a.tif" }
+
+[[layer.op]]
+kind = "unary"
+op = { multiply = 2.0 }
+"#;
+    let config = Config::parse(text).unwrap();
+    match &config.layers[0].ops[..] {
+        [OpConfig::Unary { op }] => assert!(matches!(op, UnaryOpConfig::Multiply(2.0))),
+        other => panic!("unexpected ops: {other:?}"),
+    }
+}
+
+#[test]
+fn a_reclassify_layer_has_to_name_its_own_gray_range() {
+    let text = r#"
+[[layer]]
+name = "classes"
+source = { kind = "cog", path = "/a.tif" }
+
+[[layer.op]]
+kind = "reclassify"
+classes = [{ min = 0.0, max = 350.0, value = 1.0 }]
+"#;
+    let error = Config::parse(text).expect_err("class values have no range to stretch over");
+    assert!(
+        error.contains("gray"),
+        "the error should name the field that is missing: {error}"
+    );
+
+    let with_range = text.replace(
+        "source = { kind = \"cog\", path = \"/a.tif\" }",
+        "source = { kind = \"cog\", path = \"/a.tif\" }\ngray = { min = 0.0, max = 3.0 }",
+    );
+    Config::parse(&with_range).expect("a named gray range makes it servable");
 }
 
 #[test]
@@ -336,6 +560,70 @@ async fn a_tile_renders_at_any_time_and_a_bad_one_is_rejected() {
         message.contains("t parameter"),
         "a rejection should name the parameter: {message}"
     );
+}
+
+#[tokio::test]
+async fn every_op_renders_a_tile_and_the_pixels_show_it_ran() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&every_op_layer_file(dir.path()));
+    let (x, y) = tile_of(12, 7.3, 46.8);
+
+    let mut grays: HashMap<&str, Vec<u8>> = HashMap::new();
+    for name in EVERY_OP_LAYER {
+        let (status, png) = get(&app, &format!("/tiles/{name}/12/{x}/{y}.png")).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "{name}");
+        let opaque = opaque_grays(&png);
+        assert!(!opaque.is_empty(), "{name} rendered nothing but nodata");
+        grays.insert(name, opaque);
+    }
+
+    let distinct = |name: &str| grays[name].iter().collect::<HashSet<_>>().len();
+    assert!(
+        distinct("plain") > 10,
+        "the untransformed dem is a smooth ramp, not {} values",
+        distinct("plain")
+    );
+
+    // reclassify collapses that ramp onto its two class values, and only
+    // the bilinear reprojection across a class boundary lands between them
+    let classed = grays["reclassified"]
+        .iter()
+        .filter(|g| **g == CLASS_ONE_GRAY || **g == CLASS_TWO_GRAY)
+        .count();
+    assert!(
+        grays["reclassified"].contains(&CLASS_ONE_GRAY)
+            && grays["reclassified"].contains(&CLASS_TWO_GRAY),
+        "both classes should reach the tile"
+    );
+    assert!(
+        classed * 10 > grays["reclassified"].len() * 9,
+        "only class boundaries should sit off a class value, {classed} of {} did not",
+        grays["reclassified"].len()
+    );
+
+    // the mask keeps class one and drops class two, so it renders a strict
+    // subset of the same layer without it
+    assert!(
+        grays["masked"].len() < grays["reclassified"].len(),
+        "the mask dropped nothing"
+    );
+    assert!(
+        !grays["masked"].contains(&CLASS_TWO_GRAY),
+        "class two survived the mask"
+    );
+
+    // sqrt of a 300 to 400 dem lands in the 17 to 20 range the layer
+    // stretches over, so the tile is neither all black nor all white
+    assert!(distinct("rooted") > 10);
+    assert_ne!(grays["rooted"], grays["plain"]);
+
+    // both are smoothings of the dem, so they stay in its range and differ
+    // from it pixel by pixel
+    assert_ne!(grays["focal"], grays["plain"]);
+    assert_ne!(grays["convolved"], grays["plain"]);
+    assert_eq!(grays["focal"].len(), grays["plain"].len());
+    assert_eq!(grays["convolved"].len(), grays["plain"].len());
 }
 
 #[tokio::test]

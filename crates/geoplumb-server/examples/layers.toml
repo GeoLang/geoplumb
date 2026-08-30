@@ -1,6 +1,7 @@
 # geoplumb-server layers. copy this file, edit it, and point
 # GEOPLUMB_LAYERS at it. every layer ends reprojected to web mercator and
-# encoded as grayscale png, so only the source and the ops go here.
+# encoded as grayscale png, so only the source, the ops and the gray range
+# the encoding stretches over go here.
 
 # hillshade over a public copernicus dem collection. bbox is the anchor
 # the grid and crs are read from, not a coverage limit: tiles past it
@@ -40,3 +41,78 @@ source = { kind = "cog", path = "/data/dem.tif" }
 kind = "hillshade"
 azimuth = 315.0
 altitude = 45.0
+
+# a 5x5 mean over the dem before hillshading it, so the shading follows
+# the landform rather than the noise. the window is 2 * radius + 1 cells.
+[[layer]]
+name = "local-dem-smoothed"
+source = { kind = "cog", path = "/data/dem.tif" }
+
+[[layer.op]]
+kind = "focal"
+op = "mean"
+radius = 2
+
+[[layer.op]]
+kind = "hillshade"
+azimuth = 315.0
+altitude = 45.0
+
+# sentinel-2 red kept only where the scl band holds a clear-ground code.
+# band 1 is the second asset, and a pixel of any other code renders
+# transparent. band 0, the red one, is what the png encodes.
+[[layer]]
+name = "s2-red-clear"
+source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "sentinel-2-l2a", assets = [
+    "red",
+    "scl",
+], bbox = [7.0, 46.3, 8.0, 46.9], datetime = "2025-06-01T00:00:00Z/2025-09-01T00:00:00Z" }
+gray = { min = 0.0, max = 3000.0 }
+
+[[layer.op]]
+kind = "mask"
+band = 1
+valid_values = [4.0, 5.0, 6.0]
+
+# elevation bands. `min` is inclusive, `max` exclusive, and an elevation
+# in no class renders transparent. class numbers are not a measurement, so
+# this layer has to say what range the png stretches over.
+[[layer]]
+name = "local-dem-bands"
+source = { kind = "cog", path = "/data/dem.tif" }
+gray = { min = 0.0, max = 4.0 }
+
+[[layer.op]]
+kind = "reclassify"
+classes = [
+    { min = -500.0, max = 1000.0, value = 1.0 },
+    { min = 1000.0, max = 2000.0, value = 2.0 },
+    { min = 2000.0, max = 9000.0, value = 3.0 },
+]
+
+# metres to feet. `sqrt`, `abs` and `log` take no constant, `add` and
+# `multiply` take theirs as `op = { multiply = 3.28084 }`.
+[[layer]]
+name = "local-dem-feet"
+source = { kind = "cog", path = "/data/dem.tif" }
+gray = { min = 0.0, max = 15000.0 }
+
+[[layer.op]]
+kind = "unary"
+op = { multiply = 3.28084 }
+
+# a 3x3 gaussian blur, run as raster to tensor, convolution, tensor back
+# to raster. one scale and one offset per band, defaulting to a single
+# band passed through unchanged.
+[[layer]]
+name = "local-dem-blurred"
+source = { kind = "cog", path = "/data/dem.tif" }
+gray = { min = 0.0, max = 4000.0 }
+
+[[layer.op]]
+kind = "convolve"
+kernel = [
+    [0.0625, 0.125, 0.0625],
+    [0.125, 0.25, 0.125],
+    [0.0625, 0.125, 0.0625],
+]
