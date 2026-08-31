@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-31
+
+- fan-in from a layer file: a layer names either one `source` as before, or a list of `input` entries, each a source plus its own optional op chain, joined by `fanin = { kind = "mosaic" }` or `fanin = { kind = "combine", op = "subtract" }` (`add`, `subtract`, `multiply`, `divide`, `min` and `max`), with the layer's own ops running after the join. Naming both a source and inputs, a fanin without inputs, a combine with other than two inputs or a mosaic with fewer than two are parse errors naming the layer, so a wiring mistake never reaches the caps solver. `/layers` publishes a fan-in layer as `source: "composite"` with no collection of its own, taking its default datetime and temporal extent from the first stac input
+- `geojson` as a layer source, a feature collection read whole at startup and served in lon/lat per rfc 7946, with `rasterize` as the tenth `OpConfig` variant, burning `{ constant = 1.0 }` or `{ property = "depth" }` per feature. A geojson source with no rasterize in the chain over it is a parse error naming the layer and the input, rather than a caps failure at startup or a broken tile
+- the gray range a fan-in layer stretches over starts at nothing: its input chains do not carry one across the join, so it needs an op after the join that fixes one, or its own `gray = { min, max }`. `rasterize` resets the range the same way `reclassify` does, burned values being no more of a measurement than class numbers
+
 ## 2026-08-30
 
 - every single-input raster transform the crate ships is now nameable in a layer file, taking `OpConfig` from four variants to nine: `focal` (`op` of mean, median, min or max, plus `radius`), `mask` (`band` and `valid_values`), `reclassify` (`classes` of `{ min, max, value }`, min inclusive and max exclusive), `unary` (`op` of `sqrt`, `abs`, `log`, or `{ add = c }` or `{ multiply = c }`) and `convolve` (a 3x3 `kernel`, plus a `scales` and `offsets` per band defaulting to one band unchanged), which the server builds as the three-transform raster to tensor, convolution, tensor to raster chain. What stays out of reach of a layer file is what needs a second input or another chunk kind: `Mosaic`, `Combine`, the vector and point sources, and the GeoTIFF encoder

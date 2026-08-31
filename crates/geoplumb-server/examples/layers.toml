@@ -1,6 +1,6 @@
 # geoplumb-server layers. copy this file, edit it, and point
 # GEOPLUMB_LAYERS at it. every layer ends reprojected to web mercator and
-# encoded as grayscale png, so only the source, the ops and the gray range
+# encoded as grayscale png, so only the sources, the ops and the gray range
 # the encoding stretches over go here.
 
 # hillshade over a public copernicus dem collection. bbox is the anchor
@@ -116,3 +116,65 @@ kernel = [
     [0.125, 0.25, 0.125],
     [0.0625, 0.125, 0.0625],
 ]
+
+# two dem tiles stitched into one layer. a fan-in layer names `input`
+# entries instead of a `source`, each with its own optional chain, and a
+# `fanin` saying how they join. mosaic takes the first input with a value
+# at a pixel, so wiring order is priority order.
+[[layer]]
+name = "dem-mosaic"
+fanin = { kind = "mosaic" }
+gray = { min = 0.0, max = 4000.0 }
+
+[[layer.input]]
+source = { kind = "cog", path = "/data/dem-north.tif" }
+
+[[layer.input]]
+source = { kind = "cog", path = "/data/dem-south.tif" }
+
+# how much a summer lost against the one before it, ndvi per year and the
+# later minus the earlier. combine takes exactly two inputs and runs a
+# per-cell `add`, `subtract`, `multiply`, `divide`, `min` or `max` across
+# them. nothing after the join fixes a range, so the layer names its own.
+[[layer]]
+name = "ndvi-change"
+fanin = { kind = "combine", op = "subtract" }
+gray = { min = -1.0, max = 1.0 }
+
+[[layer.input]]
+source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "sentinel-2-l2a", assets = [
+    "red",
+    "nir",
+], bbox = [7.0, 46.3, 8.0, 46.9], datetime = "2025-06-01T00:00:00Z/2025-09-01T00:00:00Z", composite = "median" }
+
+[[layer.input.op]]
+kind = "bandmath"
+expr = "(b1 - b0) / (b1 + b0)"
+min = -1.0
+max = 1.0
+
+[[layer.input]]
+source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "sentinel-2-l2a", assets = [
+    "red",
+    "nir",
+], bbox = [7.0, 46.3, 8.0, 46.9], datetime = "2024-06-01T00:00:00Z/2024-09-01T00:00:00Z", composite = "median" }
+
+[[layer.input.op]]
+kind = "bandmath"
+expr = "(b1 - b0) / (b1 + b0)"
+min = -1.0
+max = 1.0
+
+# a local geojson file burned to a raster. the collection is read whole at
+# startup and its coordinates are lon/lat per rfc 7946. features are not
+# pixels, so the chain needs a `rasterize`: it burns `{ constant = 1.0 }`
+# for every feature, or a numeric property per feature as below, skipping
+# the features without it.
+[[layer]]
+name = "parcels"
+source = { kind = "geojson", path = "/data/parcels.geojson" }
+gray = { min = 0.0, max = 100.0 }
+
+[[layer.op]]
+kind = "rasterize"
+burn = { property = "depth" }

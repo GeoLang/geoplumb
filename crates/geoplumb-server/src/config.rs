@@ -1,13 +1,14 @@
-//! the layer file: one entry per served layer, a source plus an ordered
-//! op pipeline. every layer ends reprojected to web mercator and encoded
-//! as grayscale png, so the file says what varies and nothing else
+//! the layer file: one entry per served layer, either a source plus an
+//! ordered op pipeline or several inputs joined by a fanin. every layer
+//! ends reprojected to web mercator and encoded as grayscale png, so the
+//! file says what varies and nothing else
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use geoplumb::elements::{Composite, FocalOp, StacSearch};
+use geoplumb::elements::{Burn, Composite, FocalOp, StacSearch};
 use serde::Deserialize;
-use terrano_core::UnaryOp;
+use terrano_core::{BinaryOp, UnaryOp};
 
 /// the gray range png encoding stretches over when neither an op nor the
 /// layer names one, hillshade's own range
@@ -29,12 +30,59 @@ pub struct Config {
 pub struct LayerConfig {
     /// url path segment the tiles are served under
     pub name: String,
-    pub source: SourceConfig,
+    /// the one source a linear layer reads, against `input` plus `fanin`
+    /// for a layer joining several
+    pub source: Option<SourceConfig>,
+    #[serde(default, rename = "input")]
+    pub inputs: Vec<InputConfig>,
+    pub fanin: Option<FaninConfig>,
+    /// the chain over the source, or the chain after the fanin where the
+    /// layer has one
     #[serde(default, rename = "op")]
     pub ops: Vec<OpConfig>,
     /// the value range the png encoding stretches over, overriding the one
     /// the ops imply, `gray = { min = 0.0, max = 3.0 }`
     pub gray: Option<GrayConfig>,
+}
+
+/// one input of a fan-in layer: a source and the chain over it, the pair
+/// a linear layer names at the top level
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputConfig {
+    pub source: SourceConfig,
+    #[serde(default, rename = "op")]
+    pub ops: Vec<OpConfig>,
+}
+
+/// what a layer reads: one source, or several inputs and the element
+/// joining them
+pub enum LayerShape<'a> {
+    Single(&'a SourceConfig),
+    Fanin(&'a FaninConfig, &'a [InputConfig]),
+}
+
+/// how a fan-in layer joins its inputs. `mosaic` takes the first input
+/// with a value at a pixel, `combine` runs a per-cell binary op across
+/// exactly two
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum FaninConfig {
+    Mosaic,
+    Combine { op: BinaryOpConfig },
+}
+
+/// the per-cell operation a `combine` runs over its two inputs, none of
+/// them taking a constant
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BinaryOpConfig {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Min,
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -61,6 +109,11 @@ pub enum SourceConfig {
         composite: Option<CompositeConfig>,
     },
     Cog {
+        path: PathBuf,
+    },
+    /// a feature collection read whole at startup, lon/lat per rfc 7946.
+    /// features are not pixels, so the chain over it needs a `rasterize`
+    Geojson {
         path: PathBuf,
     },
 }
@@ -111,6 +164,9 @@ pub enum OpConfig {
     Unary {
         op: UnaryOpConfig,
     },
+    Rasterize {
+        burn: BurnConfig,
+    },
     Convolve {
         /// the 3x3 taps, rows top to bottom
         kernel: [[f32; 3]; 3],
@@ -132,6 +188,17 @@ pub struct ClassRange {
     pub min: f64,
     pub max: f64,
     pub value: f64,
+}
+
+/// what a `rasterize` burns into every cell a feature covers: a constant
+/// for every feature, `burn = { constant = 1.0 }`, or a numeric property
+/// read per feature, `burn = { property = "depth" }`, features without it
+/// being skipped
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BurnConfig {
+    Constant(f64),
+    Property(String),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -188,6 +255,28 @@ impl From<UnaryOpConfig> for UnaryOp {
     }
 }
 
+impl From<BinaryOpConfig> for BinaryOp {
+    fn from(op: BinaryOpConfig) -> BinaryOp {
+        match op {
+            BinaryOpConfig::Add => BinaryOp::Add,
+            BinaryOpConfig::Subtract => BinaryOp::Subtract,
+            BinaryOpConfig::Multiply => BinaryOp::Multiply,
+            BinaryOpConfig::Divide => BinaryOp::Divide,
+            BinaryOpConfig::Min => BinaryOp::Min,
+            BinaryOpConfig::Max => BinaryOp::Max,
+        }
+    }
+}
+
+impl From<&BurnConfig> for Burn {
+    fn from(burn: &BurnConfig) -> Burn {
+        match burn {
+            BurnConfig::Constant(value) => Burn::Constant(*value),
+            BurnConfig::Property(name) => Burn::Property(name.clone()),
+        }
+    }
+}
+
 impl From<CompositeConfig> for Composite {
     fn from(c: CompositeConfig) -> Composite {
         match c {
@@ -222,50 +311,103 @@ impl Config {
             if !seen.insert(&layer.name) {
                 return Err(format!("two layers are named {}", layer.name));
             }
-            if let SourceConfig::Stac { assets, .. } = &layer.source {
-                if assets.is_empty() {
-                    return Err(format!("layer {}: stac source names no assets", layer.name));
+            let named = |e: String| format!("layer {}: {e}", layer.name);
+            match layer.shape().map_err(named)? {
+                LayerShape::Single(source) => {
+                    check_branch(source, &layer.ops).map_err(named)?;
                 }
-            }
-            layer
-                .gray_range()
-                .map_err(|e| format!("layer {}: {e}", layer.name))?;
-            for op in &layer.ops {
-                if let OpConfig::Convolve {
-                    scales, offsets, ..
-                } = op
-                {
-                    if scales.len() != offsets.len() {
-                        return Err(format!(
-                            "layer {}: convolve names {} scales against {} offsets",
-                            layer.name,
-                            scales.len(),
-                            offsets.len()
-                        ));
+                LayerShape::Fanin(_, inputs) => {
+                    for (i, input) in inputs.iter().enumerate() {
+                        check_branch(&input.source, &input.ops)
+                            .map_err(|e| named(format!("input {}: {e}", i + 1)))?;
                     }
+                    check_ops(&layer.ops).map_err(named)?;
                 }
             }
+            layer.gray_range().map_err(named)?;
         }
         Ok(config)
     }
 }
 
+/// what one source and the chain over it have to satisfy before the layer
+/// can serve tiles
+fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
+    match source {
+        SourceConfig::Stac { assets, .. } if assets.is_empty() => {
+            return Err("stac source names no assets".into());
+        }
+        SourceConfig::Geojson { .. }
+            if !ops
+                .iter()
+                .any(|op| matches!(op, OpConfig::Rasterize { .. })) =>
+        {
+            return Err("the geojson source has no rasterize op, so the chain \
+                        hands features to a png encoder that wants pixels"
+                .into());
+        }
+        _ => {}
+    }
+    check_ops(ops)
+}
+
+fn check_ops(ops: &[OpConfig]) -> Result<(), String> {
+    for op in ops {
+        if let OpConfig::Convolve {
+            scales, offsets, ..
+        } = op
+        {
+            if scales.len() != offsets.len() {
+                return Err(format!(
+                    "convolve names {} scales against {} offsets",
+                    scales.len(),
+                    offsets.len()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl LayerConfig {
+    /// the layer's source side, or what the file got wrong naming it
+    pub fn shape(&self) -> Result<LayerShape<'_>, String> {
+        match (&self.source, &self.fanin) {
+            (Some(_), Some(_)) => {
+                Err("names a fanin beside a source, a fanin joins `input` entries".into())
+            }
+            (Some(_), None) if !self.inputs.is_empty() => {
+                Err("names both a source and inputs, a layer takes one or the other".into())
+            }
+            (Some(source), None) => Ok(LayerShape::Single(source)),
+            (None, Some(_)) if self.inputs.is_empty() => {
+                Err("names a fanin with no inputs to join".into())
+            }
+            (None, Some(fanin)) => {
+                fanin.check_input_count(self.inputs.len())?;
+                Ok(LayerShape::Fanin(fanin, &self.inputs))
+            }
+            (None, None) => Err("names neither a source nor inputs".into()),
+        }
+    }
+
     /// the value range the png encoding stretches over: the layer's own
     /// `gray` where it names one, else the range of the last op that fixes
-    /// one. a reclassify leaves class numbers, which no op range covers,
-    /// so from there on only the layer can say what to stretch over
+    /// one. a reclassify leaves class numbers and a rasterize leaves burned
+    /// values, which no op range covers, so from there on only the layer
+    /// can say what to stretch over. a fan-in layer starts with no range at
+    /// all, the input chains not carrying one across the join
     pub fn gray_range(&self) -> Result<(f64, f64), String> {
         if let Some(gray) = self.gray {
             return Ok((gray.min, gray.max));
         }
-        let mut range = Some(DEFAULT_GRAY);
+        let mut range = self.source.as_ref().map(|_| DEFAULT_GRAY);
         for op in &self.ops {
             range = match op {
                 OpConfig::Bandmath { min, max, .. } => Some((*min, *max)),
                 OpConfig::Slope => Some(SLOPE_GRAY),
                 OpConfig::Aspect => Some(ASPECT_GRAY),
-                OpConfig::Reclassify { .. } => None,
+                OpConfig::Reclassify { .. } | OpConfig::Rasterize { .. } => None,
                 OpConfig::Hillshade { .. }
                 | OpConfig::Focal { .. }
                 | OpConfig::Mask { .. }
@@ -273,11 +415,28 @@ impl LayerConfig {
                 | OpConfig::Convolve { .. } => range,
             };
         }
-        range.ok_or_else(|| {
-            "the ops end in reclassify class values, so the layer needs its own \
-             gray = { min = .., max = .. }"
-                .into()
+        range.ok_or_else(|| match self.source {
+            Some(_) => "the ops end in values no op range covers, so the layer needs its own \
+                        gray = { min = .., max = .. }"
+                .into(),
+            None => "a fan-in layer takes no range from its inputs, so it needs its own \
+                     gray = { min = .., max = .. } unless an op after the fanin fixes one"
+                .to_string(),
         })
+    }
+}
+
+impl FaninConfig {
+    fn check_input_count(&self, count: usize) -> Result<(), String> {
+        match self {
+            FaninConfig::Mosaic if count < 2 => Err(format!(
+                "mosaic joins two or more inputs, the layer names {count}"
+            )),
+            FaninConfig::Combine { .. } if count != 2 => Err(format!(
+                "combine joins exactly two inputs, the layer names {count}"
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -285,7 +444,7 @@ impl SourceConfig {
     /// the search a stac layer opens with, `None` for any other kind
     pub fn stac_search(&self) -> Option<StacSearch> {
         match self {
-            SourceConfig::Cog { .. } => None,
+            SourceConfig::Cog { .. } | SourceConfig::Geojson { .. } => None,
             SourceConfig::Stac {
                 api,
                 collection,

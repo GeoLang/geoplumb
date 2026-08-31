@@ -23,13 +23,13 @@ use tokio::sync::Semaphore;
 
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::{
-    Aspect, BandMath, CogSrc, Focal, Hillshade, MapAlgebra, QualityMask, Reproject, Slope, StacSrc,
-    TensorConv, ToRaster, ToTensor,
+    Aspect, BandMath, CogSrc, Combine, Focal, Hillshade, MapAlgebra, Mosaic, QualityMask,
+    Rasterize, Reproject, Slope, StacSrc, TensorConv, ToRaster, ToTensor, VecSrc,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Crs, Engine, Graph, NodeId, Source, TimeInterval};
 
-use config::{Config, LayerConfig, OpConfig, SourceConfig};
+use config::{Config, FaninConfig, LayerConfig, LayerShape, OpConfig, SourceConfig};
 
 /// past this a tile index stops fitting the zoom arithmetic, and no
 /// viewer asks for it
@@ -52,7 +52,7 @@ pub struct Layer {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerInfo {
     pub name: String,
-    /// `stac` or `cog`
+    /// `stac`, `cog`, `geojson`, or `composite` for a fan-in layer
     pub source: &'static str,
     pub collection: Option<String>,
     /// the interval pulls take when they name none
@@ -87,53 +87,32 @@ impl Layer {
     }
 
     fn build(cfg: &LayerConfig, budget_bytes: usize, disk: Option<&Path>) -> Result<Layer, String> {
-        let (source, info) = open_source(cfg)?;
         let mut graph = Graph::new();
         let gray = cfg.gray_range()?;
-        let mut node = graph.add_source(source);
-        for op in &cfg.ops {
-            node = match op {
-                OpConfig::Hillshade { azimuth, altitude } => {
-                    graph.add_transform(node, Box::new(Hillshade::new(*azimuth, *altitude)))
+        let (node, info) = match cfg.shape()? {
+            LayerShape::Single(source) => {
+                let (source, info) = open_source(&cfg.name, source)?;
+                (graph.add_source(source), info)
+            }
+            LayerShape::Fanin(fanin, inputs) => {
+                let mut tips = Vec::with_capacity(inputs.len());
+                let mut infos = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let (source, info) = open_source(&cfg.name, &input.source)?;
+                    let head = graph.add_source(source);
+                    tips.push(add_ops(&mut graph, head, &input.ops)?);
+                    infos.push(info);
                 }
-                OpConfig::Bandmath { expr, .. } => {
-                    let math = BandMath::new(expr).map_err(|e| e.to_string())?;
-                    graph.add_transform(node, Box::new(math))
-                }
-                OpConfig::Slope => graph.add_transform(node, Box::new(Slope)),
-                OpConfig::Aspect => graph.add_transform(node, Box::new(Aspect)),
-                OpConfig::Focal { op, radius } => {
-                    graph.add_transform(node, Box::new(Focal::new((*op).into(), *radius)))
-                }
-                OpConfig::Mask { band, valid_values } => graph.add_transform(
-                    node,
-                    Box::new(QualityMask::new(*band, valid_values.clone())),
-                ),
-                OpConfig::Reclassify { classes } => {
-                    let ranges = classes.iter().map(|c| (c.min, c.max, c.value)).collect();
-                    let algebra = MapAlgebra::new(AlgebraOp::Reclassify(ranges));
-                    graph.add_transform(node, Box::new(algebra))
-                }
-                OpConfig::Unary { op } => {
-                    let algebra = MapAlgebra::new(AlgebraOp::Unary((*op).into()));
-                    graph.add_transform(node, Box::new(algebra))
-                }
-                OpConfig::Convolve {
-                    kernel,
-                    scales,
-                    offsets,
-                } => {
-                    let to_tensor = ToTensor {
-                        scales: scales.clone(),
-                        offsets: offsets.clone(),
-                    };
-                    let tensor = graph.add_transform(node, Box::new(to_tensor));
-                    let convolved =
-                        graph.add_transform(tensor, Box::new(TensorConv { kernel: *kernel }));
-                    graph.add_transform(convolved, Box::new(ToRaster))
-                }
-            };
-        }
+                let joined = match fanin {
+                    FaninConfig::Mosaic => graph.add_fanin(&tips, Box::new(Mosaic)),
+                    FaninConfig::Combine { op } => {
+                        graph.add_fanin(&tips, Box::new(Combine::new((*op).into())))
+                    }
+                };
+                (joined, composite_info(&cfg.name, infos))
+            }
+        };
+        let node = add_ops(&mut graph, node, &cfg.ops)?;
         let node = graph.add_transform(node, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
         let engine = match disk {
             None => Engine::new(graph, budget_bytes),
@@ -155,9 +134,75 @@ impl Layer {
     }
 }
 
-fn open_source(cfg: &LayerConfig) -> Result<(Box<dyn Source>, LayerInfo), String> {
-    let name = cfg.name.clone();
-    match &cfg.source {
+/// one op chain over `node`, the translation a layer's own ops and a
+/// fan-in input's both take
+fn add_ops(graph: &mut Graph, node: NodeId, ops: &[OpConfig]) -> Result<NodeId, String> {
+    let mut node = node;
+    for op in ops {
+        node = match op {
+            OpConfig::Hillshade { azimuth, altitude } => {
+                graph.add_transform(node, Box::new(Hillshade::new(*azimuth, *altitude)))
+            }
+            OpConfig::Bandmath { expr, .. } => {
+                let math = BandMath::new(expr).map_err(|e| e.to_string())?;
+                graph.add_transform(node, Box::new(math))
+            }
+            OpConfig::Slope => graph.add_transform(node, Box::new(Slope)),
+            OpConfig::Aspect => graph.add_transform(node, Box::new(Aspect)),
+            OpConfig::Focal { op, radius } => {
+                graph.add_transform(node, Box::new(Focal::new((*op).into(), *radius)))
+            }
+            OpConfig::Mask { band, valid_values } => graph.add_transform(
+                node,
+                Box::new(QualityMask::new(*band, valid_values.clone())),
+            ),
+            OpConfig::Reclassify { classes } => {
+                let ranges = classes.iter().map(|c| (c.min, c.max, c.value)).collect();
+                let algebra = MapAlgebra::new(AlgebraOp::Reclassify(ranges));
+                graph.add_transform(node, Box::new(algebra))
+            }
+            OpConfig::Unary { op } => {
+                let algebra = MapAlgebra::new(AlgebraOp::Unary((*op).into()));
+                graph.add_transform(node, Box::new(algebra))
+            }
+            OpConfig::Rasterize { burn } => {
+                graph.add_transform(node, Box::new(Rasterize { burn: burn.into() }))
+            }
+            OpConfig::Convolve {
+                kernel,
+                scales,
+                offsets,
+            } => {
+                let to_tensor = ToTensor {
+                    scales: scales.clone(),
+                    offsets: offsets.clone(),
+                };
+                let tensor = graph.add_transform(node, Box::new(to_tensor));
+                let convolved =
+                    graph.add_transform(tensor, Box::new(TensorConv { kernel: *kernel }));
+                graph.add_transform(convolved, Box::new(ToRaster))
+            }
+        };
+    }
+    Ok(node)
+}
+
+/// what `/layers` publishes about a fan-in layer: no collection of its
+/// own, and the time fields of the first stac input where it has one
+fn composite_info(name: &str, inputs: Vec<LayerInfo>) -> LayerInfo {
+    let stac = inputs.into_iter().find(|i| i.source == "stac");
+    LayerInfo {
+        name: name.to_string(),
+        source: "composite",
+        collection: None,
+        default_datetime: stac.as_ref().and_then(|i| i.default_datetime.clone()),
+        temporal_extent: stac.and_then(|i| i.temporal_extent),
+    }
+}
+
+fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, LayerInfo), String> {
+    let name = layer.to_string();
+    match source {
         SourceConfig::Cog { path } => {
             let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
             let src = CogSrc::open(file).map_err(|e| e.to_string())?;
@@ -172,16 +217,29 @@ fn open_source(cfg: &LayerConfig) -> Result<(Box<dyn Source>, LayerInfo), String
                 },
             ))
         }
+        SourceConfig::Geojson { path } => {
+            let text =
+                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            // rfc 7946 puts geojson coordinates in lon/lat
+            let src = VecSrc::from_geojson(&text, Crs::WGS84).map_err(|e| e.to_string())?;
+            Ok((
+                Box::new(src),
+                LayerInfo {
+                    name,
+                    source: "geojson",
+                    collection: None,
+                    default_datetime: None,
+                    temporal_extent: None,
+                },
+            ))
+        }
         SourceConfig::Stac {
             api,
             collection,
             datetime,
             ..
         } => {
-            let search = cfg
-                .source
-                .stac_search()
-                .expect("a stac source has a search");
+            let search = source.stac_search().expect("a stac source has a search");
             let src = StacSrc::open(&search).map_err(|e| e.to_string())?;
             Ok((
                 Box::new(src),
