@@ -1382,7 +1382,7 @@ async fn every_vector_op_changes_the_features_the_rasterize_burns() {
         grays["dropped"].len()
     );
 
-    // every feature carries the added 2.0, so the tile is that one value
+    // every feature carries the schema's added value, so the tile is uniform
     assert_eq!(grays["filled"].len(), grays["parcels"].len());
     for (i, g) in grays["filled"].iter().enumerate() {
         assert_eq!(*g, FILL_GRAY, "pixel {i}");
@@ -1488,6 +1488,19 @@ burn = {{ property = "depth" }}
 
     let missing = text.replace("line.geojson", "absent.geojson");
     Config::parse(&missing).expect_err("a boundary file that is not there");
+}
+
+#[test]
+fn an_idw_radius_that_bounds_no_neighbourhood_is_named_at_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    for radius in ["0.0", "-5.0", "nan"] {
+        let text = las_layer_file(dir.path()).replace(
+            "kind = \"idw\"\n",
+            &format!("kind = \"idw\"\nradius_px = {radius}\n"),
+        );
+        let error = Config::parse(&text).expect_err("a radius that bounds no neighbourhood");
+        assert!(error.contains("radius_px"), "{error}");
+    }
 }
 
 #[tokio::test]

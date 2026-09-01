@@ -413,6 +413,12 @@ fn check_ops(ops: &[OpConfig]) -> Result<(), String> {
             OpConfig::VecClip { boundary } => {
                 read_boundary(boundary)?;
             }
+            OpConfig::Idw {
+                radius_px: Some(radius),
+                ..
+            } if !(radius.is_finite() && *radius > 0.0) => {
+                return Err(format!("idw needs a positive radius_px, got {radius}"));
+            }
             _ => {}
         }
     }
