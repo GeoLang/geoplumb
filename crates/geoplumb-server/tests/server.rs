@@ -13,6 +13,7 @@ use geoplumb_server::config::{
     SourceConfig, UnaryOpConfig,
 };
 use geoplumb_server::{Layer, parse_time, router};
+use nubis_core::{Point3, PointCloud, write_las};
 use terrano_core::{CogParams, Raster, write_cog};
 use tower::ServiceExt;
 
@@ -125,6 +126,51 @@ fn tile_of(z: u8, lon: f64, lat: f64) -> (u32, u32) {
     let y =
         ((1.0 - (r.tan() + 1.0 / r.cos()).ln() / std::f64::consts::PI) / 2.0 * n).floor() as u32;
     (x, y)
+}
+
+/// half the side of the web mercator square, the extent an xyz grid covers
+const HALF_WORLD: f64 = 20_037_508.342_789_244;
+
+/// the web mercator bounds of an xyz tile, min x, min y, max x, max y
+fn tile_bounds(z: u8, x: u32, y: u32) -> (f64, f64, f64, f64) {
+    let side = 2.0 * HALF_WORLD / f64::from(1u32 << z);
+    let min_x = -HALF_WORLD + f64::from(x) * side;
+    let max_y = HALF_WORLD - f64::from(y) * side;
+    (min_x, max_y - side, min_x + side, max_y)
+}
+
+/// how far past the rendered tile the point cloud reaches, room for the
+/// idw search radius at the tile's own edge
+const LAS_MARGIN: f64 = 400.0;
+/// point spacing in metres, under the 38 m a z12 tile's pixel covers, so
+/// the source's ladder starts at the tile rather than above it
+const LAS_STEP: f64 = 30.0;
+/// the one height every point carries, so the idw grid over them has a
+/// value the test can name
+const LAS_HEIGHT: f64 = 120.0;
+/// shifts the cloud off the tile's own cell grid, so the points do not
+/// line up with the cell nodes the idw interpolates at
+const LAS_OFFSET: f64 = 7.0;
+
+/// a flat cloud over the rendered tile, written as a real las file. its
+/// coordinates are web mercator metres, where the 1 mm las quantisation is
+/// far under the spacing, which lon/lat degrees would not be
+fn heights_las() -> Vec<u8> {
+    let (tile_x, tile_y) = tile_of(12, 7.3, 46.8);
+    let (min_x, min_y, max_x, max_y) = tile_bounds(12, tile_x, tile_y);
+    let mut points = Vec::new();
+    let mut y = min_y - LAS_MARGIN + LAS_OFFSET;
+    while y <= max_y + LAS_MARGIN {
+        let mut x = min_x - LAS_MARGIN + LAS_OFFSET;
+        while x <= max_x + LAS_MARGIN {
+            points.push(Point3::new(x, y, LAS_HEIGHT));
+            x += LAS_STEP;
+        }
+        y += LAS_STEP;
+    }
+    let mut out = Vec::new();
+    write_las(&PointCloud::from_points(points), &mut out).unwrap();
+    out
 }
 
 /// writes the fixture into `dir` and gives back the path a layer file
@@ -461,6 +507,46 @@ burn = { property = "depth" }
 /// a value the gray scaling does not land halfway between two bytes, so
 /// the reprojection's last bit cannot tip it either way
 const FILL_GRAY: u8 = 159;
+
+/// the same flat cloud gridded three ways: the idw defaults, a min_points
+/// no cell of this cloud reaches, and a search radius under the spacing
+const LAS: &str = r#"
+[[layer]]
+name = "heights"
+source = { kind = "las", path = "LAS_PATH", crs = 3857 }
+gray = { min = 0.0, max = 300.0 }
+
+[[layer.op]]
+kind = "idw"
+
+[[layer]]
+name = "sparse"
+source = { kind = "las", path = "LAS_PATH", crs = 3857 }
+gray = { min = 0.0, max = 300.0 }
+
+[[layer.op]]
+kind = "idw"
+min_points = 1000
+
+[[layer]]
+name = "pinpoint"
+source = { kind = "las", path = "LAS_PATH", crs = 3857 }
+gray = { min = 0.0, max = 300.0 }
+
+[[layer.op]]
+kind = "idw"
+power = 3.0
+radius_px = 0.25
+"#;
+
+/// the cloud's one height over the 0 to 300 range the las layers name
+const HEIGHT_GRAY: u8 = 102;
+
+fn las_layer_file(dir: &Path) -> String {
+    let path = dir.join("heights.las");
+    std::fs::write(&path, heights_las()).unwrap();
+    LAS.replace("LAS_PATH", &path.display().to_string().replace('\\', "/"))
+}
 
 /// the plain parcels layer beside one layer per vector op, all over the
 /// same fixtures written into `dir`
@@ -977,6 +1063,22 @@ kind = "rasterize"
 burn = { constant = 1.0 }"#,
             "a geojson input rasterized only after the join",
         ),
+        (
+            r#"[[layer]]
+name = "a"
+source = { kind = "las", path = "/a.las", crs = 3857 }
+gray = { min = 0.0, max = 1.0 }"#,
+            "a las layer with no idw",
+        ),
+        (
+            r#"[[layer]]
+name = "a"
+source = { kind = "las", path = "/a.las" }
+gray = { min = 0.0, max = 1.0 }
+[[layer.op]]
+kind = "idw""#,
+            "a las source with no crs",
+        ),
     ];
     for (text, why) in cases {
         assert!(Config::parse(text).is_err(), "{why} should not have parsed");
@@ -1337,6 +1439,122 @@ burn = {{ property = "depth" }}
 
     let missing = text.replace("line.geojson", "absent.geojson");
     Config::parse(&missing).expect_err("a boundary file that is not there");
+}
+
+#[tokio::test]
+async fn a_las_layer_grids_its_points_into_the_tile() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&las_layer_file(dir.path()));
+    let (x, y) = tile_of(12, 7.3, 46.8);
+
+    let mut grays: HashMap<&str, Vec<u8>> = HashMap::new();
+    for name in ["heights", "sparse", "pinpoint"] {
+        let (status, png) = get(&app, &format!("/tiles/{name}/12/{x}/{y}.png")).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        grays.insert(name, opaque_grays(&png));
+    }
+
+    // the cloud is flat and covers the whole tile, so the idw defaults
+    // grid it into that one height everywhere
+    assert!(
+        grays["heights"].len() > 60_000,
+        "only {} pixels gridded",
+        grays["heights"].len()
+    );
+    for (i, g) in grays["heights"].iter().enumerate() {
+        assert_eq!(*g, HEIGHT_GRAY, "pixel {i}");
+    }
+
+    // the default radius reaches tens of points, so a min_points of 1000
+    // leaves the tile nodata but for the handful of cells a point sits on,
+    // which take their height whatever min_points says
+    assert!(
+        grays["sparse"].len() * 100 < grays["heights"].len(),
+        "{} of {} pixels reached 1000 points",
+        grays["sparse"].len(),
+        grays["heights"].len()
+    );
+
+    // a quarter-pixel radius is under the point spacing, so only the cells
+    // that happen to sit next to a point get a value
+    assert!(!grays["pinpoint"].is_empty());
+    assert!(
+        grays["pinpoint"].len() * 2 < grays["heights"].len(),
+        "{} of {} pixels found a point within a quarter of a pixel",
+        grays["pinpoint"].len(),
+        grays["heights"].len()
+    );
+
+    let (status, body) = get(&app, "/layers").await;
+    assert_eq!(status, StatusCode::OK);
+    let layers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(layers[0]["source"], "las");
+    assert!(layers[0]["temporal_extent"].is_null());
+}
+
+#[test]
+fn config_parses_a_las_source_and_the_idw_over_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::parse(&las_layer_file(dir.path())).unwrap();
+    match source_of(&config.layers[0]) {
+        SourceConfig::Las { path, crs } => {
+            assert!(path.ends_with("heights.las"), "{path:?}");
+            assert_eq!(*crs, 3857);
+        }
+        other => panic!("unexpected source: {other:?}"),
+    }
+    assert!(source_of(&config.layers[0]).stac_search().is_none());
+
+    // an idw naming no field takes every one of the element's defaults
+    match &config.layers[0].ops[..] {
+        [
+            OpConfig::Idw {
+                power,
+                radius_px,
+                min_points,
+            },
+        ] => {
+            assert_eq!(*power, None);
+            assert_eq!(*radius_px, None);
+            assert_eq!(*min_points, None);
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    match &config.layers[2].ops[..] {
+        [
+            OpConfig::Idw {
+                power,
+                radius_px,
+                min_points,
+            },
+        ] => {
+            assert_eq!(*power, Some(3.0));
+            assert_eq!(*radius_px, Some(0.25));
+            assert_eq!(*min_points, None);
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+}
+
+#[test]
+fn an_idw_layer_has_to_name_its_own_gray_range() {
+    let text = r#"
+[[layer]]
+name = "heights"
+source = { kind = "las", path = "/a.las", crs = 3857 }
+
+[[layer.op]]
+kind = "idw"
+"#;
+    let error = Config::parse(text).expect_err("interpolated heights have no range of their own");
+    assert!(error.contains("gray"), "{error}");
+
+    let with_range = text.replace(
+        "[[layer.op]]",
+        "gray = { min = 0.0, max = 300.0 }\n\n[[layer.op]]",
+    );
+    Config::parse(&with_range).expect("a named gray range makes it servable");
 }
 
 #[tokio::test]

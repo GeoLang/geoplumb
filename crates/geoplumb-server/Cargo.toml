@@ -30,6 +30,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+nubis-core.workspace = true
 tokio = { version = "1", features = ["test-util"] }
 png = "0.17"
 tempfile = "3"

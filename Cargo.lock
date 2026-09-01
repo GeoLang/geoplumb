@@ -341,6 +341,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "geoplumb",
+ "nubis-core",
  "png",
  "projicio-core",
  "reqwest",

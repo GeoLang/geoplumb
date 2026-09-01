@@ -119,6 +119,14 @@ pub enum SourceConfig {
     Geojson {
         path: PathBuf,
     },
+    /// a las point cloud read whole at startup. points are not pixels, so
+    /// the chain over it needs an `idw`
+    Las {
+        path: PathBuf,
+        /// the epsg the file's coordinates are in, which las itself does
+        /// not carry in a form the reader trusts
+        crs: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -200,6 +208,16 @@ pub enum OpConfig {
     /// drop the ones the cut leaves empty
     VecClip {
         boundary: PathBuf,
+    },
+    /// inverse distance weighted gridding, points in and one raster band
+    /// out. every field falls back to the element's own default
+    Idw {
+        power: Option<f64>,
+        /// the search radius, in output pixels rather than map units, so
+        /// every zoom greets a comparable neighbourhood
+        radius_px: Option<f64>,
+        /// cells reached by fewer points than this stay nodata
+        min_points: Option<usize>,
     },
 }
 
@@ -370,6 +388,11 @@ fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
                         hands features to a png encoder that wants pixels"
                 .into());
         }
+        SourceConfig::Las { .. } if !ops.iter().any(|op| matches!(op, OpConfig::Idw { .. })) => {
+            return Err("the las source has no idw op, so the chain hands \
+                        points to a png encoder that wants pixels"
+                .into());
+        }
         _ => {}
     }
     check_ops(ops)
@@ -461,9 +484,10 @@ impl LayerConfig {
     /// the value range the png encoding stretches over: the layer's own
     /// `gray` where it names one, else the range of the last op that fixes
     /// one. a reclassify leaves class numbers and a rasterize leaves burned
-    /// values, which no op range covers, so from there on only the layer
-    /// can say what to stretch over. a fan-in layer starts with no range at
-    /// all, the input chains not carrying one across the join
+    /// values and an idw leaves interpolated point heights, which no op
+    /// range covers, so from there on only the layer can say what to
+    /// stretch over. a fan-in layer starts with no range at all, the input
+    /// chains not carrying one across the join
     pub fn gray_range(&self) -> Result<(f64, f64), String> {
         if let Some(gray) = self.gray {
             return Ok((gray.min, gray.max));
@@ -474,7 +498,9 @@ impl LayerConfig {
                 OpConfig::Bandmath { min, max, .. } => Some((*min, *max)),
                 OpConfig::Slope => Some(SLOPE_GRAY),
                 OpConfig::Aspect => Some(ASPECT_GRAY),
-                OpConfig::Reclassify { .. } | OpConfig::Rasterize { .. } => None,
+                OpConfig::Reclassify { .. } | OpConfig::Rasterize { .. } | OpConfig::Idw { .. } => {
+                    None
+                }
                 OpConfig::Hillshade { .. }
                 | OpConfig::Focal { .. }
                 | OpConfig::Mask { .. }
@@ -514,7 +540,9 @@ impl SourceConfig {
     /// the search a stac layer opens with, `None` for any other kind
     pub fn stac_search(&self) -> Option<StacSearch> {
         match self {
-            SourceConfig::Cog { .. } | SourceConfig::Geojson { .. } => None,
+            SourceConfig::Cog { .. } | SourceConfig::Geojson { .. } | SourceConfig::Las { .. } => {
+                None
+            }
             SourceConfig::Stac {
                 api,
                 collection,

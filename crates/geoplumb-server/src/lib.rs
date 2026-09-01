@@ -23,9 +23,9 @@ use tokio::sync::Semaphore;
 
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::{
-    Aspect, BandMath, CogSrc, Combine, Focal, Hillshade, MapAlgebra, Mosaic, QualityMask,
-    Rasterize, Reproject, Slope, StacSrc, TensorConv, ToRaster, ToTensor, VecClip, VecFilter,
-    VecSchema, VecSrc,
+    Aspect, BandMath, CogSrc, Combine, Focal, Hillshade, IdwGrid, LasSrc, MapAlgebra, Mosaic,
+    QualityMask, Rasterize, Reproject, Slope, StacSrc, TensorConv, ToRaster, ToTensor, VecClip,
+    VecFilter, VecSchema, VecSrc,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Crs, Engine, Graph, NodeId, Source, TimeInterval};
@@ -53,7 +53,7 @@ pub struct Layer {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerInfo {
     pub name: String,
-    /// `stac`, `cog`, `geojson`, or `composite` for a fan-in layer
+    /// `stac`, `cog`, `geojson`, `las`, or `composite` for a fan-in layer
     pub source: &'static str,
     pub collection: Option<String>,
     /// the interval pulls take when they name none
@@ -199,6 +199,19 @@ fn add_ops(graph: &mut Graph, node: NodeId, ops: &[OpConfig]) -> Result<NodeId, 
                 let boundary = config::read_boundary(boundary)?;
                 graph.add_transform(node, Box::new(VecClip { boundary }))
             }
+            OpConfig::Idw {
+                power,
+                radius_px,
+                min_points,
+            } => {
+                let default = IdwGrid::default();
+                let idw = IdwGrid {
+                    power: power.unwrap_or(default.power),
+                    radius_px: radius_px.unwrap_or(default.radius_px),
+                    min_points: min_points.unwrap_or(default.min_points),
+                };
+                graph.add_transform(node, Box::new(idw))
+            }
         };
     }
     Ok(node)
@@ -244,6 +257,21 @@ fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, L
                 LayerInfo {
                     name,
                     source: "geojson",
+                    collection: None,
+                    default_datetime: None,
+                    temporal_extent: None,
+                },
+            ))
+        }
+        SourceConfig::Las { path, crs } => {
+            let mut file =
+                std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let src = LasSrc::from_las(&mut file, Crs(*crs)).map_err(|e| e.to_string())?;
+            Ok((
+                Box::new(src),
+                LayerInfo {
+                    name,
+                    source: "las",
                     collection: None,
                     default_datetime: None,
                     temporal_extent: None,

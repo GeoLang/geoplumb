@@ -2,6 +2,7 @@
 
 ## 2026-09-01
 
+- `las` as a layer source, a point cloud read whole at startup and served with per-level voxel thinning, taking the `crs` its coordinates are in because las carries none the reader trusts, and `idw` as the op that grids those points into a raster band, taking `power`, `radius_px` and `min_points`, each falling back to the element's own default. They are two entries rather than one fused source, so a layer file combines them itself. A las source with no idw in the chain over it is a parse error naming the layer, the same rule a geojson source without a rasterize follows. Interpolated heights are no more of a fixed range than burned values, so a layer ending in an idw has to name its own `gray`
 - the three vector ops are nameable in a layer file: `vec_filter` (`field` plus `equals`, keeping the features whose property matches), `vec_schema` (`drop`, `rename` and `add`, each optional, rewriting properties and leaving geometry alone) and `vec_clip` (`boundary`, a path to a geojson file). A clip boundary is read and checked at parse: every polygon and multipolygon in the file joins into the one boundary the element cuts against, and a file holding a point, a line or nothing is a parse error naming what it holds instead. All three run over features, so a chain still needs its `rasterize` before the png encoder, and none of them changes the gray range
 
 ## 2026-08-31
