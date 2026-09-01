@@ -24,7 +24,8 @@ use tokio::sync::Semaphore;
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::{
     Aspect, BandMath, CogSrc, Combine, Focal, Hillshade, MapAlgebra, Mosaic, QualityMask,
-    Rasterize, Reproject, Slope, StacSrc, TensorConv, ToRaster, ToTensor, VecSrc,
+    Rasterize, Reproject, Slope, StacSrc, TensorConv, ToRaster, ToTensor, VecClip, VecFilter,
+    VecSchema, VecSrc,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Crs, Engine, Graph, NodeId, Source, TimeInterval};
@@ -181,6 +182,22 @@ fn add_ops(graph: &mut Graph, node: NodeId, ops: &[OpConfig]) -> Result<NodeId, 
                 let convolved =
                     graph.add_transform(tensor, Box::new(TensorConv { kernel: *kernel }));
                 graph.add_transform(convolved, Box::new(ToRaster))
+            }
+            OpConfig::VecFilter { field, equals } => graph.add_transform(
+                node,
+                Box::new(VecFilter::new(field.clone(), equals.clone())),
+            ),
+            OpConfig::VecSchema { drop, rename, add } => graph.add_transform(
+                node,
+                Box::new(VecSchema {
+                    drop: drop.clone(),
+                    rename: rename.clone(),
+                    add: add.clone(),
+                }),
+            ),
+            OpConfig::VecClip { boundary } => {
+                let boundary = config::read_boundary(boundary)?;
+                graph.add_transform(node, Box::new(VecClip { boundary }))
             }
         };
     }

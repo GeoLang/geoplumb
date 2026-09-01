@@ -76,13 +76,13 @@ fn parcel_ring(min_lon: f64, max_lon: f64) -> Vec<[f64; 2]> {
     ring
 }
 
-/// two squares meeting at 7.35, each with its own depth, together covering
-/// the tile the render test asks for
+/// two squares meeting at 7.35, each with its own depth and zone name,
+/// together covering the tile the render test asks for
 fn parcels_geojson() -> String {
-    let parcel = |min_lon: f64, max_lon: f64, depth: f64| {
+    let parcel = |min_lon: f64, max_lon: f64, depth: f64, zone: &str| {
         serde_json::json!({
             "type": "Feature",
-            "properties": { "depth": depth },
+            "properties": { "depth": depth, "zone": zone },
             "geometry": {
                 "type": "Polygon",
                 "coordinates": [parcel_ring(min_lon, max_lon)],
@@ -91,7 +91,24 @@ fn parcels_geojson() -> String {
     };
     serde_json::json!({
         "type": "FeatureCollection",
-        "features": [parcel(7.25, 7.35, 1.0), parcel(7.35, 7.45, 3.0)],
+        "features": [
+            parcel(7.25, 7.35, 1.0, "shallow"),
+            parcel(7.35, 7.45, 3.0, "deep"),
+        ],
+    })
+    .to_string()
+}
+
+/// the eastern edge of the clip boundary, inside the rendered tile so the
+/// cut takes a visible bite out of it
+const BOUNDARY_MAX_LON: f64 = 7.32;
+
+/// one polygon over the western part of the tile, the fixture a `vec_clip`
+/// cuts against
+fn boundary_geojson() -> String {
+    serde_json::json!({
+        "type": "Polygon",
+        "coordinates": [parcel_ring(7.20, BOUNDARY_MAX_LON)],
     })
     .to_string()
 }
@@ -124,6 +141,14 @@ fn write_dem(dir: &Path) -> String {
 fn write_parcels(dir: &Path) -> String {
     let path = dir.join("parcels.geojson");
     std::fs::write(&path, parcels_geojson()).unwrap();
+    path.display().to_string().replace('\\', "/")
+}
+
+/// writes a geojson file into `dir` and gives back the path a layer file
+/// names it by
+fn write_geojson(dir: &Path, name: &str, text: String) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
     path.display().to_string().replace('\\', "/")
 }
 
@@ -360,6 +385,92 @@ burn = { property = "depth" }
 /// the two parcel depths, 1.0 and 3.0, over the 0 to 4 range the layer names
 const SHALLOW_GRAY: u8 = 64;
 const DEEP_GRAY: u8 = 191;
+
+/// one layer per vector op, each over the same parcels and each ending in
+/// the rasterize that turns what the op left into pixels. every layer
+/// stretches over the same 0 to 4 range the plain `parcels` layer does
+const VEC_OPS: &str = r#"
+[[layer]]
+name = "filtered"
+source = { kind = "geojson", path = "GEOJSON_PATH" }
+gray = { min = 0.0, max = 4.0 }
+
+[[layer.op]]
+kind = "vec_filter"
+field = "zone"
+equals = "shallow"
+
+[[layer.op]]
+kind = "rasterize"
+burn = { property = "depth" }
+
+[[layer]]
+name = "renamed"
+source = { kind = "geojson", path = "GEOJSON_PATH" }
+gray = { min = 0.0, max = 4.0 }
+
+[[layer.op]]
+kind = "vec_schema"
+rename = { depth = "elevation" }
+
+[[layer.op]]
+kind = "rasterize"
+burn = { property = "elevation" }
+
+[[layer]]
+name = "dropped"
+source = { kind = "geojson", path = "GEOJSON_PATH" }
+gray = { min = 0.0, max = 4.0 }
+
+[[layer.op]]
+kind = "vec_schema"
+drop = ["depth"]
+
+[[layer.op]]
+kind = "rasterize"
+burn = { property = "depth" }
+
+[[layer]]
+name = "filled"
+source = { kind = "geojson", path = "GEOJSON_PATH" }
+gray = { min = 0.0, max = 4.0 }
+
+[[layer.op]]
+kind = "vec_schema"
+add = { fill = 2.5 }
+
+[[layer.op]]
+kind = "rasterize"
+burn = { property = "fill" }
+
+[[layer]]
+name = "clipped"
+source = { kind = "geojson", path = "GEOJSON_PATH" }
+gray = { min = 0.0, max = 4.0 }
+
+[[layer.op]]
+kind = "vec_clip"
+boundary = "BOUNDARY_PATH"
+
+[[layer.op]]
+kind = "rasterize"
+burn = { property = "depth" }
+"#;
+
+/// the 2.5 the `filled` layer adds to every feature, over the same 0 to 4.
+/// a value the gray scaling does not land halfway between two bytes, so
+/// the reprojection's last bit cannot tip it either way
+const FILL_GRAY: u8 = 159;
+
+/// the plain parcels layer beside one layer per vector op, all over the
+/// same fixtures written into `dir`
+fn vec_ops_layer_file(dir: &Path) -> String {
+    let parcels = write_parcels(dir);
+    let boundary = write_geojson(dir, "boundary.geojson", boundary_geojson());
+    format!("{GEOJSON}{VEC_OPS}")
+        .replace("GEOJSON_PATH", &parcels)
+        .replace("BOUNDARY_PATH", &boundary)
+}
 
 #[test]
 fn config_parses_sources_ops_and_their_order() {
@@ -1081,6 +1192,151 @@ async fn a_geojson_layer_burns_its_features_into_the_tile() {
         "{burned} of {} pixels hold a parcel depth",
         grays.len()
     );
+}
+
+#[tokio::test]
+async fn every_vector_op_changes_the_features_the_rasterize_burns() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&vec_ops_layer_file(dir.path()));
+    let (x, y) = tile_of(12, 7.3, 46.8);
+
+    let mut grays: HashMap<&str, Vec<u8>> = HashMap::new();
+    for name in [
+        "parcels", "filtered", "renamed", "dropped", "filled", "clipped",
+    ] {
+        let (status, png) = get(&app, &format!("/tiles/{name}/12/{x}/{y}.png")).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        grays.insert(name, opaque_grays(&png));
+    }
+
+    // the filter keeps the shallow zone, so the deep parcel's half of the
+    // tile burns nothing
+    assert!(!grays["filtered"].is_empty());
+    assert!(
+        !grays["filtered"].contains(&DEEP_GRAY),
+        "the deep parcel survived the filter"
+    );
+    assert!(grays["filtered"].contains(&SHALLOW_GRAY));
+    assert!(grays["filtered"].len() < grays["parcels"].len());
+
+    // the rename is what the rasterize's `elevation` finds, so the layer
+    // renders exactly what burning `depth` unrenamed does
+    assert_eq!(grays["renamed"], grays["parcels"]);
+
+    // dropping `depth` leaves the rasterize nothing to read, and a feature
+    // without the property is skipped
+    assert!(
+        grays["dropped"].is_empty(),
+        "{} pixels burned without the property",
+        grays["dropped"].len()
+    );
+
+    // every feature carries the added 2.0, so the tile is that one value
+    assert_eq!(grays["filled"].len(), grays["parcels"].len());
+    for (i, g) in grays["filled"].iter().enumerate() {
+        assert_eq!(*g, FILL_GRAY, "pixel {i}");
+    }
+
+    // the boundary stops at 7.32, inside the tile, and holds only shallow
+    // parcel, so the clip drops the rest
+    assert!(!grays["clipped"].is_empty());
+    assert!(grays["clipped"].len() < grays["parcels"].len());
+    assert!(
+        !grays["clipped"].contains(&DEEP_GRAY),
+        "the clip left features past its boundary"
+    );
+}
+
+#[test]
+fn config_parses_every_vector_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::parse(&vec_ops_layer_file(dir.path())).unwrap();
+    let ops_of = |name: &str| {
+        &config
+            .layers
+            .iter()
+            .find(|l| l.name == name)
+            .unwrap_or_else(|| panic!("no layer {name}"))
+            .ops
+    };
+
+    match &ops_of("filtered")[..] {
+        [
+            OpConfig::VecFilter { field, equals },
+            OpConfig::Rasterize { .. },
+        ] => {
+            assert_eq!(field, "zone");
+            assert_eq!(equals, "shallow");
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    match &ops_of("renamed")[..] {
+        [
+            OpConfig::VecSchema { drop, rename, add },
+            OpConfig::Rasterize { .. },
+        ] => {
+            assert_eq!(rename["depth"], "elevation");
+            assert!(drop.is_empty());
+            assert!(add.is_empty());
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    match &ops_of("dropped")[..] {
+        [OpConfig::VecSchema { drop, .. }, OpConfig::Rasterize { .. }] => {
+            assert_eq!(drop, &["depth"]);
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    match &ops_of("filled")[..] {
+        [OpConfig::VecSchema { add, .. }, OpConfig::Rasterize { .. }] => {
+            assert_eq!(add["fill"], 2.5);
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    match &ops_of("clipped")[..] {
+        [OpConfig::VecClip { boundary }, OpConfig::Rasterize { .. }] => {
+            assert!(boundary.ends_with("boundary.geojson"), "{boundary:?}");
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+}
+
+#[test]
+fn a_clip_boundary_that_is_not_polygonal_is_named_at_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = serde_json::json!({
+        "type": "LineString",
+        "coordinates": [[7.2, 46.7], [7.4, 46.9]],
+    })
+    .to_string();
+    let text = format!(
+        r#"
+[[layer]]
+name = "clipped"
+source = {{ kind = "geojson", path = "{}" }}
+gray = {{ min = 0.0, max = 4.0 }}
+
+[[layer.op]]
+kind = "vec_clip"
+boundary = "{}"
+
+[[layer.op]]
+kind = "rasterize"
+burn = {{ property = "depth" }}
+"#,
+        write_parcels(dir.path()),
+        write_geojson(dir.path(), "line.geojson", line),
+    );
+    let error = Config::parse(&text).expect_err("a linestring bounds no area");
+    assert!(error.contains("polygon"), "{error}");
+    assert!(error.contains("linestring"), "{error}");
+
+    let missing = text.replace("line.geojson", "absent.geojson");
+    Config::parse(&missing).expect_err("a boundary file that is not there");
 }
 
 #[tokio::test]

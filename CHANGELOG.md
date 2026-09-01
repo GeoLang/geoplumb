@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-01
+
+- the three vector ops are nameable in a layer file: `vec_filter` (`field` plus `equals`, keeping the features whose property matches), `vec_schema` (`drop`, `rename` and `add`, each optional, rewriting properties and leaving geometry alone) and `vec_clip` (`boundary`, a path to a geojson file). A clip boundary is read and checked at parse: every polygon and multipolygon in the file joins into the one boundary the element cuts against, and a file holding a point, a line or nothing is a parse error naming what it holds instead. All three run over features, so a chain still needs its `rasterize` before the png encoder, and none of them changes the gray range
+
 ## 2026-08-31
 
 - fan-in from a layer file: a layer names either one `source` as before, or a list of `input` entries, each a source plus its own optional op chain, joined by `fanin = { kind = "mosaic" }` or `fanin = { kind = "combine", op = "subtract" }` (`add`, `subtract`, `multiply`, `divide`, `min` and `max`), with the layer's own ops running after the join. Naming both a source and inputs, a fanin without inputs, a combine with other than two inputs or a mosaic with fewer than two are parse errors naming the layer, so a wiring mistake never reaches the caps solver. `/layers` publishes a fan-in layer as `source: "composite"` with no collection of its own, taking its default datetime and temporal extent from the first stac input

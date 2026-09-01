@@ -3,12 +3,15 @@
 //! ends reprojected to web mercator and encoded as grayscale png, so the
 //! file says what varies and nothing else
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use geoplumb::elements::{Burn, Composite, FocalOp, StacSearch};
 use serde::Deserialize;
+use serde_json::Value;
 use terrano_core::{BinaryOp, UnaryOp};
+use topoi_core::MultiPolygon;
+use topoi_core::geojson::FeatureGeometry;
 
 /// the gray range png encoding stretches over when neither an op nor the
 /// layer names one, hillshade's own range
@@ -133,7 +136,7 @@ pub enum CompositeConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OpConfig {
     Hillshade {
         azimuth: f64,
@@ -176,6 +179,27 @@ pub enum OpConfig {
         scales: Vec<f32>,
         #[serde(default = "identity_offsets")]
         offsets: Vec<f32>,
+    },
+    /// keep the features whose `field` equals a value, everything else
+    /// dropped. `equals = "residential"` and `equals = 3` both work
+    VecFilter {
+        field: String,
+        equals: Value,
+    },
+    /// rewrite feature properties, geometry untouched: drop first, then
+    /// rename what survives, then add the defaults a feature lacks
+    VecSchema {
+        #[serde(default)]
+        drop: Vec<String>,
+        #[serde(default)]
+        rename: HashMap<String, String>,
+        #[serde(default)]
+        add: HashMap<String, Value>,
+    },
+    /// intersect every feature with the polygons of a geojson file, and
+    /// drop the ones the cut leaves empty
+    VecClip {
+        boundary: PathBuf,
     },
 }
 
@@ -353,20 +377,63 @@ fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
 
 fn check_ops(ops: &[OpConfig]) -> Result<(), String> {
     for op in ops {
-        if let OpConfig::Convolve {
-            scales, offsets, ..
-        } = op
-        {
-            if scales.len() != offsets.len() {
+        match op {
+            OpConfig::Convolve {
+                scales, offsets, ..
+            } if scales.len() != offsets.len() => {
                 return Err(format!(
                     "convolve names {} scales against {} offsets",
                     scales.len(),
                     offsets.len()
                 ));
             }
+            OpConfig::VecClip { boundary } => {
+                read_boundary(boundary)?;
+            }
+            _ => {}
         }
     }
     Ok(())
+}
+
+/// the polygons a `vec_clip` cuts against, every one the file holds joined
+/// into the single boundary the element takes. a clip intersects areas, so
+/// a file holding anything else has nothing to cut with
+pub fn read_boundary(path: &Path) -> Result<MultiPolygon, String> {
+    let named = |e: String| format!("clip boundary {}: {e}", path.display());
+    let text = std::fs::read_to_string(path).map_err(|e| named(e.to_string()))?;
+    let collection = topoi_core::geojson::read_geojson(&text).map_err(|e| named(e.to_string()))?;
+    let mut polygons = Vec::new();
+    for feature in &collection.features {
+        match &feature.geometry {
+            Some(FeatureGeometry::Polygon(polygon)) => polygons.push(polygon.clone()),
+            Some(FeatureGeometry::MultiPolygon(multi)) => {
+                polygons.extend(multi.polygons().iter().cloned())
+            }
+            other => {
+                return Err(named(format!(
+                    "a boundary takes polygons, this holds {}",
+                    geometry_kind(other)
+                )));
+            }
+        }
+    }
+    if polygons.is_empty() {
+        return Err(named("the file holds no polygons".into()));
+    }
+    Ok(MultiPolygon::new(polygons))
+}
+
+fn geometry_kind(geometry: &Option<FeatureGeometry>) -> &'static str {
+    match geometry {
+        None => "a feature with no geometry",
+        Some(FeatureGeometry::Point(_)) => "a point",
+        Some(FeatureGeometry::LineString(_)) => "a linestring",
+        Some(FeatureGeometry::MultiPoint(_)) => "a multipoint",
+        Some(FeatureGeometry::MultiLineString(_)) => "a multilinestring",
+        Some(FeatureGeometry::GeometryCollection(_)) => "a geometry collection",
+        Some(FeatureGeometry::Polygon(_)) | Some(FeatureGeometry::MultiPolygon(_)) => "a polygon",
+    }
 }
 
 impl LayerConfig {
@@ -412,7 +479,10 @@ impl LayerConfig {
                 | OpConfig::Focal { .. }
                 | OpConfig::Mask { .. }
                 | OpConfig::Unary { .. }
-                | OpConfig::Convolve { .. } => range,
+                | OpConfig::Convolve { .. }
+                | OpConfig::VecFilter { .. }
+                | OpConfig::VecSchema { .. }
+                | OpConfig::VecClip { .. } => range,
             };
         }
         range.ok_or_else(|| match self.source {
