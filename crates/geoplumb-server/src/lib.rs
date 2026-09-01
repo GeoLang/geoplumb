@@ -1,7 +1,8 @@
 //! http tile server over geoplumb. one engine per configured layer, xyz
-//! png tiles, and a per-request time interval wherever the layer's source
-//! resolves one. layers come from the toml named by `GEOPLUMB_LAYERS`,
-//! the service invents none of its own.
+//! tiles as gray png or, where the path ends in `.tif`, as geotiff, and a
+//! per-request time interval wherever the layer's source resolves one.
+//! layers come from the toml named by `GEOPLUMB_LAYERS`, the service
+//! invents none of its own.
 //!
 //! the endpoints are public by decision: these are tiles rendered from
 //! public collections, the same policy tiletopia's public tiles follow
@@ -370,6 +371,13 @@ struct TileQuery {
     t: Option<String>,
 }
 
+/// what the tile path asks to be encoded as. `.tif` hands over the chunk's
+/// own f64 bands and their georeferencing, everything else is the gray png
+enum TileFormat {
+    Png,
+    GeoTiff,
+}
+
 async fn tile(
     State(state): State<Arc<ServerState>>,
     UrlPath((name, z, x, y)): UrlPath<(String, u8, u32, String)>,
@@ -378,7 +386,11 @@ async fn tile(
     let Some(layer) = state.layers.iter().find(|l| l.info.name == name) else {
         return (StatusCode::NOT_FOUND, format!("unknown layer {name}")).into_response();
     };
-    let Ok(y) = y.trim_end_matches(".png").parse::<u32>() else {
+    let (row, format) = match y.strip_suffix(".tif") {
+        Some(row) => (row, TileFormat::GeoTiff),
+        None => (y.trim_end_matches(".png"), TileFormat::Png),
+    };
+    let Ok(y) = row.parse::<u32>() else {
         return bad_request(format!("tile y {y} is not a number"));
     };
     if z > MAX_ZOOM {
@@ -396,8 +408,15 @@ async fn tile(
         Ok(chunk) => chunk,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    match geoplumb::encode::png_gray(&chunk, layer.gray.0, layer.gray.1) {
-        Ok(png) => ([(header::CONTENT_TYPE, "image/png")], png).into_response(),
+    let encoded = match format {
+        TileFormat::Png => geoplumb::encode::png_gray(&chunk, layer.gray.0, layer.gray.1)
+            .map(|bytes| ("image/png", bytes)),
+        TileFormat::GeoTiff => geoplumb::encode::geotiff(&chunk).map(|bytes| ("image/tiff", bytes)),
+    };
+    match encoded {
+        Ok((content_type, bytes)) => {
+            ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

@@ -14,7 +14,9 @@ use geoplumb_server::config::{
 };
 use geoplumb_server::{Layer, parse_time, router};
 use nubis_core::{Point3, PointCloud, write_las};
-use terrano_core::{CogParams, Raster, write_cog};
+use terrano_core::{
+    BandedRaster, CogParams, Raster, read_geotiff_bands, write_cog, write_cog_bands,
+};
 use tower::ServiceExt;
 
 const W: usize = 600;
@@ -23,8 +25,8 @@ const CELL: f64 = 0.001;
 const ORIGIN_X: f64 = 7.0;
 const ORIGIN_Y: f64 = 47.0;
 
-/// an alpine-ish dem as a deflate cog, the fixture a `cog` layer serves
-fn dem_cog() -> Vec<u8> {
+/// an alpine-ish dem, a smooth 300 to 700 surface
+fn dem_values() -> Vec<f64> {
     let mut data = Vec::with_capacity(W * H);
     for row in 0..H {
         for col in 0..W {
@@ -33,8 +35,11 @@ fn dem_cog() -> Vec<u8> {
             data.push(500.0 + 200.0 * (lon * 8.0).sin() * (lat * 8.0).cos());
         }
     }
-    let raster = Raster::from_vec(W, H, data, CELL, f64::NAN).unwrap();
-    let params = CogParams {
+    data
+}
+
+fn cog_params() -> CogParams {
+    CogParams {
         tile_width: 256,
         tile_height: 256,
         overview_levels: 2,
@@ -44,9 +49,33 @@ fn dem_cog() -> Vec<u8> {
         pixel_width: CELL,
         pixel_height: CELL,
         deflate: true,
-    };
+    }
+}
+
+/// the dem as a deflate cog, the fixture a `cog` layer serves
+fn dem_cog() -> Vec<u8> {
+    let raster = Raster::from_vec(W, H, dem_values(), CELL, f64::NAN).unwrap();
     let mut buf = std::io::Cursor::new(Vec::new());
-    write_cog(&raster, &params, &mut buf).unwrap();
+    write_cog(&raster, &cog_params(), &mut buf).unwrap();
+    buf.into_inner()
+}
+
+/// how far the second band of the two-band fixture sits above the first,
+/// a gap the resampling leaves alone because both bands warp together
+const BAND_LIFT: f64 = 1000.0;
+
+/// the dem beside a copy of it lifted, so a reader of a served tile can
+/// tell the two bands apart and check both survived
+fn banded_dem_cog() -> Vec<u8> {
+    let base = dem_values();
+    let lifted = base.iter().map(|v| v + BAND_LIFT).collect();
+    let bands = BandedRaster::new(vec![
+        Raster::from_vec(W, H, base, CELL, f64::NAN).unwrap(),
+        Raster::from_vec(W, H, lifted, CELL, f64::NAN).unwrap(),
+    ])
+    .unwrap();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    write_cog_bands(&bands, &cog_params(), &mut buf).unwrap();
     buf.into_inner()
 }
 
@@ -221,31 +250,51 @@ fn app(text: &str) -> Router {
     router(layers)
 }
 
-async fn get(app: &Router, uri: &str) -> (StatusCode, Vec<u8>) {
+/// the response's content type beside its body, which only the encoding
+/// test looks at
+async fn get_typed(app: &Router, uri: &str) -> (StatusCode, String, Vec<u8>) {
     let response = app
         .clone()
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = response.status();
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
     let body = axum::body::to_bytes(response.into_body(), 8 << 20)
         .await
         .unwrap();
-    (status, body.to_vec())
+    (status, content_type, body.to_vec())
 }
 
-/// the gray value of every pixel the png marks opaque, so an empty tile
-/// is distinguishable from one that actually rendered data and two tiles
-/// are comparable pixel by pixel
-fn opaque_grays(bytes: &[u8]) -> Vec<u8> {
+async fn get(app: &Router, uri: &str) -> (StatusCode, Vec<u8>) {
+    let (status, _, body) = get_typed(app, uri).await;
+    (status, body)
+}
+
+/// every pixel of a grayscale-alpha png as gray beside alpha
+fn png_pixels(bytes: &[u8]) -> Vec<(u8, u8)> {
     let mut reader = png::Decoder::new(bytes).read_info().expect("a png");
     let mut buf = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).unwrap();
     assert_eq!(info.color_type, png::ColorType::GrayscaleAlpha);
     buf[..info.buffer_size()]
         .chunks_exact(2)
-        .filter(|px| px[1] == 255)
-        .map(|px| px[0])
+        .map(|px| (px[0], px[1]))
+        .collect()
+}
+
+/// the gray value of every pixel the png marks opaque, so an empty tile
+/// is distinguishable from one that actually rendered data and two tiles
+/// are comparable pixel by pixel
+fn opaque_grays(bytes: &[u8]) -> Vec<u8> {
+    png_pixels(bytes)
+        .into_iter()
+        .filter(|(_, alpha)| *alpha == 255)
+        .map(|(gray, _)| gray)
         .collect()
 }
 
@@ -1587,6 +1636,90 @@ async fn layers_publishes_a_fan_in_and_a_geojson_layer_by_what_they_read() {
     assert!(named("parcels")["temporal_extent"].is_null());
 }
 
+/// the gray range the two-band layer stretches band 0 over, the dem's own
+/// range across the rendered tile
+const BANDED_GRAY: (f64, f64) = (300.0, 400.0);
+
+#[tokio::test]
+async fn the_same_tile_is_served_as_png_or_as_geotiff() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bands.tif");
+    std::fs::write(&path, banded_dem_cog()).unwrap();
+    let text = format!(
+        r#"
+[[layer]]
+name = "bands"
+source = {{ kind = "cog", path = "{}" }}
+gray = {{ min = {}, max = {} }}
+"#,
+        path.display().to_string().replace('\\', "/"),
+        BANDED_GRAY.0,
+        BANDED_GRAY.1,
+    );
+    let app = app(&text);
+    let (x, y) = tile_of(12, 7.3, 46.8);
+
+    // the suffixless path stays png, as does the one naming it
+    let (status, bare_type, bare) = get_typed(&app, &format!("/tiles/bands/12/{x}/{y}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bare_type, "image/png");
+    let (status, png_type, png) = get_typed(&app, &format!("/tiles/bands/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(png_type, "image/png");
+    assert_eq!(bare, png);
+
+    let (status, tif_type, tif) = get_typed(&app, &format!("/tiles/bands/12/{x}/{y}.tif")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tif_type, "image/tiff");
+
+    let (bands, meta) = read_geotiff_bands(&tif).expect("terrano reads back what it wrote");
+    assert_eq!(bands.band_count(), 2, "the second band did not survive");
+    assert_eq!(bands.width(), 256);
+    assert_eq!(bands.height(), 256);
+
+    // the tile is reprojected before it is encoded, so the geotiff carries
+    // the web mercator corner and pixel size of the tile that was asked for
+    let (min_x, _, max_x, max_y) = tile_bounds(12, x, y);
+    let pixel = (max_x - min_x) / 256.0;
+    assert_eq!(meta.epsg, 3857);
+    assert!((meta.origin_x - min_x).abs() < pixel, "{}", meta.origin_x);
+    assert!((meta.origin_y - max_y).abs() < pixel, "{}", meta.origin_y);
+    assert!((meta.pixel_width - pixel).abs() < pixel / 100.0);
+    assert!((meta.pixel_height - pixel).abs() < pixel / 100.0);
+
+    // both bands warped together, so the lift between them is what it was
+    // in the source file
+    let base = bands.band(0).unwrap().data();
+    let lifted = bands.band(1).unwrap().data();
+    let mut checked = 0;
+    for (i, (v, w)) in base.iter().zip(lifted).enumerate() {
+        if !v.is_finite() {
+            continue;
+        }
+        assert!(
+            (w - v - BAND_LIFT).abs() < 1e-6,
+            "pixel {i}: {v} against {w}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 60_000, "only {checked} pixels held a value");
+
+    // the png is the same chunk's band 0 stretched to gray, so the two
+    // encodings agree pixel by pixel
+    let pixels = png_pixels(&png);
+    assert_eq!(pixels.len(), base.len());
+    let span = BANDED_GRAY.1 - BANDED_GRAY.0;
+    for (i, ((gray, alpha), v)) in pixels.iter().zip(base).enumerate() {
+        if !v.is_finite() {
+            assert_eq!(*alpha, 0, "pixel {i} is nodata in the geotiff");
+            continue;
+        }
+        assert_eq!(*alpha, 255, "pixel {i}");
+        let want = (((v - BANDED_GRAY.0) / span).clamp(0.0, 1.0) * 255.0).round() as u8;
+        assert_eq!(*gray, want, "pixel {i} holds {v}");
+    }
+}
+
 #[tokio::test]
 async fn malformed_tile_requests_are_rejected_not_rendered() {
     let dir = tempfile::tempdir().unwrap();
@@ -1595,6 +1728,7 @@ async fn malformed_tile_requests_are_rejected_not_rendered() {
     let cases = [
         ("/tiles/nope/12/2131/1443.png", StatusCode::NOT_FOUND),
         ("/tiles/dem/12/2131/north.png", StatusCode::BAD_REQUEST),
+        ("/tiles/dem/12/2131/north.tif", StatusCode::BAD_REQUEST),
         // past the zoom cap, where the tile arithmetic stops working
         ("/tiles/dem/40/0/0.png", StatusCode::BAD_REQUEST),
         // inside the cap but outside the zoom's tile grid
