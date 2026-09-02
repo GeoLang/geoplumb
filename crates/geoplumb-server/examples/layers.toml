@@ -178,3 +178,47 @@ gray = { min = 0.0, max = 100.0 }
 [[layer.op]]
 kind = "rasterize"
 burn = { property = "depth" }
+
+# the roads whose `highway` property is residential, their properties
+# rewritten before the burn. a vector op leaves features behind, so the
+# chain still ends in a `rasterize`. `vec_schema` drops first, then
+# renames what survives, then adds the defaults a feature lacks, and a
+# third vector op, `vec_clip`, intersects every feature with the polygons
+# of a geojson file read at startup.
+[[layer]]
+name = "residential-lanes"
+source = { kind = "geojson", path = "/data/roads.geojson" }
+gray = { min = 0.0, max = 4.0 }
+
+[[layer.op]]
+kind = "vec_filter"
+field = "highway"
+equals = "residential"
+
+[[layer.op]]
+kind = "vec_schema"
+drop = ["surface"]
+rename = { name = "label" }
+add = { lanes = 2 }
+
+[[layer.op]]
+kind = "rasterize"
+burn = { property = "lanes" }
+
+# a las point cloud gridded to a raster. the file is read whole at startup
+# and `crs` names the epsg its coordinates are in, which las does not
+# carry in a form the reader trusts. points are not pixels, so the chain
+# needs an `idw`, and interpolated heights are no op's range, so the layer
+# says what the png stretches over. every idw field is optional and falls
+# back to the element's own default. `radius_px` is in output pixels, so
+# every zoom searches a comparable neighbourhood.
+[[layer]]
+name = "lidar-ground"
+source = { kind = "las", path = "/data/ground.las", crs = 26910 }
+gray = { min = 0.0, max = 500.0 }
+
+[[layer.op]]
+kind = "idw"
+power = 2.0
+radius_px = 8.0
+min_points = 3

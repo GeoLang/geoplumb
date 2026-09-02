@@ -15,7 +15,7 @@ Build a dag of sources and transforms, negotiate caps once, then pull windows: a
 
 Elements in v1 split into what a served layer file can name and what only Rust code against the crate can reach.
 
-Reachable from a layer file: the windowed COG source (only the tiles a pull touches are fetched, locally or over HTTP range requests, from the file overview nearest the request, single- or multi-band), the STAC collection source (items searched lazily per pulled window, paged to the end of the api's results, and combined band by band as a most-recent-first mosaic or a mean, median, min, max, percentile, standard deviation or count temporal composite over the searched interval, see `examples/stac_tiles.rs` for live Copernicus DEM hillshade), the GeoJSON vector source (a feature collection read whole at startup, simplified per level and clipped to the pulled window), the LAS point cloud source (a cloud read whole at startup and thinned by voxel decimation per level, paired with the `idw` op that grids its points into a raster band), and the ten ops `hillshade`, `slope`, `aspect`, `bandmath`, `focal`, `mask`, `reclassify`, `unary` and `convolve`, which is every single-input raster transform the crate ships, plus `rasterize`, which burns a constant or a numeric property per feature, and the three vector ops `vec_filter`, `vec_schema` and `vec_clip`, which run over features before a `rasterize` turns them into pixels. A layer may name several inputs instead of one source, each with its own chain, joined by a `mosaic` or a two-input `combine` and followed by a chain over the join. Reproject to web mercator and PNG encoding are appended to every layer, not named. The PNG stretch range comes from the last op that fixes one, or from the layer's own `gray = { min, max }`, which a layer ending in `reclassify` or `rasterize` has to name because class numbers and burned values carry no range of their own, as does a fan-in layer with nothing after the join to fix one. Mean, min, max, standard deviation and count fold item by item, so a pull's peak memory is one wave however deep the stack; median and percentile instead need every value at a pixel at once and hold a horizontal strip's whole stack under a fixed value budget.
+Reachable from a layer file: the windowed COG source (only the tiles a pull touches are fetched, locally or over HTTP range requests, from the file overview nearest the request, single- or multi-band), the STAC collection source (items searched lazily per pulled window, paged to the end of the api's results, and combined band by band as a most-recent-first mosaic or a mean, median, min, max, percentile, standard deviation or count temporal composite over the searched interval, see `examples/stac_tiles.rs` for live Copernicus DEM hillshade), the GeoJSON vector source (a feature collection read whole at startup, simplified per level and clipped to the pulled window), the LAS point cloud source (a cloud read whole at startup and thinned by voxel decimation per level, paired with the `idw` op that grids its points into a raster band), and the ten ops `hillshade`, `slope`, `aspect`, `bandmath`, `focal`, `mask`, `reclassify`, `unary` and `convolve`, which is every single-input raster transform the crate ships, plus `rasterize`, which burns a constant or a numeric property per feature, and the three vector ops `vec_filter`, `vec_schema` and `vec_clip`, which run over features before a `rasterize` turns them into pixels. A layer may name several inputs instead of one source, each with its own chain, joined by a `mosaic` or a two-input `combine` and followed by a chain over the join. Reproject to web mercator and PNG encoding are appended to every layer, not named. The PNG stretch range comes from the last op that fixes one, or from the layer's own `gray = { min, max }`, which a layer ending in `reclassify`, `rasterize` or `idw` has to name because class numbers, burned values and interpolated point heights carry no range of their own, as does a fan-in layer with nothing after the join to fix one. Mean, min, max, standard deviation and count fold item by item, so a pull's peak memory is one wave however deep the stack; median and percentile instead need every value at a pixel at once and hold a horizontal strip's whole stack under a fixed value budget.
 
 Library-only, meaning no layer file can name them: the in-memory GeoTIFF source, windowed tensors past the raster to tensor, 3x3 convolution, tensor to raster chain `convolve` builds out of them, explicit reproject for rasters and vectors (projicio, auto-plugged wherever a link disagrees only on CRS), zonal statistics and time-series pull drivers, and the XYZ tile adapter.
 
@@ -40,10 +40,9 @@ curl localhost:3000/layers
 ```
 
 The `ndvi` layer in that example file is a Sentinel-2 median composite with no
-cloud masking, which is not what you would deploy. Masking would need
-`QualityMask` over the SCL band, and `OpConfig` has no variant for it, so a
-layer file cannot ask for it. Build the graph in Rust when you need masked
-optical imagery.
+cloud masking, which is not what you would deploy. Add a `mask` op over the SCL
+band ahead of the `bandmath`, listing `scl` among the search assets, the way the
+`s2-red-clear` layer in the same file does.
 
 ```toml
 # the smallest useful layer file: hillshade over a public collection
@@ -85,4 +84,4 @@ See [DESIGN.md](DESIGN.md) for the architecture and [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 
-AGPL-3.0-or-later. `src/caps.rs` and `src/solver.rs` are adapted from glass2glass and remain MPL-2.0.
+AGPL-3.0-or-later. `crates/geoplumb/src/caps.rs` and `crates/geoplumb/src/solver.rs` are adapted from glass2glass and remain MPL-2.0.
