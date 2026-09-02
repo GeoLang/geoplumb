@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-02
+
+- the composite memory test bounds the folding and strip peaks at half a window per extra item instead of a quarter. a wave's peak depends on how many of its items are mid-decode at once and the deep pull keeps the highest of four waves, so the step measured 13 to 26 MB over 192 items across the ci hosts and the macos leg failed on a docs-only push. retained bytes across waves stay at about 3 KB per item, so nothing is held. holding the stack would grow a full window per item, which the new bound still refuses
+
 ## 2026-09-01
 
 - a tile path ending in `.tif` serves the same tile as a geotiff, `image/tiff`, carrying every band of the chunk at f64 and the web mercator origin and pixel size of the tile that was asked for. The suffixless path and `.png` stay the grayscale png, so no existing client sees a change, and the gray range a layer names applies only to the png

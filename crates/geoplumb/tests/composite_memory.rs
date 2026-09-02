@@ -211,7 +211,11 @@ async fn pull(items: usize, composite: Composite) -> (usize, f64) {
 /// stack reducer because it reads the window in strips. the control is the
 /// stack reducer under the budget, where a deeper stack really is another
 /// resident window per item: without it both bounds would pass on a
-/// harness too noisy to measure anything
+/// harness too noisy to measure anything. a wave's peak moves with how many
+/// of its items are mid-decode at once, and the deep pull keeps the highest
+/// of four waves, so a step carries noise: 13 to 26 MB over 192 items across
+/// the ci hosts. half a window per extra item clears that and is half what
+/// holding the stack would cost
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_composite_peaks_flat_in_the_stack_depth() {
     const {
@@ -241,11 +245,11 @@ async fn a_composite_peaks_flat_in_the_stack_depth() {
     let stack_step = deep_stack.saturating_sub(shallow_stack);
     let control_step = fitting_stack.saturating_sub(small_stack);
     assert!(
-        fold_step < extra_items / 4 * WINDOW_BYTES,
+        fold_step < extra_items / 2 * WINDOW_BYTES,
         "folding peak grew {fold_step} bytes over {extra_items} more items"
     );
     assert!(
-        stack_step < extra_items / 4 * WINDOW_BYTES,
+        stack_step < extra_items / 2 * WINDOW_BYTES,
         "stack peak grew {stack_step} bytes over {extra_items} more items"
     );
     let control_items = FITTING - FITTING / 4;
