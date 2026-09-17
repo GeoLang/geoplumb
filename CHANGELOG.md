@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-16
+
+- the readme called the layer-file raster ops "the ten ops" over a list of nine, and said that list is every single-input raster transform the crate ships, which leaves out reproject and the three tensor elements `convolve` is built from. it now says nine raster ops and makes no claim about the crate's full set
+
 ## 2026-09-02
 
 - the composite memory test bounds the folding and strip peaks at half a window per extra item instead of a quarter. a wave's peak depends on how many of its items are mid-decode at once and the deep pull keeps the highest of four waves, so the step measured 13 to 26 MB over 192 items across the ci hosts and the macos leg failed on a docs-only push. retained bytes across waves stay at about 3 KB per item, so nothing is held. holding the stack would grow a full window per item, which the new bound still refuses
