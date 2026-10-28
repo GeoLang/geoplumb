@@ -420,3 +420,19 @@ fn tile_index_scans_only_the_bins_a_tile_touches() {
         cloud.len()
     );
 }
+
+#[test]
+fn inverted_bbox_yields_no_candidates_at_once() {
+    let las = LasSrc::new(lattice_cloud(|_, _| 0.0), Crs::WGS84).unwrap();
+    // min_x past max_x by several bins, with a y range that spans every row
+    let bbox = Bbox::new(1.0e5, -1.0e300, 0.0, 1.0e300);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let count = las.candidates(&bbox).count();
+        let _ = sender.send(count);
+    });
+    let count = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("candidates did not return");
+    assert_eq!(count, 0);
+}

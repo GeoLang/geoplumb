@@ -97,7 +97,9 @@ impl LasSrc {
         let in_range = |(column, row): (i64, i64)| {
             (first_column..=last_column).contains(&column) && (first_row..=last_row).contains(&row)
         };
-        let mut indices: Vec<usize> = if columns.saturating_mul(rows) > self.bins.len() as i128 {
+        let mut indices: Vec<usize> = if columns == 0 || rows == 0 {
+            Vec::new()
+        } else if columns.saturating_mul(rows) > self.bins.len() as i128 {
             self.bins
                 .iter()
                 .filter(|(key, _)| in_range(**key))

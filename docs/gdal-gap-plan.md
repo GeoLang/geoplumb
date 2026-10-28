@@ -108,20 +108,24 @@ terrano release and a geoplumb bump together.
 - [ ] COPC, about a week. A `CopcSrc` that reads the octree hierarchy and
       fetches only the nodes a window at a ladder level touches, over the
       same `RangeRead` transport as COGs, so a remote COPC over HTTP works.
-      Candidates: `copc-rs` 0.5.0 (2025-05-15) and the `las` crate 0.11.2
-      (2026-10-27) with its `laz` feature. Neither has been evaluated against
-      nubis's `read_las`. The COPC level maps onto the ladder level directly,
-      which replaces the per-level voxel thinning for this source.
+      LAZ decoding is already in the org: tiletopia-server depends on the
+      `las` crate 0.9 with its `laz` feature (`crates/tiletopia-server`),
+      and the newest `las` is 0.11.2 (2026-10-27). `copc-rs` 0.5.0
+      (2025-05-15) reads the COPC hierarchy. Neither has been evaluated
+      against nubis's `read_las`. The COPC level maps onto the ladder level
+      directly, which replaces the per-level voxel thinning for this source.
 
 ## 4. Windowed vector source
 
 Two to three days. `VecSrc` holds the collection resident with an in-memory
 rtree over envelopes. A GeoPackage carries its own rtree in SQLite.
 
-- [ ] `GpkgSrc` over geodukt-io's rusqlite reader: a tile read queries the
-      layer's `rtree_<table>_<geom>` virtual table for the tile bbox and
-      decodes only those rows. Resident memory becomes the open connection
-      and a bounded feature cache.
+- [ ] `GpkgSrc` over `ptolemy-geopackage`, which already opens a GeoPackage
+      read-only and answers `FeatureQuery { bbox }` through the layer's
+      `rtree_<table>_<geom>` virtual table (`crates/ptolemy-geopackage/src/lib.rs`
+      in ptolemy). A tile read is one such query, decoding only those rows.
+      Resident memory becomes the open connection and a bounded feature
+      cache. geodukt-io reads GeoPackage whole, so it is not the base here.
 - [ ] Simplification per ladder level is unchanged, it already happens per
       tile read.
 - [ ] A test with a GeoPackage larger than the memory budget would be the
@@ -204,8 +208,18 @@ like today, by what the org already touches:
   for tables, geometry and the catalogue XML is two to four months, and it
   removes the last `gdal-sys` in the org.
 - Vector long tail: FlatGeobuf (`flatgeobuf` crate exists), GeoParquet
-  (`geoarrow-rs`), KML (verne has it), GML and WFS (XML, two weeks), DXF
-  (`dxf` crate), MapInfo TAB (no crate, a month).
+  (`ptolemy-api` already depends on `parquet`, read what it does before
+  adding another path), KML (verne has it), GML and WFS (XML, two weeks),
+  DXF (`dxf` crate), MapInfo TAB (no crate, a month).
+
+What the other repos already hold, checked 2026-10-28 over every
+`Cargo.toml` and README in the org: GDAL only in verne. ONNX inference in
+panoptes, which is where the design doc sends inference. `wgpu` and Vello
+in fenestra and jung for rendering, no compute path. `object_store` in
+tiletopia behind its `martin` feature only. tiletopia consumes terrano's
+`CogReader` for its `/api/v1/cog` window route and geoplumb's STAC source
+for its analysis tiles, so neither is duplicated there. No Zarr, HDF5,
+LZW or LERC anywhere.
 - Coordinate transforms: projicio already covers EPSG codes, Helmert and
   NTv2. What PROJ still has is geoid and vertical grids, time-dependent
   transforms and the CDN grid fetch. Each is weeks, none is blocking.
