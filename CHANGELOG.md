@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-28
+
+- `LasSrc` bins its points by base-grid tile at construction, so a tile read scans only the bins its window touches instead of the whole cloud, with the same points out as before
+
 ## 2026-09-16
 
 - the readme called the layer-file raster ops "the ten ops" over a list of nine, and said that list is every single-input raster transform the crate ships, which leaves out reproject and the three tensor elements `convolve` is built from. it now says nine raster ops and makes no claim about the crate's full set

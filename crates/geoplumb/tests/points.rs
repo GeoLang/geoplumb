@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::future::BoxFuture;
 use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
+use geoplumb::chunk::tile_contains;
 use geoplumb::element::{Source, Transform};
 use geoplumb::elements::{Hillshade, IdwGrid, LasSrc};
+use geoplumb::window::ChunkKey;
 use geoplumb::{Bbox, Caps, Chunk, Crs, Engine, Error, Graph, WindowReq};
 use nubis_core::{Point3, PointCloud};
 
@@ -20,9 +22,13 @@ fn plane(x: f64, y: f64) -> f64 {
 
 /// one point per cell center of a unit lattice, z on a gentle plane
 fn lattice_cloud(z: impl Fn(f64, f64) -> f64) -> PointCloud {
-    let mut pts = Vec::with_capacity(W * H);
-    for row in 0..H {
-        for col in 0..W {
+    lattice(W, H, z)
+}
+
+fn lattice(columns: usize, rows: usize, z: impl Fn(f64, f64) -> f64) -> PointCloud {
+    let mut pts = Vec::with_capacity(columns * rows);
+    for row in 0..rows {
+        for col in 0..columns {
             let (x, y) = (col as f64 + 0.5, row as f64 + 0.5);
             pts.push(Point3::new(x, y, z(x, y)));
         }
@@ -328,4 +334,89 @@ fn crs_demand_downstream_of_the_gridder_autoplugs_a_reproject() {
     assert!(matches!(engine.caps(las), Caps::PointCloud(_)));
     assert_eq!(engine.caps(grid).raster().crs, Crs::WGS84);
     assert_eq!(engine.caps(t).raster().crs, Crs::WEB_MERCATOR);
+}
+
+fn brute_force(cloud: &PointCloud, bbox: &Bbox) -> Vec<Point3> {
+    cloud
+        .points()
+        .iter()
+        .filter(|p| tile_contains(bbox, p.x, p.y))
+        .copied()
+        .collect()
+}
+
+fn chunk_key(level: u8, ix: i64, iy: i64) -> ChunkKey {
+    ChunkKey {
+        level,
+        ix,
+        iy,
+        time: None,
+    }
+}
+
+#[test]
+fn tile_index_candidates_keep_every_point_a_full_scan_keeps() {
+    let cloud = lattice(1024, 1024, plane);
+    let las = LasSrc::new(cloud.clone(), Crs::WGS84).unwrap();
+    let grid = las.grid();
+    let base_tile = grid.chunk_ground_size(0);
+    let aligned = grid.chunk_bbox(chunk_key(0, 1, 1));
+    let straddling_seam = Bbox::new(
+        aligned.min_x + 0.5 * base_tile,
+        aligned.min_y + 0.5 * base_tile,
+        aligned.max_x + 0.5 * base_tile,
+        aligned.max_y + 0.5 * base_tile,
+    );
+    let bboxes = [
+        aligned,
+        straddling_seam,
+        grid.chunk_bbox(chunk_key(0, 3, 3)),
+        grid.chunk_bbox(chunk_key(1, 1, 0)),
+        grid.chunk_bbox(chunk_key(2, 0, 0)),
+        grid.chunk_bbox(chunk_key(0, -2, -2)),
+        grid.chunk_bbox(chunk_key(1, 5, 5)),
+        Bbox::new(-1e12, aligned.min_y, 1e12, aligned.max_y),
+    ];
+    for bbox in bboxes {
+        let indexed: Vec<Point3> = las
+            .candidates(&bbox)
+            .filter(|p| tile_contains(&bbox, p.x, p.y))
+            .copied()
+            .collect();
+        assert_eq!(indexed, brute_force(&cloud, &bbox), "bbox {bbox:?}");
+    }
+}
+
+#[test]
+fn tile_index_scans_only_the_bins_a_tile_touches() {
+    let cloud = lattice(2048, 2048, plane);
+    let las = LasSrc::new(cloud.clone(), Crs::WGS84).unwrap();
+    let grid = las.grid();
+    let base_tile = grid.chunk_ground_size(0);
+    let (min, max) = cloud.bounds().unwrap();
+    assert!(max.x - min.x >= 8.0 * base_tile && max.y - min.y >= 8.0 * base_tile);
+
+    let bbox = grid.chunk_bbox(chunk_key(0, 3, 4));
+    let scanned = las.candidates(&bbox).count();
+    let inside = brute_force(&cloud, &bbox).len();
+    assert!(inside > 0);
+    assert!(scanned >= inside, "scanned {scanned}, inside {inside}");
+    assert!(
+        scanned < cloud.len() / 4,
+        "scanned {scanned} of {} points",
+        cloud.len()
+    );
+
+    let row_spanning_more_bins_than_exist = Bbox::new(
+        -1e12,
+        bbox.min_y + 0.25 * base_tile,
+        1e12,
+        bbox.max_y - 0.25 * base_tile,
+    );
+    let scanned_row = las.candidates(&row_spanning_more_bins_than_exist).count();
+    assert!(
+        scanned_row < cloud.len() / 4,
+        "scanned {scanned_row} of {} points",
+        cloud.len()
+    );
 }
