@@ -22,6 +22,8 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
+#[cfg(feature = "gdal")]
+use geoplumb::elements::GdalSrc;
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::{
     Aspect, BandMath, CogSrc, Combine, Focal, Hillshade, IdwGrid, LasSrc, MapAlgebra, Mosaic,
@@ -54,7 +56,8 @@ pub struct Layer {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerInfo {
     pub name: String,
-    /// `stac`, `cog`, `geojson`, `las`, or `composite` for a fan-in layer
+    /// `stac`, `cog`, `gdal`, `geojson`, `las`, or `composite` for a fan-in
+    /// layer
     pub source: &'static str,
     pub collection: Option<String>,
     /// the interval pulls take when they name none
@@ -248,6 +251,27 @@ fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, L
                 },
             ))
         }
+        #[cfg(feature = "gdal")]
+        SourceConfig::Gdal { path, band } => {
+            let src = match band {
+                None => GdalSrc::open(path),
+                Some(band) => GdalSrc::open_band(path, *band),
+            }
+            .map_err(|e| e.to_string())?;
+            println!("layer {layer}: gdal driver {}", src.driver());
+            Ok((
+                Box::new(src),
+                LayerInfo {
+                    name,
+                    source: "gdal",
+                    collection: None,
+                    default_datetime: None,
+                    temporal_extent: None,
+                },
+            ))
+        }
+        #[cfg(not(feature = "gdal"))]
+        SourceConfig::Gdal { .. } => Err(config::GDAL_NOT_BUILT.into()),
         SourceConfig::Geojson { path } => {
             let text =
                 std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;

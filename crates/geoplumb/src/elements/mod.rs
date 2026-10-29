@@ -1,6 +1,8 @@
 pub mod algebra;
 pub mod band_math;
 pub mod cog;
+#[cfg(feature = "gdal")]
+pub mod gdal;
 pub mod mosaic;
 pub mod points;
 pub mod reproject;
@@ -11,6 +13,8 @@ pub mod terrain;
 pub mod vec_ops;
 pub mod vector;
 
+#[cfg(feature = "gdal")]
+pub use self::gdal::GdalSrc;
 pub use algebra::{Combine, MapAlgebra};
 pub use band_math::BandMath;
 pub use cog::{CogSrc, HttpRange};

@@ -114,6 +114,12 @@ pub enum SourceConfig {
     Cog {
         path: PathBuf,
     },
+    /// any raster gdal opens, in a server built with the `gdal` feature
+    Gdal {
+        path: PathBuf,
+        /// the one 1-based band served, every band when absent
+        band: Option<u16>,
+    },
     /// a feature collection read whole at startup, lon/lat per rfc 7946.
     /// features are not pixels, so the chain over it needs a `rasterize`
     Geojson {
@@ -372,6 +378,9 @@ impl Config {
     }
 }
 
+pub(crate) const GDAL_NOT_BUILT: &str =
+    "the gdal source needs a server built with the gdal feature, this one was built without it";
+
 /// what one source and the chain over it have to satisfy before the layer
 /// can serve tiles
 fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
@@ -392,6 +401,9 @@ fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
             return Err("the las source has no idw op, so the chain hands \
                         points to a png encoder that wants pixels"
                 .into());
+        }
+        SourceConfig::Gdal { .. } if cfg!(not(feature = "gdal")) => {
+            return Err(GDAL_NOT_BUILT.into());
         }
         _ => {}
     }
@@ -546,9 +558,10 @@ impl SourceConfig {
     /// the search a stac layer opens with, `None` for any other kind
     pub fn stac_search(&self) -> Option<StacSearch> {
         match self {
-            SourceConfig::Cog { .. } | SourceConfig::Geojson { .. } | SourceConfig::Las { .. } => {
-                None
-            }
+            SourceConfig::Cog { .. }
+            | SourceConfig::Gdal { .. }
+            | SourceConfig::Geojson { .. }
+            | SourceConfig::Las { .. } => None,
             SourceConfig::Stac {
                 api,
                 collection,

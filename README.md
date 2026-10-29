@@ -17,7 +17,7 @@ You build a graph of sources and transforms, the engine negotiates caps once, an
 
 A served layer file can name these:
 
-- Sources: `stac` (a STAC collection), `cog` (a local COG file), `geojson` and `las`.
+- Sources: `stac` (a STAC collection), `cog` (a local COG file), `gdal` (any raster GDAL opens, in a build with the `gdal` feature), `geojson` and `las`.
 - Raster ops: `hillshade`, `slope`, `aspect`, `bandmath`, `focal`, `mask`, `reclassify`, `unary` and `convolve`.
 - Vector ops: `vec_filter`, `vec_schema` and `vec_clip`, then `rasterize`, which burns a constant or a numeric property per feature.
 - Point op: `idw`, which grids LAS points into one raster band.
@@ -27,6 +27,7 @@ Source behaviour:
 
 - `stac` searches items per pulled window and follows `next` links to the end of the results. The `composite` key picks how the items combine band by band: `latest` (the default, newest item first), `mean`, `median`, `min`, `max`, `percentile`, `stddev` or `count`. `mean`, `min`, `max`, `stddev` and `count` fold item by item, so peak memory is one batch of parallel item reads however many the search returns. `median` and `percentile` need every value at a pixel at once, so they read the window in horizontal strips under a fixed value budget. See `examples/stac_tiles.rs` for Copernicus DEM hillshade.
 - `cog` fetches only the tiles a pull touches, from the file overview nearest the request, single- or multi-band.
+- `gdal` reads only the window a pull touches, from the file overview nearest the request, every band as f64. It refuses a rotated or sheared geotransform and a CRS without an EPSG code at startup. GDAL's own `AVERAGE` overviews count NaN as a value unless the file declares NaN as nodata.
 - `geojson` reads a feature collection whole at startup, then simplifies it per level and clips it to the pulled window.
 - `las` reads a point cloud whole at startup and thins it by voxel decimation per level.
 
@@ -88,6 +89,14 @@ azimuth = 315.0
 altitude = 45.0
 ```
 
+A server built with the `gdal` feature also takes a local raster in any format GDAL reads. `band` is 1-based and optional, and every band is served when it is absent. Startup prints the GDAL driver each `gdal` layer opened with. A build without the feature refuses a layer file naming `gdal` and says so.
+
+```toml
+[[layer]]
+name = "dem"
+source = { kind = "gdal", path = "/data/dem.tif", band = 1 }
+```
+
 ## Library
 
 ```rust
@@ -109,10 +118,10 @@ let chunk = engine.pull(rp, WindowReq { bbox, resolution, time }).await?;
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
+cargo test --all --all-features
 ```
 
-Pure Rust, no GDAL. Depends on the sibling GeoLang crates `terrano-core` (raster kernels), `projicio-core` (CRS transforms), `nubis-core` (point clouds) and `topoi-core` (vector geometry), all as git dependencies on master.
+The default build is pure Rust with no GDAL. The `gdal` feature, on `geoplumb` and on `geoplumb-server`, adds the `gdal` source and links the system libgdal, so `--all-features` needs it installed (`apt-get install libgdal-dev` on Debian and Ubuntu, GDAL 3.4 to 3.12). Build the server with it by `cargo build --release -p geoplumb-server --features gdal`, or the image by `docker build --build-arg GDAL=1 .`, which installs bookworm's `libgdal32` at runtime. Depends on the sibling GeoLang crates `terrano-core` (raster kernels), `projicio-core` (CRS transforms), `nubis-core` (point clouds) and `topoi-core` (vector geometry), all as git dependencies on master.
 
 See [DESIGN.md](DESIGN.md) for the architecture and [CHANGELOG.md](CHANGELOG.md) for history.
 

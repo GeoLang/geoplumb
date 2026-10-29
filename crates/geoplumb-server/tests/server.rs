@@ -1649,6 +1649,100 @@ async fn layers_publishes_a_fan_in_and_a_geojson_layer_by_what_they_read() {
     assert!(named("parcels")["temporal_extent"].is_null());
 }
 
+/// the dem as a cog layer and as a gdal layer over a striped copy, so the
+/// two tiles can be compared
+const GDAL_BESIDE_COG: &str = r#"
+[[layer]]
+name = "dem"
+source = { kind = "cog", path = "COG_PATH" }
+
+[[layer.op]]
+kind = "hillshade"
+azimuth = 315.0
+altitude = 45.0
+
+[[layer]]
+name = "dem-gdal"
+source = { kind = "gdal", path = "GDAL_PATH", band = 1 }
+
+[[layer.op]]
+kind = "hillshade"
+azimuth = 315.0
+altitude = 45.0
+"#;
+
+#[cfg(feature = "gdal")]
+#[test]
+fn config_parses_a_gdal_layer_and_its_band() {
+    let config = Config::parse(GDAL_BESIDE_COG).unwrap();
+    match source_of(&config.layers[1]) {
+        SourceConfig::Gdal { path, band } => {
+            assert_eq!(path, Path::new("GDAL_PATH"));
+            assert_eq!(*band, Some(1));
+        }
+        other => panic!("expected a gdal source, got {other:?}"),
+    }
+}
+
+#[cfg(not(feature = "gdal"))]
+#[test]
+fn a_gdal_layer_fails_to_parse_without_the_feature() {
+    let message = Config::parse(GDAL_BESIDE_COG).unwrap_err();
+    assert!(message.contains("layer dem-gdal"), "{message}");
+    assert!(message.contains("gdal feature"), "{message}");
+}
+
+/// the dem as a striped geotiff. gdal reads no epsg code from a terrano
+/// cog, whose geokeys lack the model type
+#[cfg(feature = "gdal")]
+fn write_striped_dem(dir: &Path) -> String {
+    let raster = Raster::from_vec(W, H, dem_values(), CELL, f64::NAN).unwrap();
+    let meta = terrano_core::GeoTiffMetadata {
+        origin_x: ORIGIN_X,
+        origin_y: ORIGIN_Y,
+        pixel_width: CELL,
+        pixel_height: CELL,
+        epsg: 4326,
+    };
+    let mut bytes = Vec::new();
+    terrano_core::write_geotiff_bands(
+        &BandedRaster::new(vec![raster]).unwrap(),
+        &meta,
+        terrano_core::SampleFormat::F64,
+        &mut bytes,
+    )
+    .unwrap();
+    let path = dir.join("striped.tif");
+    std::fs::write(&path, bytes).unwrap();
+    path.display().to_string().replace('\\', "/")
+}
+
+#[cfg(feature = "gdal")]
+#[tokio::test]
+async fn a_gdal_layer_serves_the_tile_the_cog_layer_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = GDAL_BESIDE_COG
+        .replace("COG_PATH", &write_dem(dir.path()))
+        .replace("GDAL_PATH", &write_striped_dem(dir.path()));
+    let app = app(&text);
+    let (x, y) = tile_of(12, 7.3, 46.8);
+
+    let (status, cog) = get(&app, &format!("/tiles/dem/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, gdal) = get(&app, &format!("/tiles/dem-gdal/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        opaque_pixels(&gdal) > 0,
+        "the tile rendered nothing but nodata"
+    );
+    assert_eq!(png_pixels(&gdal), png_pixels(&cog));
+
+    let (_, body) = get(&app, "/layers").await;
+    let layers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(layers[1]["name"], "dem-gdal");
+    assert_eq!(layers[1]["source"], "gdal");
+}
+
 /// the gray range the two-band layer stretches band 0 over, the dem's own
 /// range across the rendered tile
 const BANDED_GRAY: (f64, f64) = (300.0, 400.0);

@@ -14,7 +14,14 @@ jobs:
   check:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          # only the ubuntu leg installs libgdal, so only it builds the gdal feature
+          - os: ubuntu-latest
+            features: --all-features
+          - os: windows-latest
+            features: ""
+          - os: macos-latest
+            features: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -22,12 +29,15 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Install GDAL
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libgdal-dev
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
       - name: Test
-        run: cargo test --all
+        run: cargo test --all ${{ matrix.features }}
 
   deny:
     runs-on: ubuntu-latest
@@ -50,6 +60,8 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - name: Install GDAL
+        run: sudo apt-get update && sudo apt-get install -y libgdal-dev
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage

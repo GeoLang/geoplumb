@@ -2,6 +2,7 @@
 
 ## 2026-10-28
 
+- `gdal` as a layer source in a server built with the new `gdal` feature, serving any raster GDAL opens: `source = { kind = "gdal", path = "/data/dem.tif", band = 1 }`, with `band` 1-based and optional, every band served when it is absent. Pulls read only their window, from the file overview nearest the request, every band as f64. A rotated or sheared geotransform, non-square pixels, a CRS without an EPSG code and an out-of-range band fail at startup naming the file, and startup prints the GDAL driver each such layer opened with. A build without the feature fails to parse a layer file naming `gdal`, naming the layer and the feature. The Docker image builds it with `--build-arg GDAL=1`
 - `LasSrc` bins its points by base-grid tile at construction, so a tile read scans only the bins its window touches instead of the whole cloud, with the same points out as before
 
 ## 2026-09-16

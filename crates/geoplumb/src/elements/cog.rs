@@ -150,7 +150,7 @@ pub(crate) fn read_chunk<R: RangeRead>(
     })
 }
 
-fn decimate(fine: &[f64], cols: usize, rows: usize, factor: usize) -> Vec<f64> {
+pub(crate) fn decimate(fine: &[f64], cols: usize, rows: usize, factor: usize) -> Vec<f64> {
     let fcols = cols * factor;
     let mut out = vec![f64::NAN; cols * rows];
     for row in 0..rows {
