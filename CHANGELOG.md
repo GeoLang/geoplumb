@@ -2,6 +2,7 @@
 
 ## 2026-10-28
 
+- `CogSrc` reads the chunks of one pull concurrently through one shared reader instead of one at a time behind a lock, and `StacSrc` keeps one reader per asset where it pooled up to four, since terrano's `RangeRead` and `CogReader` reads take `&self`
 - `LasSrc` bins its points by base-grid tile at construction, so a tile read scans only the bins its window touches instead of the whole cloud, with the same points out as before
 
 ## 2026-09-16

@@ -16,9 +16,8 @@ use crate::window::{GridSpec, WindowReq};
 use futures::future::BoxFuture;
 use terrano_core::{BandedRaster, CogReader, RangeRead, Raster};
 
-pub struct CogSrc<R: RangeRead + Send + 'static> {
-    // read_window_bands needs &mut, so concurrent chunk reads serialize here
-    reader: Arc<Mutex<CogReader<R>>>,
+pub struct CogSrc<R: RangeRead + Send + Sync + 'static> {
+    reader: Arc<CogReader<R>>,
     origin_x: f64,
     origin_y: f64,
     base_resolution: f64,
@@ -26,7 +25,7 @@ pub struct CogSrc<R: RangeRead + Send + 'static> {
     crs: Crs,
 }
 
-impl<R: RangeRead + Send + 'static> CogSrc<R> {
+impl<R: RangeRead + Send + Sync + 'static> CogSrc<R> {
     /// reads the file layout with blocking range requests, call it off
     /// the async runtime (`spawn_blocking`) when one is running
     pub fn open(source: R) -> Result<Self> {
@@ -39,7 +38,7 @@ impl<R: RangeRead + Send + 'static> CogSrc<R> {
             base_resolution: meta.pixel_width,
             bands,
             crs: Crs(u32::from(meta.epsg)),
-            reader: Arc::new(Mutex::new(reader)),
+            reader: Arc::new(reader),
         })
     }
 
@@ -59,7 +58,7 @@ pub(crate) fn band_count<R: RangeRead>(reader: &CogReader<R>) -> Result<u16> {
     u16::try_from(samples).map_err(|_| Error::Source(format!("cog has {samples} bands")))
 }
 
-impl<R: RangeRead + Send + 'static> Source for CogSrc<R> {
+impl<R: RangeRead + Send + Sync + 'static> Source for CogSrc<R> {
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
             dtype: SetField::one(Dtype::F64),
@@ -85,8 +84,7 @@ impl<R: RangeRead + Send + 'static> Source for CogSrc<R> {
         let (origin_x, origin_y, crs) = (self.origin_x, self.origin_y, self.crs);
         Box::pin(async move {
             crate::engine::offload(move || {
-                read_chunk(&mut reader.lock().unwrap(), &req, origin_x, origin_y, crs)
-                    .map(Chunk::Raster)
+                read_chunk(&reader, &req, origin_x, origin_y, crs).map(Chunk::Raster)
             })
             .await
         })
@@ -94,7 +92,7 @@ impl<R: RangeRead + Send + 'static> Source for CogSrc<R> {
 }
 
 pub(crate) fn read_chunk<R: RangeRead>(
-    reader: &mut CogReader<R>,
+    reader: &CogReader<R>,
     req: &WindowReq,
     origin_x: f64,
     origin_y: f64,
@@ -418,7 +416,7 @@ impl HttpRange {
 
 impl RangeRead for HttpRange {
     fn read_range(
-        &mut self,
+        &self,
         offset: u64,
         len: u64,
     ) -> core::result::Result<Vec<u8>, terrano_core::Error> {
@@ -430,7 +428,7 @@ impl RangeRead for HttpRange {
     /// caller's in-flight fetch happens after every own claim has been
     /// published, so callers cannot deadlock on each other's claims
     fn read_ranges(
-        &mut self,
+        &self,
         ranges: &[(u64, u64)],
     ) -> core::result::Result<Vec<Vec<u8>>, terrano_core::Error> {
         let mut out: Vec<Option<Vec<u8>>> = vec![None; ranges.len()];

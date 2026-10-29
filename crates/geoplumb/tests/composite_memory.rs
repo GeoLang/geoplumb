@@ -106,6 +106,7 @@ fn cog(value: f64) -> Vec<u8> {
         pixel_width: CELL,
         pixel_height: CELL,
         deflate: true,
+        ..CogParams::default()
     };
     let mut buf = std::io::Cursor::new(Vec::new());
     write_cog(&raster, &params, &mut buf).unwrap();

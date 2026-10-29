@@ -2,8 +2,10 @@
 //! nan padding outside the file, multi-band files, and the http range
 //! transport
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::ThreadId;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -55,6 +57,7 @@ fn params(overview_levels: u32) -> CogParams {
         pixel_width: CELL,
         pixel_height: CELL,
         deflate: false,
+        ..CogParams::default()
     }
 }
 
@@ -85,10 +88,44 @@ impl MemRange {
 }
 
 impl RangeRead for MemRange {
-    fn read_range(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, terrano_core::Error> {
+    fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, terrano_core::Error> {
         self.fetched.fetch_add(len as usize, Ordering::SeqCst);
-        let mut slice = self.data.as_slice();
-        slice.read_range(offset, len)
+        self.data.as_slice().read_range(offset, len)
+    }
+}
+
+/// tile reads in arrival order, tagged by the reading thread: each chunk
+/// read runs on its own blocking thread
+#[derive(Default)]
+struct ReadLog {
+    readers: Mutex<Vec<ThreadId>>,
+    second_read: Condvar,
+    armed: AtomicBool,
+}
+
+/// how long the first armed read waits for a read from another chunk
+const SECOND_READ_WAIT: Duration = Duration::from_secs(2);
+
+struct GatedRange {
+    data: Vec<u8>,
+    log: Arc<ReadLog>,
+}
+
+impl RangeRead for GatedRange {
+    fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, terrano_core::Error> {
+        if self.log.armed.load(Ordering::SeqCst) {
+            let mut readers = self.log.readers.lock().unwrap();
+            readers.push(std::thread::current().id());
+            self.log.second_read.notify_all();
+            if readers.len() == 1 {
+                let _ = self
+                    .log
+                    .second_read
+                    .wait_timeout_while(readers, SECOND_READ_WAIT, |readers| readers.len() == 1)
+                    .unwrap();
+            }
+        }
+        self.data.as_slice().read_range(offset, len)
     }
 }
 
@@ -188,6 +225,55 @@ async fn tile_bytes_fetched(req: WindowReq) -> usize {
     let before = fetched.load(Ordering::SeqCst);
     src.read(&req).await.unwrap().into_raster().unwrap();
     fetched.load(Ordering::SeqCst) - before
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_chunks_of_one_cog_interleave_their_reads() {
+    let log = Arc::new(ReadLog::default());
+    let src = Arc::new(
+        CogSrc::open(GatedRange {
+            data: cog_bytes(0),
+            log: log.clone(),
+        })
+        .unwrap(),
+    );
+    log.armed.store(true, Ordering::SeqCst);
+
+    // two tiles across each, on tile rows that do not meet
+    let read = |bbox: Bbox| {
+        let src = src.clone();
+        tokio::spawn(async move {
+            let req = WindowReq {
+                bbox,
+                resolution: CELL,
+                time: None,
+            };
+            src.read(&req).await.unwrap()
+        })
+    };
+    let first = read(window(0, 0, 128, 64));
+    let second = read(window(256, 128, 384, 192));
+    first.await.unwrap();
+    second.await.unwrap();
+
+    let readers = log.readers.lock().unwrap();
+    let chunk_a = readers[0];
+    let a_reads: Vec<usize> = (0..readers.len())
+        .filter(|&i| readers[i] == chunk_a)
+        .collect();
+    let b_reads: Vec<usize> = (0..readers.len())
+        .filter(|&i| readers[i] != chunk_a)
+        .collect();
+    assert_eq!(
+        (a_reads.len(), b_reads.len()),
+        (2, 2),
+        "reads by chunk: {readers:?}"
+    );
+    // a lock around the reader runs one chunk's reads to the end before the other's first
+    assert!(
+        b_reads[0] < a_reads[a_reads.len() - 1] && a_reads[0] < b_reads[b_reads.len() - 1],
+        "chunk reads did not interleave: {readers:?}"
+    );
 }
 
 #[tokio::test]

@@ -59,6 +59,7 @@ fn params(x0: usize) -> CogParams {
         pixel_width: CELL,
         pixel_height: CELL,
         deflate: true,
+        ..CogParams::default()
     }
 }
 
