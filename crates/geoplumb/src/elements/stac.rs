@@ -9,7 +9,8 @@
 //! may name several assets (collections like sentinel-2 spread bands
 //! across per-band cogs): an item is kept only when every asset is
 //! present, and a pull reads them all, bands concatenated in asset order.
-//! item reads run in parallel, capped across every pull in the process.
+//! item reads, and the asset reads within an item, run in parallel, asset
+//! reads capped across every pull in the process.
 //!
 //! a pull may carry its own interval, which overrides the search's
 //! `datetime` for that pull: blocks are searched, and their item sets
@@ -69,12 +70,13 @@ const MAX_CACHED_SEARCHES: usize = 256;
 /// item references retained across one source's completed searches
 const MAX_CACHED_SEARCH_MATCHES: usize = 8192;
 
-/// item reads in flight across every pull in the process. each read is
-/// blocking http offloaded to the runtime's blocking pool, so without a
-/// shared cap n concurrent pulls would stack n windows' worth of threads
+/// asset reads in flight across every pull in the process, and the items
+/// one fill or fold wave reads. each asset read is blocking http offloaded
+/// to the runtime's blocking pool, so without a shared cap n concurrent
+/// pulls would stack n windows' worth of threads
 pub const MAX_PARALLEL_ITEM_READS: usize = 64;
 
-static ITEM_READ_PERMITS: LazyLock<tokio::sync::Semaphore> =
+static ASSET_READ_PERMITS: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(MAX_PARALLEL_ITEM_READS));
 
 /// epoch milliseconds from an rfc 3339 timestamp, the form stac item and
@@ -814,54 +816,45 @@ impl Inner {
         Ok(results)
     }
 
-    /// one item's window across every asset, bands concatenated in asset
-    /// order, each cog opening on first use. an asset of an item on
-    /// another crs comes back warped onto the anchor grid, so every band
-    /// of the chunk is on the window the caller asked for either way
-    fn read_item(&self, item: &Item, req: &WindowReq, scale_window: &Bbox) -> Result<RasterChunk> {
-        // the pull filters items against the whole window, a strip of it can
-        // still miss one, and opening its cogs to find that out costs a fetch
-        if !item.bbox.intersects(&req.bbox) {
-            return self.empty(req);
-        }
-        let mut bands = Vec::with_capacity(usize::from(self.bands));
-        for (k, slot) in item.readers.iter().enumerate() {
-            let reader = match slot.get() {
-                Some(reader) => reader,
-                None => {
-                    let opened = CogReader::open(HttpRange::new(&item.hrefs[k]))?;
-                    // a concurrent read may have opened the asset first, its reader wins
-                    slot.get_or_init(|| opened)
-                }
-            };
-            let meta = reader.meta().clone();
-            let asset_bands = band_count(reader)?;
-            if asset_bands != self.asset_bands[k] {
-                return Err(Error::Source(format!(
-                    "stac item asset {} has {asset_bands} bands, the anchor item has {}",
-                    item.hrefs[k], self.asset_bands[k]
-                )));
+    /// one asset's window of an item, its cog opening on first use. an
+    /// asset of an item on another crs comes back warped onto the anchor
+    /// grid, so it is on the window the caller asked for either way
+    fn read_asset(
+        &self,
+        item: &Item,
+        k: usize,
+        req: &WindowReq,
+        scale_window: &Bbox,
+    ) -> Result<RasterChunk> {
+        let slot = &item.readers[k];
+        let reader = match slot.get() {
+            Some(reader) => reader,
+            None => {
+                let opened = CogReader::open(HttpRange::new(&item.hrefs[k]))?;
+                // a concurrent read may have opened the asset first, its reader wins
+                slot.get_or_init(|| opened)
             }
-            let chunk = match &item.reprojection {
-                None => read_chunk(reader, req, meta.origin_x, meta.origin_y, self.crs)?,
-                Some(reprojection) => read_warped(
-                    reader,
-                    req,
-                    meta.origin_x,
-                    meta.origin_y,
-                    reprojection,
-                    self.crs,
-                    scale_window,
-                )?,
-            };
-            bands.extend(chunk.bands.into_bands());
+        };
+        let meta = reader.meta().clone();
+        let asset_bands = band_count(reader)?;
+        if asset_bands != self.asset_bands[k] {
+            return Err(Error::Source(format!(
+                "stac item asset {} has {asset_bands} bands, the anchor item has {}",
+                item.hrefs[k], self.asset_bands[k]
+            )));
         }
-        Ok(RasterChunk {
-            bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
-            bbox: req.bbox,
-            resolution: req.resolution,
-            crs: self.crs,
-        })
+        match &item.reprojection {
+            None => read_chunk(reader, req, meta.origin_x, meta.origin_y, self.crs),
+            Some(reprojection) => read_warped(
+                reader,
+                req,
+                meta.origin_x,
+                meta.origin_y,
+                reprojection,
+                self.crs,
+                scale_window,
+            ),
+        }
     }
 
     /// nothing intersects: an all-nodata window on the source grid
@@ -953,29 +946,58 @@ fn read_warped(
     warp_to_grid(&chunk, req, &reprojection.from_anchor, anchor)
 }
 
-/// one window read per item, `MAX_PARALLEL_ITEM_READS` in flight across
-/// the whole process, results in item order. `scale_window` is the whole
-/// pull window, which `req` is a strip of when a reduction reads the pull
-/// in strips
+/// one item's window across every asset, the assets read in parallel and
+/// their bands concatenated in asset order
+async fn read_item(
+    inner: &Arc<Inner>,
+    item: &Arc<Item>,
+    req: &WindowReq,
+    scale_window: &Bbox,
+) -> Result<RasterChunk> {
+    // the pull filters items against the whole window, a strip of it can
+    // still miss one, and opening its cogs to find that out costs a fetch
+    if !item.bbox.intersects(&req.bbox) {
+        let (inner, req) = (inner.clone(), *req);
+        return crate::engine::offload(move || inner.empty(&req)).await;
+    }
+    let reads = (0..item.readers.len()).map(|k| {
+        let inner = inner.clone();
+        let item = item.clone();
+        let req = *req;
+        let scale_window = *scale_window;
+        async move {
+            let _permit = ASSET_READ_PERMITS
+                .acquire()
+                .await
+                .expect("semaphore is never closed");
+            crate::engine::offload(move || inner.read_asset(&item, k, &req, &scale_window)).await
+        }
+    });
+    let chunks = futures::future::try_join_all(reads).await?;
+    let bands = chunks
+        .into_iter()
+        .flat_map(|chunk| chunk.bands.into_bands())
+        .collect();
+    Ok(RasterChunk {
+        bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
+        bbox: req.bbox,
+        resolution: req.resolution,
+        crs: inner.crs,
+    })
+}
+
+/// one window read per item, results in item order. `scale_window` is
+/// the whole pull window, which `req` is a strip of when a reduction
+/// reads the pull in strips
 async fn read_items(
     inner: &Arc<Inner>,
     items: &[Arc<Item>],
     req: &WindowReq,
     scale_window: &Bbox,
 ) -> Result<Vec<RasterChunk>> {
-    let reads = items.iter().map(|item| {
-        let inner = inner.clone();
-        let item = item.clone();
-        let req = *req;
-        let scale_window = *scale_window;
-        async move {
-            let _permit = ITEM_READ_PERMITS
-                .acquire()
-                .await
-                .expect("semaphore is never closed");
-            crate::engine::offload(move || inner.read_item(&item, &req, &scale_window)).await
-        }
-    });
+    let reads = items
+        .iter()
+        .map(|item| read_item(inner, item, req, scale_window));
     futures::future::try_join_all(reads).await
 }
 

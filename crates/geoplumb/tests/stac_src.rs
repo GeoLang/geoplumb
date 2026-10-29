@@ -4,8 +4,8 @@
 //! another crs warped onto the anchor grid, and lazy per-window block
 //! searches past the open bbox
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -216,17 +216,23 @@ type Scene = (
     Vec<serde_json::Value>,
 );
 
-async fn start_mock_with(build: impl FnOnce(&str) -> Scene) -> (String, Arc<Mock>) {
+async fn bind_mock(build: impl FnOnce(&str) -> Scene) -> (tokio::net::TcpListener, Arc<Mock>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
     let (cogs, features) = build(&base);
     let mock = Arc::new(Mock {
-        base: base.clone(),
+        base,
         cogs,
         features,
         searches: AtomicUsize::new(0),
     });
+    (listener, mock)
+}
+
+async fn start_mock_with(build: impl FnOnce(&str) -> Scene) -> (String, Arc<Mock>) {
+    let (listener, mock) = bind_mock(build).await;
+    let base = mock.base.clone();
     let app = axum::Router::new()
         .route("/search", get(serve_search))
         .route("/cog/{name}", get(serve_cog))
@@ -858,6 +864,114 @@ async fn assets_on_different_grids_fail_at_open() {
         Err(e) => e,
     };
     assert!(err.to_string().contains("different resolutions"), "{err}");
+}
+
+#[derive(Debug, PartialEq)]
+enum GatedCogEvent {
+    NirRequested,
+    RedAnswered,
+}
+
+/// cog server that, once armed, holds every red range until nir has been
+/// asked for, logging both in the order they happen
+struct AssetGate {
+    mock: Arc<Mock>,
+    armed: AtomicBool,
+    nir_requested: tokio::sync::watch::Sender<bool>,
+    events: Mutex<Vec<GatedCogEvent>>,
+}
+
+const GATED_RED: &str = "g_red.tif";
+const GATED_NIR: &str = "g_nir.tif";
+const NIR_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn serve_gated_cog(
+    State(gate): State<Arc<AssetGate>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> (StatusCode, Vec<u8>) {
+    let armed = gate.armed.load(Ordering::SeqCst);
+    if armed && name == GATED_NIR {
+        gate.events
+            .lock()
+            .unwrap()
+            .push(GatedCogEvent::NirRequested);
+        gate.nir_requested.send_replace(true);
+    }
+    if armed && name == GATED_RED {
+        let mut requested = gate.nir_requested.subscribe();
+        // red answers after the wait either way, so a sequential read fails the order check instead of hanging
+        let _ = tokio::time::timeout(NIR_WAIT, requested.wait_for(|seen| *seen)).await;
+    }
+    let response = serve_cog(State(gate.mock.clone()), Path(name.clone()), headers).await;
+    if armed && name == GATED_RED {
+        gate.events.lock().unwrap().push(GatedCogEvent::RedAnswered);
+    }
+    response
+}
+
+/// one item with a red and a nir asset, served through the gate
+async fn start_gated_asset_mock() -> (String, Arc<AssetGate>) {
+    let (listener, mock) = bind_mock(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert(GATED_RED.into(), cog(0, 300, 400, 0.0, false));
+        cogs.insert(GATED_NIR.into(), cog(0, 300, 400, NIR_SHIFT, false));
+        let features = vec![asset_item(
+            "g_item",
+            "2024-06-01T00:00:00Z",
+            &[
+                ("red", format!("{base}/cog/{GATED_RED}")),
+                ("nir", format!("{base}/cog/{GATED_NIR}")),
+            ],
+            [7.0, 46.6, 7.3, 47.0],
+            4326,
+        )];
+        (cogs, features)
+    })
+    .await;
+    let gate = Arc::new(AssetGate {
+        mock: mock.clone(),
+        armed: AtomicBool::new(false),
+        nir_requested: tokio::sync::watch::Sender::new(false),
+        events: Mutex::new(Vec::new()),
+    });
+    let app = axum::Router::new()
+        .route("/search", get(serve_search))
+        .with_state(mock.clone())
+        .merge(
+            axum::Router::new()
+                .route("/cog/{name}", get(serve_gated_cog))
+                .with_state(gate.clone()),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (mock.base.clone(), gate)
+}
+
+/// the assets of one item read in parallel: nir is asked for while red's
+/// read is still waiting on its response, and the bands stay in order
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn assets_of_one_item_read_in_parallel() {
+    let (base, gate) = start_gated_asset_mock().await;
+    let src = open_assets(&base, &["red", "nir"]).await.unwrap();
+    gate.armed.store(true, Ordering::SeqCst);
+
+    let chunk = src.read(&OVERLAP).await.unwrap().into_raster().unwrap();
+    assert_eq!(chunk.bands.band_count(), 2);
+    each_pixel(&chunk, |bi, x, y, got| {
+        let shift = if bi == 0 { 0.0 } else { NIR_SHIFT };
+        close(got, elevation(x, y) + shift, (x, y));
+    });
+
+    let events = gate.events.lock().unwrap();
+    let nir_requested = events
+        .iter()
+        .position(|e| *e == GatedCogEvent::NirRequested);
+    let red_answered = events.iter().position(|e| *e == GatedCogEvent::RedAnswered);
+    // a sequential loop answers red after the wait times out and only then asks for nir
+    assert!(
+        nir_requested.is_some() && red_answered.is_some() && nir_requested < red_answered,
+        "assets did not overlap: {events:?}"
+    );
 }
 
 #[test]
