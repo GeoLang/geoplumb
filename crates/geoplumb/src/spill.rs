@@ -260,8 +260,10 @@ pub(crate) fn read_chunk(path: &Path) -> Result<Chunk> {
                 let mut raw = vec![0u8; cols * rows * 8];
                 f.read_exact(&mut raw).map_err(io)?;
                 let data: Vec<f64> = raw
-                    .chunks_exact(8)
-                    .map(|c| f64::from_le_bytes(c.try_into().expect("8-byte chunks")))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| f64::from_le_bytes(*c))
                     .collect();
                 bands.push(
                     Raster::from_vec(cols, rows, data, resolution, nodata)
@@ -345,8 +347,10 @@ pub(crate) fn read_chunk(path: &Path) -> Result<Chunk> {
             let mut raw = vec![0u8; len * 4];
             f.read_exact(&mut raw).map_err(io)?;
             let data: Vec<f32> = raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().expect("4-byte chunks")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             Ok(Chunk::Tensor(TensorChunk {
                 data,

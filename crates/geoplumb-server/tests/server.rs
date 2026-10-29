@@ -318,7 +318,9 @@ fn png_pixels(bytes: &[u8]) -> Vec<(u8, u8)> {
     let info = reader.next_frame(&mut buf).unwrap();
     assert_eq!(info.color_type, png::ColorType::GrayscaleAlpha);
     buf[..info.buffer_size()]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|px| (px[0], px[1]))
         .collect()
 }

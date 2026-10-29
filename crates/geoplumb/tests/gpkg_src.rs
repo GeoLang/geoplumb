@@ -29,7 +29,7 @@ const COLUMNS: &[(&str, &str)] = &[("name", "TEXT"), ("weight", "REAL")];
 fn cell_geometry(index: usize) -> FeatureGeometry {
     let x = ORIGIN_X + (index % CELLS_PER_SIDE) as f64 * CELL_STRIDE;
     let y = ORIGIN_Y + (index / CELLS_PER_SIDE) as f64 * CELL_STRIDE;
-    if index % LINE_EVERY == 0 {
+    if index.is_multiple_of(LINE_EVERY) {
         return FeatureGeometry::LineString(LineString::new(vec![
             Coord::new(x, y),
             Coord::new(x + CELL_SIDE, y),
@@ -46,7 +46,7 @@ fn cell_geometry(index: usize) -> FeatureGeometry {
 }
 
 fn cell_weight(index: usize) -> Option<f64> {
-    (index % NULL_WEIGHT_EVERY != 0).then_some(index as f64 * 0.25)
+    (!index.is_multiple_of(NULL_WEIGHT_EVERY)).then_some(index as f64 * 0.25)
 }
 
 fn fixture_features() -> Vec<FixtureFeature> {

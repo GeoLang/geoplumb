@@ -446,10 +446,10 @@ impl CapsSet {
         let mut alternatives = Vec::new();
         for a in &self.alternatives {
             for b in &other.alternatives {
-                if let Some(r) = a.intersect(b) {
-                    if !alternatives.contains(&r) {
-                        alternatives.push(r);
-                    }
+                if let Some(r) = a.intersect(b)
+                    && !alternatives.contains(&r)
+                {
+                    alternatives.push(r);
                 }
             }
         }

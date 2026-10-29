@@ -291,10 +291,10 @@ fn candidates_of(
     };
     let mut out: Vec<Caps> = Vec::new();
     for alt in &set.alternatives {
-        if let Some(c) = CapsSet::one(alt.clone()).fixate() {
-            if !out.contains(&c) {
-                out.push(c);
-            }
+        if let Some(c) = CapsSet::one(alt.clone()).fixate()
+            && !out.contains(&c)
+        {
+            out.push(c);
         }
     }
     out

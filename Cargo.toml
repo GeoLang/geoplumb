@@ -9,7 +9,7 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/GeoLang/geoplumb"
 authors = ["GeoLang <tiletopia@proton.me>"]
 description = "Pull-based geospatial compute pipeline with caps negotiation"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 terrano-core = { git = "https://github.com/GeoLang/terrano.git", branch = "master" }

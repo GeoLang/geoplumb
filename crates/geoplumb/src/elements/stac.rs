@@ -1596,7 +1596,7 @@ mod fold_tests {
     /// nodata varying with item, band and pixel, so pixels come out one
     /// deep, several deep, and (pixel 0) covered by no item at all
     fn holed(item: usize, band: usize, pixel: usize) -> bool {
-        pixel == 0 || (pixel + band + item) % 5 == 0
+        pixel == 0 || (pixel + band + item).is_multiple_of(5)
     }
 
     fn stack(items: usize) -> Vec<RasterChunk> {
