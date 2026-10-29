@@ -142,7 +142,7 @@ rtree over envelopes. A GeoPackage carries its own rtree in SQLite.
 
 - [x] STAC assets within an item read in parallel, each asset read under
       the same 64-in-flight cap item reads used, bands joined in asset order.
-- [ ] Disk cache across processes, one to two days. The spill store is a
+- [x] Disk cache across processes, one to two days. The spill store is a
       fresh directory per engine because nothing identifies the graph. Add
       an element identity hash: each element contributes a stable
       description (`CogSrc` the file path and its IFD byte length, `StacSrc`
