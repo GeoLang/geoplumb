@@ -2,6 +2,7 @@
 
 ## 2026-10-28
 
+- `gpkg` as a layer source, `source = { kind = "gpkg", path = "parcels.gpkg", table = "parcels", crs = 4326 }` with `table` and `crs` optional, serving a GeoPackage feature table tile by tile through the file's own rtree index, so a tile read decodes only the rows whose envelopes touch it and the table is never held in memory. `table` defaults to the first feature table in the file and `crs` to the table's EPSG srs. A file with no rtree for the table, or a non-EPSG srs and no `crs`, is refused at startup naming the table, and like `geojson` the chain over it needs a `rasterize`
 - `LasSrc` bins its points by base-grid tile at construction, so a tile read scans only the bins its window touches instead of the whole cloud, with the same points out as before
 
 ## 2026-09-16

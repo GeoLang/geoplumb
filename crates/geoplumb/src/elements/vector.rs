@@ -228,7 +228,10 @@ fn polygon_rings(p: &Polygon) -> Vec<&[Coord]> {
 /// simplify whole features for a ladder level, dropping features smaller
 /// than a pixel. points and multipoints are exempt from the drop, and a
 /// collection is measured whole, so a small member rides along with a big one
-fn simplify_geometry(geometry: &FeatureGeometry, resolution: f64) -> Option<FeatureGeometry> {
+pub(crate) fn simplify_geometry(
+    geometry: &FeatureGeometry,
+    resolution: f64,
+) -> Option<FeatureGeometry> {
     if !matches!(
         geometry,
         FeatureGeometry::Point(_) | FeatureGeometry::MultiPoint(_)

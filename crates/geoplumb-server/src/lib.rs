@@ -24,9 +24,9 @@ use tokio::sync::Semaphore;
 
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::{
-    Aspect, BandMath, CogSrc, Combine, Focal, Hillshade, IdwGrid, LasSrc, MapAlgebra, Mosaic,
-    QualityMask, Rasterize, Reproject, Slope, StacSrc, TensorConv, ToRaster, ToTensor, VecClip,
-    VecFilter, VecSchema, VecSrc,
+    Aspect, BandMath, CogSrc, Combine, Focal, GpkgSrc, Hillshade, IdwGrid, LasSrc, MapAlgebra,
+    Mosaic, QualityMask, Rasterize, Reproject, Slope, StacSrc, TensorConv, ToRaster, ToTensor,
+    VecClip, VecFilter, VecSchema, VecSrc,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Crs, Engine, Graph, NodeId, Source, TimeInterval};
@@ -54,7 +54,7 @@ pub struct Layer {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerInfo {
     pub name: String,
-    /// `stac`, `cog`, `geojson`, `las`, or `composite` for a fan-in layer
+    /// `stac`, `cog`, `geojson`, `gpkg`, `las`, or `composite` for a fan-in layer
     pub source: &'static str,
     pub collection: Option<String>,
     /// the interval pulls take when they name none
@@ -258,6 +258,20 @@ fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, L
                 LayerInfo {
                     name,
                     source: "geojson",
+                    collection: None,
+                    default_datetime: None,
+                    temporal_extent: None,
+                },
+            ))
+        }
+        SourceConfig::Gpkg { path, table, crs } => {
+            let src =
+                GpkgSrc::open(path, table.as_deref(), crs.map(Crs)).map_err(|e| e.to_string())?;
+            Ok((
+                Box::new(src),
+                LayerInfo {
+                    name,
+                    source: "gpkg",
                     collection: None,
                     default_datetime: None,
                     temporal_extent: None,

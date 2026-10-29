@@ -1,6 +1,7 @@
 pub mod algebra;
 pub mod band_math;
 pub mod cog;
+pub mod gpkg;
 pub mod mosaic;
 pub mod points;
 pub mod reproject;
@@ -14,6 +15,7 @@ pub mod vector;
 pub use algebra::{Combine, MapAlgebra};
 pub use band_math::BandMath;
 pub use cog::{CogSrc, HttpRange};
+pub use gpkg::GpkgSrc;
 pub use mosaic::Mosaic;
 pub use points::{IdwGrid, LasSrc};
 pub use reproject::{Reproject, VecReproject};

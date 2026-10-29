@@ -33,5 +33,6 @@ reqwest = { version = "0.12", default-features = false, features = [
 nubis-core.workspace = true
 tokio = { version = "1", features = ["test-util"] }
 png = "0.17"
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

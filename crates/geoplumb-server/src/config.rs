@@ -119,6 +119,12 @@ pub enum SourceConfig {
     Geojson {
         path: PathBuf,
     },
+    // table defaults to the first feature table, crs to the table's epsg srs
+    Gpkg {
+        path: PathBuf,
+        table: Option<String>,
+        crs: Option<u32>,
+    },
     /// a las point cloud read whole at startup. points are not pixels, so
     /// the chain over it needs an `idw`
     Las {
@@ -388,6 +394,15 @@ fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
                         hands features to a png encoder that wants pixels"
                 .into());
         }
+        SourceConfig::Gpkg { .. }
+            if !ops
+                .iter()
+                .any(|op| matches!(op, OpConfig::Rasterize { .. })) =>
+        {
+            return Err("the gpkg source has no rasterize op, so the chain \
+                        hands features to a png encoder that wants pixels"
+                .into());
+        }
         SourceConfig::Las { .. } if !ops.iter().any(|op| matches!(op, OpConfig::Idw { .. })) => {
             return Err("the las source has no idw op, so the chain hands \
                         points to a png encoder that wants pixels"
@@ -546,9 +561,10 @@ impl SourceConfig {
     /// the search a stac layer opens with, `None` for any other kind
     pub fn stac_search(&self) -> Option<StacSearch> {
         match self {
-            SourceConfig::Cog { .. } | SourceConfig::Geojson { .. } | SourceConfig::Las { .. } => {
-                None
-            }
+            SourceConfig::Cog { .. }
+            | SourceConfig::Geojson { .. }
+            | SourceConfig::Gpkg { .. }
+            | SourceConfig::Las { .. } => None,
             SourceConfig::Stac {
                 api,
                 collection,

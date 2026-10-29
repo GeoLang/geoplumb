@@ -2,6 +2,9 @@
 //! built from a synthetic geotiff written at test time, so nothing here
 //! touches the network
 
+#[path = "../../geoplumb/tests/gpkg_fixture/mod.rs"]
+mod gpkg_fixture;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -14,9 +17,12 @@ use geoplumb_server::config::{
 };
 use geoplumb_server::{Layer, parse_time, router};
 use nubis_core::{Point3, PointCloud, write_las};
+use rusqlite::types::Value;
 use terrano_core::{
     BandedRaster, CogParams, Raster, read_geotiff_bands, write_cog, write_cog_bands,
 };
+use topoi_core::geojson::FeatureGeometry;
+use topoi_core::{Coord, Polygon};
 use tower::ServiceExt;
 
 const W: usize = 600;
@@ -216,6 +222,35 @@ fn write_dem(dir: &Path) -> String {
 fn write_parcels(dir: &Path) -> String {
     let path = dir.join("parcels.geojson");
     std::fs::write(&path, parcels_geojson()).unwrap();
+    path.display().to_string().replace('\\', "/")
+}
+
+// the geojson parcels as a geopackage feature table
+fn write_parcels_gpkg(dir: &Path) -> String {
+    let parcel = |id: i64, min_lon: f64, max_lon: f64, depth: f64, zone: &str| {
+        let ring: Vec<Coord> = parcel_ring(min_lon, max_lon)
+            .into_iter()
+            .map(|[x, y]| Coord::new(x, y))
+            .collect();
+        gpkg_fixture::FixtureFeature {
+            id,
+            geometry: FeatureGeometry::Polygon(Polygon::from_coords(&ring)),
+            properties: vec![Value::Real(depth), Value::Text(zone.to_string())],
+        }
+    };
+    let path = dir.join("parcels.gpkg");
+    gpkg_fixture::write_geopackage(
+        &path,
+        &gpkg_fixture::Layer {
+            srs: gpkg_fixture::WGS84,
+            columns: &[("depth", "REAL"), ("zone", "TEXT")],
+            features: &[
+                parcel(1, 7.25, 7.35, 1.0, "shallow"),
+                parcel(2, 7.35, 7.45, 3.0, "deep"),
+            ],
+            rtree: true,
+        },
+    );
     path.display().to_string().replace('\\', "/")
 }
 
@@ -476,6 +511,22 @@ gray = { min = 0.0, max = 4.0 }
 kind = "rasterize"
 burn = { property = "depth" }
 "#;
+
+const GPKG: &str = r#"
+[[layer]]
+name = "parcels"
+source = { kind = "gpkg", path = "GPKG_PATH", table = "TABLE_NAME", crs = 4326 }
+gray = { min = 0.0, max = 4.0 }
+
+[[layer.op]]
+kind = "rasterize"
+burn = { property = "depth" }
+"#;
+
+fn gpkg_layer_file(path: &str) -> String {
+    GPKG.replace("GPKG_PATH", path)
+        .replace("TABLE_NAME", gpkg_fixture::TABLE)
+}
 
 /// the two parcel depths, 1.0 and 3.0, over the 0 to 4 range the layer names
 const SHALLOW_GRAY: u8 = 64;
@@ -1155,6 +1206,30 @@ source = { kind = "geojson", path = "/parcels.geojson" }
 }
 
 #[test]
+fn config_parses_a_gpkg_layer_and_names_a_missing_rasterize() {
+    let config = Config::parse(&gpkg_layer_file("/parcels.gpkg")).unwrap();
+    match source_of(&config.layers[0]) {
+        SourceConfig::Gpkg { path, table, crs } => {
+            assert_eq!(path.to_str(), Some("/parcels.gpkg"));
+            assert_eq!(table.as_deref(), Some(gpkg_fixture::TABLE));
+            assert_eq!(*crs, Some(4326));
+        }
+        other => panic!("unexpected source: {other:?}"),
+    }
+
+    let text = r#"
+[[layer]]
+name = "parcels"
+source = { kind = "gpkg", path = "/parcels.gpkg" }
+gray = { min = 0.0, max = 4.0 }
+"#;
+    let error = Config::parse(text).expect_err("a png encoder cannot take features");
+    assert!(error.contains("parcels"), "{error}");
+    assert!(error.contains("gpkg"), "{error}");
+    assert!(error.contains("rasterize"), "{error}");
+}
+
+#[test]
 fn the_t_parameter_is_an_rfc3339_interval_or_nothing() {
     assert_eq!(parse_time(None).unwrap(), None);
     let t = parse_time(Some("2024-06-01T00:00:00Z/2024-07-01T00:00:00Z"))
@@ -1343,6 +1418,34 @@ async fn a_geojson_layer_burns_its_features_into_the_tile() {
         "{burned} of {} pixels hold a parcel depth",
         grays.len()
     );
+}
+
+#[tokio::test]
+async fn a_gpkg_layer_burns_its_features_into_the_tile() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&gpkg_layer_file(&write_parcels_gpkg(dir.path())));
+    let (x, y) = tile_of(12, 7.3, 46.8);
+
+    let (status, png) = get(&app, &format!("/tiles/parcels/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    let grays = opaque_grays(&png);
+    assert!(grays.len() > 60_000, "only {} pixels burned", grays.len());
+    assert!(grays.contains(&SHALLOW_GRAY), "the 1.0 parcel is missing");
+    assert!(grays.contains(&DEEP_GRAY), "the 3.0 parcel is missing");
+    let burned = grays
+        .iter()
+        .filter(|g| **g == SHALLOW_GRAY || **g == DEEP_GRAY)
+        .count();
+    assert!(
+        burned * 10 > grays.len() * 9,
+        "{burned} of {} pixels hold a parcel depth",
+        grays.len()
+    );
+
+    let (status, body) = get(&app, "/layers").await;
+    assert_eq!(status, StatusCode::OK);
+    let layers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(layers[0]["source"], "gpkg", "{layers}");
 }
 
 #[tokio::test]
