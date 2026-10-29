@@ -1,6 +1,6 @@
 # What geoplumb is missing against GDAL, and how to add it
 
-None of this is built. Every checkbox below is unchecked. The engine design
+A checked box is built and in `DESIGN.md`, an unchecked one is not. The engine design
 (pull graph, kinded caps, resolution ladder, coalescing cache, disk tier,
 invalidation, time as a pull parameter, async range reads) is finished and
 described in `DESIGN.md`. What follows is the gap between that engine and a
@@ -36,39 +36,43 @@ and halos apply unchanged.
 Shape: a `GdalSrc` in `crates/geoplumb/src/elements/gdal.rs` implementing
 `Source`, mirroring `CogSrc`.
 
-- [ ] `constraint`: `Produces` one raster pattern from the dataset. Dtype
-      from the first band's `GDALDataType` (every band must share it, or
-      open fails naming the band). Bands from the band count. CRS from the
+- [x] `constraint`: `Produces` one raster pattern from the dataset. Dtype
+      is `F64`, the one dtype the caps have, every band read as f64 whatever
+      the file stores. Bands from the band count. CRS from the
       dataset's spatial reference as an EPSG authority code, resolved through
       projicio. A dataset whose SRS carries no EPSG code fails at open rather
       than guessing. Chunk size from the first band's block size, rounded to
       the ladder's power of two.
-- [ ] `grid`: origin and base resolution from the geotransform. A rotated or
+- [x] `grid`: origin and base resolution from the geotransform. A rotated or
       sheared geotransform fails at open, the ladder has no row for it.
-- [ ] `read`: pick the overview whose pixel width is nearest at or below
+- [x] `read`: pick the overview whose pixel width is nearest at or below
       the request, as `CogReader::select_level` does, read the window with
       `RasterBand::read_as` at that overview, block-average the remainder
       with the same code `CogSrc` uses. Nodata from `RasterBand::no_data_value`
       mapped to NaN. `read` is a `BoxFuture`, the GDAL call runs inside
-      `spawn_blocking`.
-- [ ] Concurrency: `gdal::Dataset` is `Send` and not `Sync` (gdal 0.18
+      `spawn_blocking`. GDAL's `AVERAGE` overviews treat NaN as a value
+      unless the file declares NaN as nodata, so a NaN-hole file without a
+      nodata tag serves NaN at partial-hole overview pixels where
+      `RasterSrc` averages the finite ones.
+- [x] Concurrency: `gdal::Dataset` is `Send` and not `Sync` (gdal 0.18
       docs), so it cannot sit behind an `Arc` across tasks. Hold a pool of
       opened datasets per path, the pattern `StacSrc` uses for its per-asset
       readers (take one, open fresh when empty, put it back).
-- [ ] Feature `gdal` on the `geoplumb` crate pulling the `gdal` crate, off by
+- [x] Feature `gdal` on the `geoplumb` crate pulling the `gdal` crate, off by
       default, so the default build and the wasm-adjacent crates keep no C
       dependency. The `gdal` crate's newest release is 0.19.0 (2025-12-23,
       MSRV 1.80) with bindings for GDAL 3.4 through 3.11. Pin the GDAL
-      version the Dockerfile installs to one in that range.
-- [ ] `SourceConfig::Gdal { path, band: Option<u16> }` in `geoplumb-server`,
+      version the Dockerfile installs to one in that range (bookworm's
+      3.6, behind the `GDAL=1` build arg).
+- [x] `SourceConfig::Gdal { path, band: Option<u16> }` in `geoplumb-server`,
       behind the same feature, a layer naming it in a build without the
       feature failing at parse with a message that names the feature.
-- [ ] Dockerfile: a second stage or a build arg that installs `libgdal` from
+- [x] Dockerfile: a second stage or a build arg that installs `libgdal` from
       bookworm and builds with the feature. The default image stays GDAL
       free.
-- [ ] CI: the ubuntu leg adds a job with `libgdal-dev` and `--features gdal`.
+- [x] CI: the ubuntu leg adds a job with `libgdal-dev` and `--features gdal`.
       Windows and macOS stay on the default features.
-- [ ] Test: a striped (non-COG) GeoTIFF with an overview and a nodata value
+- [x] Test: a striped (non-COG) GeoTIFF with an overview and a nodata value
       written by terrano, pulled at two ladder levels through `GdalSrc`,
       compared pixel for pixel against `RasterSrc` over the same file.
 
@@ -84,27 +88,28 @@ on its file behind a mutex because `RangeRead::read_range` and
 `CogReader::read_window` take `&mut self`. `HttpRange` is already
 multiplexed internally, so the mutex is only the trait signature.
 
-- [ ] terrano: `RangeRead::read_range` and `read_ranges` take `&self`. The
+- [x] terrano: `RangeRead::read_range` and `read_ranges` take `&self`. The
       `std::fs::File` impl uses `read_exact_at` on unix and `seek_read` on
       windows instead of seek plus read. The `&[u8]` impl is unchanged. The
       test `RecordingReader` counts through a `Cell`.
-- [ ] terrano: `CogReader::open` keeps `&mut` on its own `source` only during
+- [x] terrano: `CogReader::open` keeps `&mut` on its own `source` only during
       open. `read_window` and `read_window_bands` take `&self`. `levels` and
       `meta` are read-only already.
-- [ ] geoplumb: `CogSrc` drops the `Arc<Mutex<_>>`, concurrent chunks of one
+- [x] geoplumb: `CogSrc` drops the `Arc<Mutex<_>>`, concurrent chunks of one
       pull read concurrently. `HttpRange` drops its `&mut`.
-- [ ] A test that pulls two chunks of one COG from two tasks and asserts the
+- [x] A test that pulls two chunks of one COG from two tasks and asserts the
       range reads interleave (the recording reader logs order).
 
 This is a breaking change to terrano's public trait, so it lands as a
-terrano release and a geoplumb bump together.
+terrano release (0.3.0) and a geoplumb bump together. tiletopia's cog route
+is adapted in its own commit and takes the change at its next lock bump.
 
 ## 3. Windowed point source
 
 - [x] Plain LAS tile index. At open, point indices are binned by tile of
       the base grid into a `HashMap<(i64, i64), Vec<usize>>`, and a tile read
       scans the bins its bbox touches instead of the whole cloud. The cloud
-      stays resident. Built 2026-10-28, uncommitted until the owner commits.
+      stays resident.
 - [ ] COPC, about a week. A `CopcSrc` that reads the octree hierarchy and
       fetches only the nodes a window at a ladder level touches, over the
       same `RangeRead` transport as COGs, so a remote COPC over HTTP works.
@@ -120,17 +125,19 @@ terrano release and a geoplumb bump together.
 Two to three days. `VecSrc` holds the collection resident with an in-memory
 rtree over envelopes. A GeoPackage carries its own rtree in SQLite.
 
-- [ ] `GpkgSrc` over `ptolemy-geopackage`, which already opens a GeoPackage
-      read-only and answers `FeatureQuery { bbox }` through the layer's
-      `rtree_<table>_<geom>` virtual table (`crates/ptolemy-geopackage/src/lib.rs`
-      in ptolemy). A tile read is one such query, decoding only those rows.
-      Resident memory becomes the open connection and a bounded feature
-      cache. geodukt-io reads GeoPackage whole, so it is not the base here.
-- [ ] Simplification per ladder level is unchanged, it already happens per
+- [x] `GpkgSrc` over rusqlite, opening the file read-only and reading a
+      tile as one query against the layer's `rtree_<table>_<geom>` virtual
+      table, decoding only those rows. The WKB and GeoPackage-binary
+      decoder that geodukt-io carried moved to topoi-core as `wkb`, and
+      geodukt-io calls it, so the two cannot drift. `ptolemy-geopackage`
+      was not used: its `DataStore` is async over ptolemy-core's geo-types
+      features, which would need a geometry conversion and pull ptolemy-core
+      in for one query. Resident memory is a pool of open connections.
+- [x] Simplification per ladder level is unchanged, it already happens per
       tile read.
-- [ ] A test with a GeoPackage larger than the memory budget would be the
-      proof. A fixture of a few thousand features and an assertion on row
-      count read per tile is the practical one.
+- [x] A fixture of a few thousand features and an assertion on the row
+      count read per tile, plus a whole-window pull compared fragment for
+      fragment against `VecSrc` over the same features.
 
 ## 5. Small items
 
