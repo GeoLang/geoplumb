@@ -68,10 +68,7 @@ impl GpuContext {
     pub fn request(budget_bytes: usize) -> Result<GpuContext> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = block_on(wgpu::util::initialize_adapter_from_env_or_default(
-            &instance, None,
-        ))
-        .map_err(|e| Error::Gpu(format!("no wgpu adapter: {e}")))?;
+        let adapter = block_on(choose_adapter(&instance))?;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .map_err(|e| Error::Gpu(format!("wgpu device: {e}")))?;
         Ok(GpuContext::new(device, queue, budget_bytes))
@@ -280,6 +277,26 @@ impl GpuContext {
             None => result,
         }
     }
+}
+
+// wgpu's own WGPU_ADAPTER_NAME filter panics when the name matches no adapter
+async fn choose_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
+    let Ok(wanted) = std::env::var("WGPU_ADAPTER_NAME") else {
+        return instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::from_env().unwrap_or_default(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| Error::Gpu(format!("no wgpu adapter: {e}")));
+    };
+    let wanted = wanted.to_lowercase();
+    instance
+        .enumerate_adapters(wgpu::Backends::all())
+        .await
+        .into_iter()
+        .find(|adapter| adapter.get_info().name.to_lowercase().contains(&wanted))
+        .ok_or_else(|| Error::Gpu(format!("no wgpu adapter named {wanted:?}")))
 }
 
 fn compute_pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ComputePipeline {
