@@ -283,27 +283,29 @@ impl GpuContext {
                 ],
             }))
         })?;
-        let mut pending = self.pending.lock().unwrap();
-        pending.usable()?;
-        {
-            let encoder = pending.encoder.get_or_insert_with(|| {
-                self.device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
-            });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups_x, workgroups_y, workgroups_z);
-        }
-        pending.dispatches += 1;
-        self.dispatches.fetch_add(1, Ordering::Relaxed);
-        if pending.dispatches < DISPATCHES_PER_SUBMIT {
-            return Ok(());
-        }
-        self.submit_pending(&mut pending)
+        self.scoped(|| {
+            let mut pending = self.pending.lock().unwrap();
+            pending.usable()?;
+            {
+                let encoder = pending.encoder.get_or_insert_with(|| {
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(workgroups_x, workgroups_y, workgroups_z);
+            }
+            pending.dispatches += 1;
+            self.dispatches.fetch_add(1, Ordering::Relaxed);
+            if pending.dispatches < DISPATCHES_PER_SUBMIT {
+                return Ok(());
+            }
+            self.submit_pending(&mut pending)
+        })
     }
 
     fn flush(&self) -> Result<()> {
