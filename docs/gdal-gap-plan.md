@@ -110,15 +110,14 @@ is adapted in its own commit and takes the change at its next lock bump.
       the base grid into a `HashMap<(i64, i64), Vec<usize>>`, and a tile read
       scans the bins its bbox touches instead of the whole cloud. The cloud
       stays resident.
-- [ ] COPC, about a week. A `CopcSrc` that reads the octree hierarchy and
-      fetches only the nodes a window at a ladder level touches, over the
-      same `RangeRead` transport as COGs, so a remote COPC over HTTP works.
-      LAZ decoding is already in the org: tiletopia-server depends on the
-      `las` crate 0.9 with its `laz` feature (`crates/tiletopia-server`),
-      and the newest `las` is 0.11.2 (2026-10-27). `copc-rs` 0.5.0
-      (2025-05-15) reads the COPC hierarchy. Neither has been evaluated
-      against nubis's `read_las`. The COPC level maps onto the ladder level
-      directly, which replaces the per-level voxel thinning for this source.
+- [x] COPC. `CopcSrc` reads the octree hierarchy at open and fetches only
+      the nodes a window at a ladder level touches, through `copc-reader`
+      0.9 over a local file or geoplumb's `HttpRange`, so a remote COPC over
+      HTTP works. The COPC level maps onto the ladder level directly, which
+      replaces the per-level voxel thinning for this source. copc-reader
+      merges chunk fetches less than 64 KiB apart, so a tile of a small
+      file reads most of it. The crs comes from the layer, nothing in the
+      org parses the WKT CRS VLR.
 
 ## 4. Windowed vector source
 
