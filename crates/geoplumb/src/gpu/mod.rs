@@ -1,11 +1,13 @@
 use std::fmt;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, mpsc};
 
 use futures::executor::block_on;
 
 use crate::elements::tensor::ConvolutionWindow;
 use crate::error::{Error, Result};
 
+pub const DISPATCHES_PER_SUBMIT: usize = 64;
 const WORKGROUP_SIDE: usize = 8;
 const TENSOR_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
     .union(wgpu::BufferUsages::COPY_SRC)
@@ -17,6 +19,15 @@ pub struct GpuContext {
     budget_bytes: usize,
     copy_window_pipeline: wgpu::ComputePipeline,
     convolve_pipeline: wgpu::ComputePipeline,
+    pending: Mutex<Pending>,
+    submissions: AtomicU64,
+    dispatches: AtomicU64,
+}
+
+#[derive(Default)]
+struct Pending {
+    encoder: Option<wgpu::CommandEncoder>,
+    dispatches: usize,
 }
 
 impl fmt::Debug for GpuContext {
@@ -62,6 +73,9 @@ impl GpuContext {
             budget_bytes,
             copy_window_pipeline,
             convolve_pipeline,
+            pending: Mutex::default(),
+            submissions: AtomicU64::new(0),
+            dispatches: AtomicU64::new(0),
         }
     }
 
@@ -76,6 +90,14 @@ impl GpuContext {
 
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes
+    }
+
+    pub fn submissions(&self) -> u64 {
+        self.submissions.load(Ordering::Relaxed)
+    }
+
+    pub fn dispatches(&self) -> u64 {
+        self.dispatches.load(Ordering::Relaxed)
     }
 
     pub(crate) fn upload(&self, data: &[f32]) -> Result<wgpu::Buffer> {
@@ -93,6 +115,7 @@ impl GpuContext {
         if size == 0 {
             return Ok(Vec::new());
         }
+        self.flush()?;
         self.scoped(|| {
             let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("download"),
@@ -107,6 +130,7 @@ impl GpuContext {
                 });
             encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
             self.queue.submit([encoder.finish()]);
+            self.submissions.fetch_add(1, Ordering::Relaxed);
             let (sender, receiver) = mpsc::channel();
             staging.map_async(wgpu::MapMode::Read, .., move |mapped| {
                 let _ = sender.send(mapped);
@@ -151,15 +175,13 @@ impl GpuContext {
         ] {
             params.extend(shader_word(value)?.to_le_bytes());
         }
-        self.scoped(|| {
-            self.dispatch(
-                &self.copy_window_pipeline,
-                &params,
-                copy.source,
-                copy.destination,
-                [copy.cols, copy.rows, copy.channels],
-            )
-        })
+        self.dispatch(
+            &self.copy_window_pipeline,
+            &params,
+            copy.source,
+            copy.destination,
+            [copy.cols, copy.rows, copy.channels],
+        )
     }
 
     pub(crate) fn convolve(&self, convolution: &Convolution<'_>) -> Result<wgpu::Buffer> {
@@ -212,29 +234,34 @@ impl GpuContext {
         let workgroups_x = shader_word(invocations[0].div_ceil(WORKGROUP_SIDE))?;
         let workgroups_y = shader_word(invocations[1].div_ceil(WORKGROUP_SIDE))?;
         let workgroups_z = shader_word(invocations[2])?;
-        let uniform = self.initialized_buffer(params, wgpu::BufferUsages::UNIFORM)?;
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: source.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: destination.as_entire_binding(),
-                },
-            ],
-        });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // an invalid bind group recorded into the shared encoder fails the whole batch
+        let bind_group = self.scoped(|| {
+            let uniform = self.initialized_buffer(params, wgpu::BufferUsages::UNIFORM)?;
+            Ok(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: source.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: destination.as_entire_binding(),
+                    },
+                ],
+            }))
+        })?;
+        let mut pending = self.pending.lock().unwrap();
         {
+            let encoder = pending.encoder.get_or_insert_with(|| {
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
+            });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
                 timestamp_writes: None,
@@ -243,8 +270,30 @@ impl GpuContext {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups_x, workgroups_y, workgroups_z);
         }
-        self.queue.submit([encoder.finish()]);
-        Ok(())
+        pending.dispatches += 1;
+        self.dispatches.fetch_add(1, Ordering::Relaxed);
+        if pending.dispatches < DISPATCHES_PER_SUBMIT {
+            return Ok(());
+        }
+        self.submit_pending(&mut pending)
+    }
+
+    fn flush(&self) -> Result<()> {
+        let mut pending = self.pending.lock().unwrap();
+        self.submit_pending(&mut pending)
+    }
+
+    // runs under the pending lock so batches reach the queue in recording order
+    fn submit_pending(&self, pending: &mut Pending) -> Result<()> {
+        let Some(encoder) = pending.encoder.take() else {
+            return Ok(());
+        };
+        pending.dispatches = 0;
+        self.scoped(|| {
+            self.queue.submit([encoder.finish()]);
+            self.submissions.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
     }
 
     fn initialized_buffer(&self, bytes: &[u8], usage: wgpu::BufferUsages) -> Result<wgpu::Buffer> {

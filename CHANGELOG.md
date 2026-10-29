@@ -5,6 +5,7 @@
 - tensors negotiate a memory domain, `System` or `Wgpu`, and every existing tensor element stays `System`. A new `wgpu` feature on `geoplumb`, which the server does not enable, adds `GpuContext`, `Graph::with_gpu` and three elements: the solve splices `Upload` and `Download` wherever a tensor link crosses domains, and `WgpuConvolve` runs the 3x3 tensor convolve as a compute shader that matches `TensorConv` to 1e-5, NaN rule included. Wgpu chunks count against the context's own byte budget, never spill and are dropped on eviction, and a wgpu node's chunks assemble on the device
 - `TensorChunk::data` is a `TensorData` enum, read on the host through `system()`, `TensorChunk::crop_to` returns a `Result` since a device copy can fail, and `Adapter::build` is a boxed closure so an adapter can hold a context
 - the ubuntu CI leg installs mesa's lavapipe and sets `GEOPLUMB_REQUIRE_GPU=1`, so the gpu tests run on a software Vulkan device there instead of skipping
+- gpu window copies and convolves are recorded into one pending command encoder per `GpuContext` and submitted when sixty-four are pending or a download needs the results, instead of one submission each. An 80 by 64 pixel pull over twenty 16 px tiles went from 260 submissions to 42 for its 240 dispatches. `GpuContext::submissions()` and `dispatches()` count both
 
 ## 2026-10-28
 

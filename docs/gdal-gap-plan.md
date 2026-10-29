@@ -191,9 +191,11 @@ Slice 1, the domain:
 
 Slice 2, batching:
 
-- [ ] A pull's chunks at one node are submitted as one command encoder when
-      they share a device, which is where the GPU wins over per-chunk
-      dispatch.
+- [x] Dispatches are recorded into one open command encoder per
+      `GpuContext` and submitted only when a download needs the results or
+      sixty-four dispatches are pending, so a pull's chunks share a
+      submission whichever node they belong to. The engine stays out of
+      it, which is where the GPU wins over per-chunk submit.
 
 An inference element (ONNX through `ort`, following g2g-ml's element) is
 another one to two weeks on top. `DESIGN.md` currently puts inference

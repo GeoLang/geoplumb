@@ -6,8 +6,8 @@ use std::sync::Arc;
 use geoplumb::caps::{CapsPattern, CapsSet, Constraint, Domain, SetField, TensorPattern};
 use geoplumb::element::Transform;
 use geoplumb::elements::{RasterSrc, TensorConv, ToRaster, ToTensor, WgpuConvolve};
-use geoplumb::gpu::GpuContext;
-use geoplumb::{Bbox, Chunk, Crs, Engine, Error, Graph, NodeId, WindowReq};
+use geoplumb::gpu::{DISPATCHES_PER_SUBMIT, GpuContext};
+use geoplumb::{Bbox, Chunk, Crs, Engine, Error, Graph, NodeId, TensorChunk, WindowReq};
 use terrano_core::{BandedRaster, Raster};
 
 const W: usize = 320;
@@ -145,6 +145,31 @@ fn chain(graph: &mut Graph, source: RasterSrc, convolve: Box<dyn Transform>) -> 
     }
 }
 
+fn small_tile_chain(graph: &mut Graph, source: RasterSrc, convolve: Box<dyn Transform>) -> Chain {
+    let raster_source = graph.add_source(Box::new(source));
+    let tensor = graph.add_transform(raster_source, Box::new(to_tensor()));
+    let convolve = graph.add_transform(tensor, convolve);
+    let small = graph.add_transform(convolve, Box::new(SmallTensorChunks));
+    let raster = graph.add_transform(small, Box::new(ToRaster));
+    Chain {
+        tensor,
+        convolve,
+        raster,
+    }
+}
+
+// 5x4 tiles of 16 px, so most cells sit next to a seam the halo has to cross
+const SEAM_WINDOW: (usize, usize, usize, usize) = (32, 32, 80, 64);
+
+fn seam_window_request() -> WindowReq {
+    let (px0, py0, cols, rows) = SEAM_WINDOW;
+    WindowReq {
+        bbox: window(px0, py0, px0 + cols, py0 + rows),
+        resolution: CELL,
+        time: None,
+    }
+}
+
 #[test]
 fn solve_splices_upload_and_download() {
     let Some(context) = context(64 << 20) else {
@@ -169,39 +194,28 @@ async fn wgpu_convolve_matches_the_cpu_convolve() {
     let Some(context) = context(64 << 20) else {
         return;
     };
-    let small_chain = |graph: &mut Graph, convolve: Box<dyn Transform>| {
-        let raster_source = graph.add_source(Box::new(holed_src()));
-        let tensor = graph.add_transform(raster_source, Box::new(to_tensor()));
-        let convolve = graph.add_transform(tensor, convolve);
-        let small = graph.add_transform(convolve, Box::new(SmallTensorChunks));
-        let raster = graph.add_transform(small, Box::new(ToRaster));
-        (convolve, raster)
-    };
     let mut g = Graph::new();
-    let (_, cpu_raster) = small_chain(&mut g, Box::new(TensorConv { kernel: KERNEL }));
+    let cpu_nodes = small_tile_chain(&mut g, holed_src(), Box::new(TensorConv { kernel: KERNEL }));
     let cpu = Engine::new(g, 64 << 20).unwrap();
     let mut g = Graph::with_gpu(context);
-    let (gpu_convolve, gpu_raster) = small_chain(&mut g, Box::new(WgpuConvolve { kernel: KERNEL }));
+    let gpu_nodes = small_tile_chain(
+        &mut g,
+        holed_src(),
+        Box::new(WgpuConvolve { kernel: KERNEL }),
+    );
     let gpu = Engine::new(g, 64 << 20).unwrap();
-    assert_eq!(gpu.caps(gpu_convolve).tensor().chunk_px, 16);
+    assert_eq!(gpu.caps(gpu_nodes.convolve).tensor().chunk_px, 16);
 
-    // 5x4 tiles of 16 px, so most cells sit next to a seam the halo has to
-    // cross
-    let (px0, py0) = (32usize, 32usize);
-    let (cols, rows) = (80usize, 64usize);
-    let req = WindowReq {
-        bbox: window(px0, py0, px0 + cols, py0 + rows),
-        resolution: CELL,
-        time: None,
-    };
+    let (_, _, cols, rows) = SEAM_WINDOW;
+    let req = seam_window_request();
     let want = cpu
-        .pull(cpu_raster, req)
+        .pull(cpu_nodes.raster, req)
         .await
         .unwrap()
         .into_raster()
         .unwrap();
     let got = gpu
-        .pull(gpu_raster, req)
+        .pull(gpu_nodes.raster, req)
         .await
         .unwrap()
         .into_raster()
@@ -221,6 +235,94 @@ async fn wgpu_convolve_matches_the_cpu_convolve() {
         }
     }
     assert!(nan_cells > 0, "the holes never reached the window");
+}
+
+#[tokio::test]
+async fn a_pull_submits_once_per_batch() {
+    let Some(context) = context(64 << 20) else {
+        return;
+    };
+    let mut g = Graph::with_gpu(context.clone());
+    let nodes = small_tile_chain(&mut g, src(), Box::new(WgpuConvolve { kernel: KERNEL }));
+    let engine = Engine::new(g, 64 << 20).unwrap();
+    let (_, _, cols, rows) = SEAM_WINDOW;
+    let download_chunks = ((cols / 16) * (rows / 16)) as u64;
+
+    let (submissions_before, dispatches_before) = (context.submissions(), context.dispatches());
+    engine
+        .pull(nodes.raster, seam_window_request())
+        .await
+        .unwrap();
+    let submitted = context.submissions() - submissions_before;
+    let dispatched = context.dispatches() - dispatches_before;
+
+    assert!(
+        submitted <= 2 * download_chunks + dispatched / DISPATCHES_PER_SUBMIT as u64,
+        "{submitted} submissions for {dispatched} dispatches over {download_chunks} downloads"
+    );
+    assert!(
+        submitted < dispatched,
+        "{submitted} submissions for {dispatched} dispatches, nothing was batched"
+    );
+}
+
+#[tokio::test]
+async fn a_flush_error_does_not_poison_the_next_batch() {
+    let Some(context) = context(64 << 20) else {
+        return;
+    };
+    let build = || {
+        let mut g = Graph::with_gpu(context.clone());
+        let nodes = small_tile_chain(&mut g, src(), Box::new(WgpuConvolve { kernel: KERNEL }));
+        (Engine::new(g, 64 << 20).unwrap(), nodes)
+    };
+    let (engine, nodes) = build();
+    let want = engine
+        .pull(nodes.raster, seam_window_request())
+        .await
+        .unwrap()
+        .into_raster()
+        .unwrap();
+    let on_device = engine
+        .pull(nodes.convolve, seam_window_request())
+        .await
+        .unwrap()
+        .into_tensor()
+        .unwrap();
+
+    // one more workgroup than wgpu allows per dimension, rejected only when the batch is finished
+    let too_wide = TensorChunk {
+        channels: 1,
+        bbox: Bbox {
+            min_x: ORIGIN_X,
+            max_x: ORIGIN_X + (8 * 65_536) as f64 * CELL,
+            max_y: ORIGIN_Y,
+            min_y: ORIGIN_Y - CELL,
+        },
+        ..on_device
+    };
+    too_wide.crop_to(&too_wide.bbox).unwrap();
+    let (engine, nodes) = build();
+    match engine.pull(nodes.raster, seam_window_request()).await {
+        Err(Error::Gpu(_)) => {}
+        Err(other) => panic!("expected a gpu error from the poisoned batch, got {other:?}"),
+        Ok(_) => panic!("the batch holding the invalid dispatch was submitted cleanly"),
+    }
+
+    let (engine, nodes) = build();
+    let got = engine
+        .pull(nodes.raster, seam_window_request())
+        .await
+        .unwrap()
+        .into_raster()
+        .unwrap();
+    for c in 0..CHANNELS {
+        assert_eq!(
+            got.bands.band(c).unwrap().data(),
+            want.bands.band(c).unwrap().data(),
+            "channel {c} differs after the failed batch"
+        );
+    }
 }
 
 fn spilled_files(dir: &Path) -> usize {
