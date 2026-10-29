@@ -18,7 +18,7 @@
 //! it
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 
 use crate::caps::{
     CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
@@ -76,10 +76,6 @@ pub const MAX_PARALLEL_ITEM_READS: usize = 64;
 
 static ITEM_READ_PERMITS: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(MAX_PARALLEL_ITEM_READS));
-
-/// readers an item keeps per asset once a read returns them. the cap
-/// bounds retained decoder state after a burst of concurrent reads
-const POOLED_READERS_PER_ASSET: usize = 4;
 
 /// epoch milliseconds from an rfc 3339 timestamp, the form stac item and
 /// search datetimes take: a date, `T`, a time, optional fractional
@@ -299,10 +295,9 @@ struct Item {
     /// set only when the item's own crs is not the anchor's, in which case
     /// a read warps it onto the anchor grid
     reprojection: Option<Reprojection>,
-    /// per-asset pools of opened readers: a read takes one out, opens
-    /// fresh when the pool is empty, and puts it back after, so
-    /// concurrent chunks of one pull do not serialize on an item
-    readers: Vec<Mutex<Vec<CogReader<HttpRange>>>>,
+    /// one reader per asset, opened on first read and shared by every
+    /// concurrent read of the item after
+    readers: Vec<OnceLock<CogReader<HttpRange>>>,
 }
 
 /// what reading an item off the anchor crs needs: its own crs, and the
@@ -407,9 +402,9 @@ struct Inner {
     /// the anchor crs to lon/lat for pull windows, `None` when it is 4326
     to_lonlat: Option<projicio_core::Transform>,
     /// the open search is fixed configuration state, capped by
-    /// `MAX_SEARCH_ITEMS`, and supplies the anchor reader pool
+    /// `MAX_SEARCH_ITEMS`, and supplies the anchor readers
     anchor_items: Vec<Arc<Item>>,
-    /// live items keyed by href, so blocks and pull times share reader pools
+    /// live items keyed by href, so blocks and pull times share readers
     item_pool: ItemPool,
     /// completed block searches, keyed by block and pull time
     searches: Mutex<SearchCache>,
@@ -625,8 +620,11 @@ impl StacSrc {
                     "anchor item {anchor_key} declares a band count its cogs do not have"
                 ))
             })?;
-        for (pool, reader) in anchor.readers.iter().zip(readers) {
-            pool.lock().unwrap().push(reader);
+        for (slot, reader) in anchor.readers.iter().zip(readers) {
+            assert!(
+                slot.set(reader).is_ok(),
+                "a fresh anchor item has no readers yet"
+            );
         }
         Ok(StacSrc {
             inner: Arc::new(inner),
@@ -740,7 +738,7 @@ impl Inner {
             };
             let candidate = Arc::new(Item {
                 bbox: self.native_bbox(&f.bbox)?,
-                readers: f.hrefs.iter().map(|_| Mutex::new(Vec::new())).collect(),
+                readers: f.hrefs.iter().map(|_| OnceLock::new()).collect(),
                 hrefs: f.hrefs,
                 datetime: f.datetime,
                 reprojection,
@@ -827,14 +825,17 @@ impl Inner {
             return self.empty(req);
         }
         let mut bands = Vec::with_capacity(usize::from(self.bands));
-        for (k, pool) in item.readers.iter().enumerate() {
-            let taken = pool.lock().unwrap().pop();
-            let mut reader = match taken {
-                Some(r) => r,
-                None => CogReader::open(HttpRange::new(&item.hrefs[k]))?,
+        for (k, slot) in item.readers.iter().enumerate() {
+            let reader = match slot.get() {
+                Some(reader) => reader,
+                None => {
+                    let opened = CogReader::open(HttpRange::new(&item.hrefs[k]))?;
+                    // a concurrent read may have opened the asset first, its reader wins
+                    slot.get_or_init(|| opened)
+                }
             };
             let meta = reader.meta().clone();
-            let asset_bands = band_count(&reader)?;
+            let asset_bands = band_count(reader)?;
             if asset_bands != self.asset_bands[k] {
                 return Err(Error::Source(format!(
                     "stac item asset {} has {asset_bands} bands, the anchor item has {}",
@@ -842,9 +843,9 @@ impl Inner {
                 )));
             }
             let chunk = match &item.reprojection {
-                None => read_chunk(&mut reader, req, meta.origin_x, meta.origin_y, self.crs)?,
+                None => read_chunk(reader, req, meta.origin_x, meta.origin_y, self.crs)?,
                 Some(reprojection) => read_warped(
-                    &mut reader,
+                    reader,
                     req,
                     meta.origin_x,
                     meta.origin_y,
@@ -853,12 +854,6 @@ impl Inner {
                     scale_window,
                 )?,
             };
-            {
-                let mut pool = pool.lock().unwrap();
-                if pool.len() < POOLED_READERS_PER_ASSET {
-                    pool.push(reader);
-                }
-            }
             bands.extend(chunk.bands.into_bands());
         }
         Ok(RasterChunk {
@@ -924,7 +919,7 @@ impl Inner {
 /// rounds the window onto it and the warp samples what comes back, so an
 /// off-grid window would misregister by up to half a pixel
 fn read_warped(
-    reader: &mut CogReader<HttpRange>,
+    reader: &CogReader<HttpRange>,
     req: &WindowReq,
     origin_x: f64,
     origin_y: f64,

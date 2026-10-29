@@ -49,6 +49,7 @@ fn cog_params() -> CogParams {
         pixel_width: CELL,
         pixel_height: CELL,
         deflate: true,
+        ..CogParams::default()
     }
 }
 
