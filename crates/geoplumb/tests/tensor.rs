@@ -177,6 +177,10 @@ fn tensor_cannot_feed_a_raster_consumer_directly() {
 struct SmallChunks;
 
 impl Transform for SmallChunks {
+    fn identity(&self) -> String {
+        "SmallChunks".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Raster(RasterPattern {
             chunk_px: SetField::one(16),
@@ -197,6 +201,10 @@ impl Transform for SmallChunks {
 struct SmallTensorChunks;
 
 impl Transform for SmallTensorChunks {
+    fn identity(&self) -> String {
+        "SmallTensorChunks".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Tensor(TensorPattern {
             chunk_px: SetField::one(16),
@@ -298,6 +306,10 @@ struct CountingSrc {
 }
 
 impl Source for CountingSrc {
+    fn identity(&self) -> String {
+        format!("CountingSrc {}", self.inner.identity())
+    }
+
     fn constraint(&self) -> Constraint {
         self.inner.constraint()
     }
@@ -324,7 +336,10 @@ async fn tensor_chunks_spill_to_disk_and_reload() {
     // exactly one level-0 tensor chunk, no slack: the coarse pull must
     // evict it, and any slack would keep it resident and prove nothing
     let budget = CHANNELS * 256 * 256 * size_of::<f32>();
-    let engine = Engine::with_disk_cache(g, budget, std::env::temp_dir(), 64 << 20).unwrap();
+    // the spill dir persists, so each run gets its own base and removes it
+    let spill_base =
+        std::env::temp_dir().join(format!("geoplumb-test-{}-tensor", std::process::id()));
+    let engine = Engine::with_disk_cache(g, budget, &spill_base, 64 << 20).unwrap();
 
     let bbox = window(0, 0, 256, 256);
     let fine = WindowReq {
@@ -348,6 +363,8 @@ async fn tensor_chunks_spill_to_disk_and_reload() {
         after,
         "spilled chunk must reload from disk, not recompute"
     );
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&spill_base);
 
     let bits = |t: &geoplumb::TensorChunk| t.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
     assert_eq!(

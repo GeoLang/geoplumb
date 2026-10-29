@@ -4,6 +4,7 @@
 //! request the remainder is block-averaged, matching RasterSrc semantics
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use crate::caps::{
@@ -12,6 +13,7 @@ use crate::caps::{
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::error::{Error, Result};
+use crate::spill::Fnv1a;
 use crate::window::{GridSpec, WindowReq};
 use futures::future::BoxFuture;
 use terrano_core::{BandedRaster, CogReader, RangeRead, Raster};
@@ -59,6 +61,17 @@ pub(crate) fn band_count<R: RangeRead>(reader: &CogReader<R>) -> Result<u16> {
 }
 
 impl<R: RangeRead + Send + Sync + 'static> Source for CogSrc<R> {
+    fn identity(&self) -> String {
+        // the tile offsets and byte counts of every level stand in for the content
+        let mut layout = Fnv1a::new();
+        write!(layout, "{:?}", self.reader.levels()).expect("hashing never fails");
+        format!(
+            "CogSrc meta={:?} layout={:016x}",
+            self.reader.meta(),
+            layout.finish()
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
             dtype: SetField::one(Dtype::F64),

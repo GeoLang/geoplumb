@@ -52,6 +52,10 @@ struct ClockSrc {
 }
 
 impl Source for ClockSrc {
+    fn identity(&self) -> String {
+        format!("ClockSrc varying={}", self.varying)
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
             dtype: SetField::one(Dtype::F64),
@@ -105,6 +109,10 @@ struct AddOne {
 }
 
 impl Transform for AddOne {
+    fn identity(&self) -> String {
+        "AddOne".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::any_raster())
     }

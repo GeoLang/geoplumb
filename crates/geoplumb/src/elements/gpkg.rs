@@ -7,6 +7,7 @@ use futures::future::BoxFuture;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
+use super::file_stamp;
 use super::vector::simplify_geometry;
 use crate::caps::{CapsPattern, CapsSet, Constraint, Crs, ResRange, SetField, VectorPattern};
 use crate::chunk::{Chunk, VectorChunk, VectorFeature, clip_geometry};
@@ -325,6 +326,21 @@ impl FeatureTable {
 }
 
 impl Source for GpkgSrc {
+    fn identity(&self) -> String {
+        let table = &self.table;
+        format!(
+            "GpkgSrc path={:?} table={:?} property_columns={:?} origin_x={:?} origin_y={:?} base_resolution={:?} crs={} {}",
+            table.path,
+            table.name,
+            table.property_columns,
+            self.origin_x,
+            self.origin_y,
+            self.base_resolution,
+            self.crs,
+            file_stamp(&table.path)
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Vector(VectorPattern {
             crs: SetField::one(self.crs),

@@ -2,8 +2,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use copc_core::Bounds;
-use copc_reader::{BoundsSelection, CopcRangeReader, LodSelection, PointQuery, RangeRead};
+use copc_core::{Bounds, CopcInfo};
+use copc_reader::{
+    BoundsSelection, CopcRangeReader, LasHeader, LodSelection, PointQuery, RangeRead,
+};
 use futures::future::BoxFuture;
 use nubis_core::{Classification, Point3, PointCloud};
 
@@ -11,6 +13,7 @@ use crate::caps::{CapsPattern, CapsSet, Constraint, Crs, PointPattern, ResRange,
 use crate::chunk::{Chunk, PointChunk, tile_contains};
 use crate::element::Source;
 use crate::elements::cog::HttpRange;
+use crate::elements::file_stamp;
 use crate::error::{Error, Result};
 use crate::window::{GridSpec, WindowReq};
 
@@ -26,6 +29,10 @@ pub struct CopcSrc<S: RangeRead + Send + 'static> {
 struct CopcDataset<S: RangeRead> {
     // the path or url every error names
     name: String,
+    // set when the file is local, so its length and mtime join the identity
+    path: Option<PathBuf>,
+    header: LasHeader,
+    info: CopcInfo,
     open_source: SourceOpener<S>,
     // a reader takes `&mut self` to read, so each read takes one out
     readers: Mutex<Vec<CopcRangeReader<S>>>,
@@ -40,7 +47,12 @@ struct CopcDataset<S: RangeRead> {
 impl<S: RangeRead + Clone + Send + Sync + 'static> CopcSrc<S> {
     // blocking, call it off the async runtime when one is running
     pub fn open(source: S, crs: Crs) -> Result<Self> {
-        Self::open_with("copc".into(), Box::new(move || Ok(source.clone())), crs)
+        Self::open_with(
+            "copc".into(),
+            None,
+            Box::new(move || Ok(source.clone())),
+            crs,
+        )
     }
 }
 
@@ -49,10 +61,12 @@ impl CopcSrc<File> {
         let path: PathBuf = path.as_ref().to_path_buf();
         let name = path.display().to_string();
         let opener_name = name.clone();
+        let opener_path = path.clone();
         Self::open_with(
             name,
+            Some(path),
             Box::new(move || {
-                File::open(&path).map_err(|e| Error::Source(format!("{opener_name}: {e}")))
+                File::open(&opener_path).map_err(|e| Error::Source(format!("{opener_name}: {e}")))
             }),
             crs,
         )
@@ -64,13 +78,18 @@ impl CopcSrc<CopcHttpRange> {
     pub fn open_url(url: impl Into<String>, crs: Crs) -> Result<Self> {
         let url = url.into();
         let source = CopcHttpRange::new(&url)?;
-        Self::open_with(url, Box::new(move || Ok(source.clone())), crs)
+        Self::open_with(url, None, Box::new(move || Ok(source.clone())), crs)
     }
 }
 
 impl<S: RangeRead + Send + 'static> CopcSrc<S> {
     // the crs comes from the caller since nothing in the org parses the file's wkt vlr
-    fn open_with(name: String, open_source: SourceOpener<S>, crs: Crs) -> Result<Self> {
+    fn open_with(
+        name: String,
+        path: Option<PathBuf>,
+        open_source: SourceOpener<S>,
+        crs: Crs,
+    ) -> Result<Self> {
         let named = |e: copc_core::Error| Error::Source(format!("{name}: {e}"));
         let mut reader = CopcRangeReader::open(open_source()?).map_err(named)?;
         let deepest = reader
@@ -82,15 +101,18 @@ impl<S: RangeRead + Send + 'static> CopcSrc<S> {
             .max()
             .ok_or_else(|| Error::Source(format!("{name}: the copc file holds no points")))?;
         let header = *reader.header();
-        let spacing = reader.copc_info().spacing;
+        let info = *reader.copc_info();
         Ok(CopcSrc {
             dataset: Arc::new(CopcDataset {
                 name,
+                path,
+                header,
+                info,
                 open_source,
                 readers: Mutex::new(vec![reader]),
                 origin_x: header.min_x,
                 origin_y: header.max_y,
-                base_resolution: spacing / 2f64.powi(deepest),
+                base_resolution: info.spacing / 2f64.powi(deepest),
                 min_z: header.min_z,
                 max_z: header.max_z,
                 crs,
@@ -153,6 +175,18 @@ impl<S: RangeRead + Send + 'static> CopcDataset<S> {
 }
 
 impl<S: RangeRead + Send + 'static> Source for CopcSrc<S> {
+    fn identity(&self) -> String {
+        let dataset = &self.dataset;
+        let file = match &dataset.path {
+            Some(path) => file_stamp(path),
+            None => "file=none".into(),
+        };
+        format!(
+            "CopcSrc name={:?} header={:?} info={:?} base_resolution={:?} crs={} {file}",
+            dataset.name, dataset.header, dataset.info, dataset.base_resolution, dataset.crs
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::PointCloud(PointPattern {
             crs: SetField::one(self.dataset.crs),

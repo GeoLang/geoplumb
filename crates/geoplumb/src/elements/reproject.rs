@@ -176,6 +176,10 @@ fn canonical_origin(crs: Crs, projected_input_origin: (f64, f64)) -> (f64, f64) 
 }
 
 impl Transform for Reproject {
+    fn identity(&self) -> String {
+        format!("Reproject to={}", self.to)
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Derived {
             input: CapsSet::any_raster(),
@@ -283,6 +287,10 @@ impl VecReproject {
 }
 
 impl Transform for VecReproject {
+    fn identity(&self) -> String {
+        format!("VecReproject to={}", self.to)
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Derived {
             input: CapsSet::any_vector(),

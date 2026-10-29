@@ -25,6 +25,18 @@ impl MapAlgebra {
 }
 
 impl Transform for MapAlgebra {
+    fn identity(&self) -> String {
+        let op = match &self.op {
+            AlgebraOp::Unary(UnaryOp::Add(v)) => format!("add({v:?})"),
+            AlgebraOp::Unary(UnaryOp::Multiply(v)) => format!("multiply({v:?})"),
+            AlgebraOp::Unary(UnaryOp::Sqrt) => "sqrt".into(),
+            AlgebraOp::Unary(UnaryOp::Abs) => "abs".into(),
+            AlgebraOp::Unary(UnaryOp::Log) => "log".into(),
+            AlgebraOp::Reclassify(classes) => format!("reclassify({classes:?})"),
+        };
+        format!("MapAlgebra op={op}")
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::any_raster())
     }
@@ -67,6 +79,18 @@ impl Combine {
 }
 
 impl Fanin for Combine {
+    fn identity(&self) -> String {
+        let op = match self.op {
+            BinaryOp::Add => "add",
+            BinaryOp::Subtract => "subtract",
+            BinaryOp::Multiply => "multiply",
+            BinaryOp::Divide => "divide",
+            BinaryOp::Min => "min",
+            BinaryOp::Max => "max",
+        };
+        format!("Combine op={op}")
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::any_raster())
     }

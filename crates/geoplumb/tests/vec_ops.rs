@@ -110,6 +110,10 @@ const WINDOW: Bbox = Bbox {
 struct VecChunks(u32);
 
 impl Transform for VecChunks {
+    fn identity(&self) -> String {
+        format!("VecChunks chunk_px={}", self.0)
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Vector(VectorPattern {
             chunk_px: SetField::one(self.0),
@@ -661,6 +665,10 @@ fn clip_cuts_lines_and_drops_outside_points() {
 struct MercatorVec;
 
 impl Transform for MercatorVec {
+    fn identity(&self) -> String {
+        "MercatorVec".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Vector(VectorPattern {
             crs: SetField::one(Crs::WEB_MERCATOR),

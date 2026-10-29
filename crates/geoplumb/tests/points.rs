@@ -127,6 +127,10 @@ async fn point_pull_filters_the_window_and_thins_coarse_levels() {
 struct SmallChunks;
 
 impl Transform for SmallChunks {
+    fn identity(&self) -> String {
+        "SmallChunks".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Raster(RasterPattern {
             chunk_px: SetField::one(16),
@@ -246,6 +250,10 @@ struct CountingLas {
 }
 
 impl Source for CountingLas {
+    fn identity(&self) -> String {
+        format!("CountingLas {}", self.inner.identity())
+    }
+
     fn constraint(&self) -> Constraint {
         self.inner.constraint()
     }
@@ -270,7 +278,10 @@ async fn point_chunks_spill_to_disk_and_reload() {
     }));
     // level 0 chunk is ~128 KiB of points, the budget holds it alone but
     // not together with the next pull, forcing a demotion to disk
-    let engine = Engine::with_disk_cache(g, 130 << 10, std::env::temp_dir(), 64 << 20).unwrap();
+    // the spill dir persists, so each run gets its own base and removes it
+    let spill_base =
+        std::env::temp_dir().join(format!("geoplumb-test-{}-points", std::process::id()));
+    let engine = Engine::with_disk_cache(g, 130 << 10, &spill_base, 64 << 20).unwrap();
     let base = engine.grid(las).base_resolution;
     let bbox = Bbox::new(0.0, 0.0, 64.0, 64.0);
     let fine = WindowReq {
@@ -293,6 +304,8 @@ async fn point_chunks_spill_to_disk_and_reload() {
         after,
         "spilled chunk must reload from disk, not recompute"
     );
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&spill_base);
 
     let key = |p: &Point3| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits());
     let mut a: Vec<_> = first.points.points().iter().map(key).collect();
@@ -306,6 +319,10 @@ async fn point_chunks_spill_to_disk_and_reload() {
 struct MercatorOnly;
 
 impl Transform for MercatorOnly {
+    fn identity(&self) -> String {
+        "MercatorOnly".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Raster(RasterPattern {
             crs: SetField::one(Crs::WEB_MERCATOR),

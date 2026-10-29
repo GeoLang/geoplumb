@@ -132,6 +132,10 @@ fn output_is_one_band_and_keeps_the_input_crs() {
 struct SmallChunks;
 
 impl Transform for SmallChunks {
+    fn identity(&self) -> String {
+        "SmallChunks".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Raster(RasterPattern {
             chunk_px: SetField::one(16),

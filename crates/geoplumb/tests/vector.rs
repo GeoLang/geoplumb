@@ -234,6 +234,10 @@ async fn coarse_levels_simplify_and_drop_subpixel_features() {
 struct SmallChunks;
 
 impl Transform for SmallChunks {
+    fn identity(&self) -> String {
+        "SmallChunks".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Raster(RasterPattern {
             chunk_px: SetField::one(16),
@@ -326,6 +330,10 @@ struct CountingVec {
 }
 
 impl Source for CountingVec {
+    fn identity(&self) -> String {
+        format!("CountingVec {}", self.inner.identity())
+    }
+
     fn constraint(&self) -> Constraint {
         self.inner.constraint()
     }
@@ -360,7 +368,10 @@ async fn vector_chunks_spill_to_disk_and_reload() {
         inner: src(),
         reads: reads.clone(),
     }));
-    let engine = Engine::with_disk_cache(g, budget, std::env::temp_dir(), 64 << 20).unwrap();
+    // the spill dir persists, so each run gets its own base and removes it
+    let spill_base =
+        std::env::temp_dir().join(format!("geoplumb-test-{}-vector", std::process::id()));
+    let engine = Engine::with_disk_cache(g, budget, &spill_base, 64 << 20).unwrap();
     let coarse = WindowReq {
         bbox,
         resolution: base * 8.0,
@@ -376,6 +387,8 @@ async fn vector_chunks_spill_to_disk_and_reload() {
         after,
         "spilled chunk must reload from disk, not recompute"
     );
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&spill_base);
 
     let key = |f: &geoplumb::VectorFeature| {
         (
@@ -451,6 +464,10 @@ fn polygon_bits(p: &Polygon) -> Vec<(u64, u64)> {
 struct MercatorOnly;
 
 impl Transform for MercatorOnly {
+    fn identity(&self) -> String {
+        "MercatorOnly".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Raster(RasterPattern {
             crs: SetField::one(Crs::WEB_MERCATOR),

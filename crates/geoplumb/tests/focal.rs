@@ -216,6 +216,10 @@ async fn an_all_nodata_window_comes_back_nodata() {
 struct SmallChunks;
 
 impl Transform for SmallChunks {
+    fn identity(&self) -> String {
+        "SmallChunks".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Raster(RasterPattern {
             chunk_px: SetField::one(16),

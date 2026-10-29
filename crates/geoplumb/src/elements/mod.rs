@@ -40,3 +40,27 @@ pub mod mask;
 pub use mask::QualityMask;
 pub mod focal;
 pub use focal::{Focal, FocalOp};
+
+/// length and modification time of a file a source reads by path, so a
+/// rewritten file gets a new identity
+pub(crate) fn file_stamp(path: &std::path::Path) -> String {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) => return format!("file_error={:?}", e.to_string()),
+    };
+    let modified = metadata
+        .modified()
+        .map_err(|e| e.to_string())
+        .and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())
+        });
+    match modified {
+        Ok(since_epoch) => format!(
+            "file_bytes={} file_modified_ns={}",
+            metadata.len(),
+            since_epoch.as_nanos()
+        ),
+        Err(e) => format!("file_bytes={} file_modified_error={e:?}", metadata.len()),
+    }
+}

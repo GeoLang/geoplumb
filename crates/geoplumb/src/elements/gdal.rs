@@ -12,6 +12,7 @@ use crate::caps::{
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::elements::cog::decimate;
+use crate::elements::file_stamp;
 use crate::error::{Error, Result};
 use crate::window::{GridSpec, WindowReq};
 
@@ -283,6 +284,22 @@ impl GdalFile {
 }
 
 impl Source for GdalSrc {
+    fn identity(&self) -> String {
+        let file = &self.file;
+        format!(
+            "GdalSrc path={:?} driver={:?} bands={:?} nodata={:?} level_resolutions={:?} origin_x={:?} origin_y={:?} crs={} {}",
+            file.path,
+            file.driver,
+            file.bands,
+            file.nodata,
+            file.level_resolutions,
+            file.origin_x,
+            file.origin_y,
+            file.crs,
+            file_stamp(&file.path)
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
             dtype: SetField::one(Dtype::F64),

@@ -132,6 +132,10 @@ async fn mixed_crs_fanin_autoplugs_a_reproject() {
 struct MercatorOnly;
 
 impl Transform for MercatorOnly {
+    fn identity(&self) -> String {
+        "MercatorOnly".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Raster(RasterPattern {
             crs: SetField::one(Crs::WEB_MERCATOR),
@@ -180,6 +184,10 @@ async fn crs_demanding_transform_autoplugs_upstream() {
 struct BandPick;
 
 impl Transform for BandPick {
+    fn identity(&self) -> String {
+        "BandPick".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Derived {
             input: CapsSet::any_raster(),

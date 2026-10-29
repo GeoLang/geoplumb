@@ -3,12 +3,13 @@
 //! request, so chunked output equals whole-window output and none of them
 //! needs a halo
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::caps::{CapsPattern, CapsSet, Constraint, VectorPattern};
 use crate::chunk::{Chunk, VectorChunk, VectorFeature};
 use crate::element::Transform;
 use crate::error::Result;
+use crate::spill::{Fnv1a, write_polygon};
 use crate::window::WindowReq;
 use serde_json::Value;
 use topoi_core::{MultiPolygon, clip_to_boundary};
@@ -62,6 +63,10 @@ impl VecFilter {
 }
 
 impl Transform for VecFilter {
+    fn identity(&self) -> String {
+        format!("VecFilter field={:?} equals={}", self.field, self.equals)
+    }
+
     fn constraint(&self) -> Constraint {
         vector_identity()
     }
@@ -109,6 +114,15 @@ impl VecSchema {
 }
 
 impl Transform for VecSchema {
+    fn identity(&self) -> String {
+        let rename: BTreeMap<_, _> = self.rename.iter().collect();
+        let add: BTreeMap<_, _> = self.add.iter().map(|(k, v)| (k, v.to_string())).collect();
+        format!(
+            "VecSchema rename={rename:?} drop={:?} add={add:?}",
+            self.drop
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         vector_identity()
     }
@@ -141,6 +155,18 @@ pub struct VecClip {
 }
 
 impl Transform for VecClip {
+    fn identity(&self) -> String {
+        let mut digest = Fnv1a::new();
+        for polygon in self.boundary.polygons() {
+            write_polygon(&mut digest, polygon).expect("hashing never fails");
+        }
+        format!(
+            "VecClip polygons={} boundary={:016x}",
+            self.boundary.polygons().len(),
+            digest.finish()
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         vector_identity()
     }

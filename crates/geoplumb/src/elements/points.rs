@@ -11,6 +11,7 @@ use crate::caps::{
 use crate::chunk::{Chunk, PointChunk, RasterChunk, tile_contains};
 use crate::element::{Source, Transform};
 use crate::error::{Error, Result};
+use crate::spill::Fnv1a;
 use crate::window::{Bbox, GridSpec, WindowReq};
 use futures::future::BoxFuture;
 use nubis_core::{GridWindow, Point3, PointCloud, idw_window, thin_voxel};
@@ -120,6 +121,26 @@ impl LasSrc {
 }
 
 impl Source for LasSrc {
+    fn identity(&self) -> String {
+        let mut digest = Fnv1a::new();
+        for p in self.cloud.points() {
+            for v in [p.x, p.y, p.z] {
+                digest.update(&v.to_le_bytes());
+            }
+            digest.update(&p.intensity.to_le_bytes());
+            digest.update(&[p.classification.to_u8()]);
+        }
+        format!(
+            "LasSrc points={} origin_x={:?} origin_y={:?} base_resolution={:?} crs={} content={:016x}",
+            self.cloud.len(),
+            self.origin_x,
+            self.origin_y,
+            self.base_resolution,
+            self.crs,
+            digest.finish()
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::PointCloud(PointPattern {
             crs: SetField::one(self.crs),
@@ -180,6 +201,13 @@ impl Default for IdwGrid {
 }
 
 impl Transform for IdwGrid {
+    fn identity(&self) -> String {
+        format!(
+            "IdwGrid power={:?} radius_px={:?} min_points={}",
+            self.power, self.radius_px, self.min_points
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Derived {
             input: CapsSet::one(CapsPattern::PointCloud(PointPattern::default())),

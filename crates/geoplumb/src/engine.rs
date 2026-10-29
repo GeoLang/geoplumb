@@ -19,7 +19,7 @@ use crate::element::{Fanin, Source, Transform};
 use crate::error::{Error, Result};
 use crate::graph::{Graph, Node, NodeId};
 use crate::solver;
-use crate::spill::{self, SpillStore};
+use crate::spill::{self, SpillStore, StoredChunk};
 use crate::window::{Bbox, ChunkKey, GridSpec, TimeInterval, WindowReq};
 use terrano_core::{BandedRaster, Raster};
 
@@ -101,30 +101,6 @@ impl Engine {
     /// node's grid from its source up. spliced nodes sit after their
     /// consumers in index order, so construction walks the topo order
     pub fn new(graph: Graph, budget_bytes: usize) -> Result<Engine> {
-        Engine::build(graph, budget_bytes, None)
-    }
-
-    /// like `new`, with evicted chunks demoted to a disk tier instead of
-    /// dropped. the engine owns a fresh subdir of `dir` and removes it on
-    /// drop, entries never outlive the engine that wrote them
-    pub fn with_disk_cache(
-        graph: Graph,
-        budget_bytes: usize,
-        dir: impl AsRef<std::path::Path>,
-        disk_budget_bytes: usize,
-    ) -> Result<Engine> {
-        let store = SpillStore::create(dir.as_ref())?;
-        Engine::build(
-            graph,
-            budget_bytes,
-            Some(SpillState {
-                store,
-                budget_bytes: disk_budget_bytes,
-            }),
-        )
-    }
-
-    fn build(graph: Graph, budget_bytes: usize, spill: Option<SpillState>) -> Result<Engine> {
         let mut graph = graph;
         let caps = solver::solve(&mut graph)?;
         let topo = graph.topo_order();
@@ -191,8 +167,92 @@ impl Engine {
             cache: Mutex::new(CacheState::default()),
             events,
             budget_bytes,
-            spill,
+            spill: None,
         })
+    }
+
+    /// like `new`, with evicted chunks demoted to a disk tier instead of
+    /// dropped. the tier is the subdir of `dir` named by the graph
+    /// identity, it persists after the engine and the next engine over the
+    /// same graph reuses its files. files of time-varying nodes are
+    /// deleted at open instead, a time-keyed chunk can go stale
+    pub fn with_disk_cache(
+        graph: Graph,
+        budget_bytes: usize,
+        dir: impl AsRef<std::path::Path>,
+        disk_budget_bytes: usize,
+    ) -> Result<Engine> {
+        let mut engine = Engine::new(graph, budget_bytes)?;
+        let store_dir = dir
+            .as_ref()
+            .join(format!("geoplumb-{:016x}", engine.graph_identity()));
+        let (store, stored) = SpillStore::open(store_dir)?;
+        engine.spill = Some(SpillState {
+            store,
+            budget_bytes: disk_budget_bytes,
+        });
+        engine.restore_spilled(stored, disk_budget_bytes);
+        Ok(engine)
+    }
+
+    /// hash of every node's index, kind, parents, element identity and
+    /// fixated caps, after the solve so spliced adapters count
+    fn graph_identity(&self) -> u64 {
+        let mut canonical = String::new();
+        for &i in &self.topo {
+            let node = &self.nodes[i];
+            let (kind, parents, identity) = match &node.elem {
+                RtElem::Source(s) => ("source", Vec::new(), s.identity()),
+                RtElem::Transform { parent, element } => {
+                    ("transform", vec![*parent], element.identity())
+                }
+                RtElem::Fanin { parents, element } => {
+                    ("fanin", parents.clone(), element.identity())
+                }
+            };
+            for line in [
+                i.to_string(),
+                kind.to_string(),
+                format!("{parents:?}"),
+                identity,
+                format!("{:?}", node.caps),
+            ] {
+                canonical.push_str(&line);
+                canonical.push('\n');
+            }
+        }
+        spill::fnv1a(canonical.as_bytes())
+    }
+
+    /// turns the files a reopened store holds into spilled entries, newest
+    /// first up to the disk budget. the rest, and every file of a
+    /// time-varying node, is deleted
+    fn restore_spilled(&mut self, mut stored: Vec<StoredChunk>, disk_budget_bytes: usize) {
+        stored.sort_by_key(|c| std::cmp::Reverse(c.modified));
+        let state = self.cache.get_mut().unwrap();
+        let mut deletions = Vec::new();
+        let mut over_budget = false;
+        for c in stored {
+            let trusted = self
+                .nodes
+                .get(c.node)
+                .is_some_and(|n| !n.time_varying && c.key.time.is_none());
+            over_budget =
+                over_budget || (trusted && state.disk_bytes + c.bytes > disk_budget_bytes);
+            if !trusted || over_budget {
+                deletions.push((c.node, c.key));
+                continue;
+            }
+            state.disk_bytes += c.bytes;
+            state.entries.insert(
+                (c.node, c.key),
+                Entry::Spilled {
+                    bytes: c.bytes,
+                    last_used: 0,
+                },
+            );
+        }
+        self.delete_spill_files(&deletions);
     }
 
     pub fn caps(&self, node: NodeId) -> &Caps {
@@ -416,13 +476,20 @@ impl Engine {
         if let Some(sp) = &self.spill {
             let path = sp.store.path(node, key);
             let c = chunk.clone();
-            if offload(move || spill::write_chunk(&path, &c)).await.is_ok() {
+            let written = path.clone();
+            if offload(move || spill::write_chunk(&written, &c))
+                .await
+                .is_ok()
+            {
                 let mut state = self.cache.lock().unwrap();
                 if let Some(Entry::Ready { spilled, .. }) = state.entries.get_mut(&(node, key)) {
                     *spilled = true;
+                } else {
+                    // evicted or invalidated mid-write, and the next engine
+                    // over this graph would load the orphan file
+                    drop(state);
+                    let _ = std::fs::remove_file(&path);
                 }
-                // entry gone: the orphan file gets overwritten on the next
-                // compute of this key, the store dir dies with the engine
             }
         }
         Ok(chunk)

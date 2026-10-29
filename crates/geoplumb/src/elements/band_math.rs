@@ -366,6 +366,7 @@ impl Parser<'_> {
 /// cell enters the expression as NaN and NaN propagates through every
 /// operator, so the output nodata is NaN
 pub struct BandMath {
+    expression: String,
     root: Expr,
     bands: usize,
 }
@@ -383,6 +384,7 @@ impl BandMath {
             return Err(parse_err(format!("trailing {}", describe(tok))));
         }
         Ok(BandMath {
+            expression: expr.into(),
             root,
             bands: parser.bands,
         })
@@ -390,6 +392,10 @@ impl BandMath {
 }
 
 impl Transform for BandMath {
+    fn identity(&self) -> String {
+        format!("BandMath expression={:?}", self.expression)
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Derived {
             input: CapsSet::one(CapsPattern::Raster(RasterPattern {

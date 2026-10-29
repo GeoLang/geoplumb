@@ -2,6 +2,7 @@
 
 ## 2026-10-28
 
+- the disk cache survives restarts: every element names what it computes through a required `identity()` method, the engine hashes those with the fixated caps into the store directory name, a reopened directory serves its files for time-invariant nodes and drops time-keyed ones, an edited graph gets a new directory, and chunk files are written under a temporary name and renamed into place
 - the workspace's minimum rust version is 1.88, which the copc crates require, and the code uses the `as_chunks`, `is_multiple_of` and let-chain forms clippy asks for at that version
 - `StacSrc` reads the assets of one item in parallel instead of one after another, the process-wide cap of 64 now counting asset reads
 - `gdal` as a layer source in a server built with the new `gdal` feature, serving any raster GDAL opens: `source = { kind = "gdal", path = "/data/dem.tif", band = 1 }`, with `band` 1-based and optional, every band served when it is absent. Pulls read only their window, from the file overview nearest the request, every band as f64. A rotated or sheared geotransform, non-square pixels, a CRS without an EPSG code and an out-of-range band fail at startup naming the file, and startup prints the GDAL driver each such layer opened with. A build without the feature fails to parse a layer file naming `gdal`, naming the layer and the feature. The Docker image builds it with `--build-arg GDAL=1`

@@ -13,6 +13,10 @@ use terrano_core::{BandedRaster, Raster};
 pub struct Mosaic;
 
 impl Fanin for Mosaic {
+    fn identity(&self) -> String {
+        "Mosaic".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::any_raster())
     }

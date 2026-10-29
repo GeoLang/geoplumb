@@ -51,6 +51,13 @@ impl Hillshade {
 }
 
 impl Transform for Hillshade {
+    fn identity(&self) -> String {
+        format!(
+            "Hillshade azimuth={:?} altitude={:?}",
+            self.azimuth, self.altitude
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(single_band())
     }
@@ -73,6 +80,10 @@ impl Transform for Hillshade {
 pub struct Slope;
 
 impl Transform for Slope {
+    fn identity(&self) -> String {
+        "Slope".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(single_band())
     }
@@ -97,6 +108,10 @@ impl Transform for Slope {
 pub struct Aspect;
 
 impl Transform for Aspect {
+    fn identity(&self) -> String {
+        "Aspect".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(single_band())
     }

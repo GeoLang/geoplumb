@@ -48,6 +48,10 @@ struct CountingSrc {
 }
 
 impl Source for CountingSrc {
+    fn identity(&self) -> String {
+        format!("CountingSrc {}", self.inner.identity())
+    }
+
     fn constraint(&self) -> Constraint {
         self.inner.constraint()
     }

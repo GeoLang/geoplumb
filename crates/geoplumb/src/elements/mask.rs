@@ -26,6 +26,13 @@ impl QualityMask {
 }
 
 impl Transform for QualityMask {
+    fn identity(&self) -> String {
+        format!(
+            "QualityMask band={} valid_values={:?}",
+            self.band, self.valid_values
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Raster(RasterPattern {
             // a band index past u16 just demands more than any link carries

@@ -36,6 +36,13 @@ pub struct ToTensor {
 }
 
 impl Transform for ToTensor {
+    fn identity(&self) -> String {
+        format!(
+            "ToTensor scales={:?} offsets={:?}",
+            self.scales, self.offsets
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Derived {
             input: CapsSet::one(CapsPattern::Raster(RasterPattern::default())),
@@ -98,6 +105,10 @@ pub struct TensorConv {
 }
 
 impl Transform for TensorConv {
+    fn identity(&self) -> String {
+        format!("TensorConv kernel={:?}", self.kernel)
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::one(CapsPattern::Tensor(TensorPattern::default())))
     }
@@ -161,6 +172,10 @@ impl Transform for TensorConv {
 pub struct ToRaster;
 
 impl Transform for ToRaster {
+    fn identity(&self) -> String {
+        "ToRaster".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Derived {
             input: CapsSet::one(CapsPattern::Tensor(TensorPattern::default())),

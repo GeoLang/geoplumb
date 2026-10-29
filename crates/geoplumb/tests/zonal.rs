@@ -139,6 +139,10 @@ struct CountingSrc {
 }
 
 impl Source for CountingSrc {
+    fn identity(&self) -> String {
+        format!("CountingSrc {}", self.inner.identity())
+    }
+
     fn constraint(&self) -> Constraint {
         self.inner.constraint()
     }
@@ -171,6 +175,10 @@ fn stamp(time: Option<TimeInterval>) -> f64 {
 }
 
 impl Source for ClockSrc {
+    fn identity(&self) -> String {
+        "ClockSrc".into()
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
             dtype: SetField::one(Dtype::F64),

@@ -135,6 +135,10 @@ struct PrefSrc {
 }
 
 impl Source for PrefSrc {
+    fn identity(&self) -> String {
+        format!("PrefSrc crss={:?}", self.crss)
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet {
             alternatives: self

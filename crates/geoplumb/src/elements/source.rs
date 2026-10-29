@@ -7,6 +7,7 @@ use crate::caps::{CapsPattern, CapsSet, Constraint, Crs, RasterPattern, ResRange
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::error::Result;
+use crate::spill::Fnv1a;
 use crate::window::{GridSpec, WindowReq};
 use futures::future::BoxFuture;
 use terrano_core::{BandedRaster, GeoTiffMetadata, Raster, read_geotiff_bands};
@@ -92,6 +93,27 @@ impl RasterSrc {
 }
 
 impl Source for RasterSrc {
+    fn identity(&self) -> String {
+        let mut digest = Fnv1a::new();
+        for band in self.data.bands() {
+            digest.update(&(band.width() as u64).to_le_bytes());
+            digest.update(&(band.height() as u64).to_le_bytes());
+            digest.update(&band.nodata.to_le_bytes());
+            for v in band.data() {
+                digest.update(&v.to_le_bytes());
+            }
+        }
+        format!(
+            "RasterSrc bands={} origin_x={:?} origin_y={:?} base_resolution={:?} crs={} content={:016x}",
+            self.data.band_count(),
+            self.origin_x,
+            self.origin_y,
+            self.base_resolution,
+            self.crs,
+            digest.finish()
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
             dtype: SetField::one(crate::caps::Dtype::F64),

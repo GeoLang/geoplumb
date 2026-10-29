@@ -25,6 +25,13 @@ pub trait Source: Send + Sync {
     /// must be `Constraint::Produces`
     fn constraint(&self) -> Constraint;
 
+    /// what this element reads or computes, stable across processes, so two
+    /// engines over the same graph share one disk cache and a changed
+    /// parameter or input never serves the other's files. every field that
+    /// changes the output goes in, nothing that does not (handles, pools,
+    /// counters)
+    fn identity(&self) -> String;
+
     /// native pixel grid anchoring this source's resolution ladder
     fn grid(&self) -> GridSpec;
 
@@ -42,6 +49,9 @@ pub trait Source: Send + Sync {
 
 pub trait Transform: Send + Sync {
     fn constraint(&self) -> Constraint;
+
+    /// like `Source::identity`, the element's parameters
+    fn identity(&self) -> String;
 
     /// called once after the solve with the fixated link caps
     fn configure(&mut self, input: &Caps, output: &Caps) -> Result<()> {
@@ -83,6 +93,9 @@ pub trait Fanin: Send + Sync {
     /// applies to every input link and the output link alike, so all pins
     /// negotiate to matching caps. `Identity` is the usual choice
     fn constraint(&self) -> Constraint;
+
+    /// like `Source::identity`, the element's parameters
+    fn identity(&self) -> String;
 
     /// called once after the solve with the fixated caps of every input
     /// link, wiring order, and the output link

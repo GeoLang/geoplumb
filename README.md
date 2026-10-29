@@ -73,7 +73,7 @@ Tiles take `?t=2024-06-01T00:00:00Z/2024-07-01T00:00:00Z` to render at that inte
 | `GEOPLUMB_LAYERS` | none, required | layer TOML path |
 | `PORT` | `3000` | listen port |
 | `GEOPLUMB_CACHE_BYTES` | 256 MiB | memory cache per layer |
-| `GEOPLUMB_DISK_CACHE` | unset | directory for a disk cache tier of eight times the memory budget per layer |
+| `GEOPLUMB_DISK_CACHE` | unset | directory for a disk cache tier of eight times the memory budget per layer, kept across restarts in a subdirectory per layer graph, so an edited layer starts empty and its old subdirectory stays until you delete it |
 
 Endpoints are public, the same as the rest of the public tile path. Tagged releases publish `ghcr.io/geolang/geoplumb`.
 

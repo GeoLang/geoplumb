@@ -51,6 +51,10 @@ impl Focal {
 }
 
 impl Transform for Focal {
+    fn identity(&self) -> String {
+        format!("Focal op={:?} radius={}", self.op, self.radius)
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Identity(CapsSet::any_raster())
     }

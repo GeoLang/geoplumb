@@ -1412,6 +1412,23 @@ fn reduce_values(vals: &mut [f64], op: Composite) -> f64 {
 }
 
 impl Source for StacSrc {
+    fn identity(&self) -> String {
+        // the remote items behind a search can change, the search is all
+        // there is to name
+        let search = &self.inner.search;
+        format!(
+            "StacSrc api={:?} collection={:?} assets={:?} bbox={:?} datetime={:?} composite={:?} crs={} bands={}",
+            search.api,
+            search.collection,
+            search.assets,
+            search.bbox,
+            search.datetime,
+            search.composite,
+            self.crs,
+            self.bands
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
             dtype: SetField::one(Dtype::F64),

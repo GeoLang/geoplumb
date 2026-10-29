@@ -1,16 +1,17 @@
-//! disk tier for the chunk cache: a flat binary file per chunk. entries
-//! live for one engine instance, the engine owns a unique subdir and
-//! removes it on drop, so files never outlive the caps they were computed
-//! under
+//! disk tier for the chunk cache: a flat binary file per chunk, in a
+//! directory named by the graph identity. the directory outlives the
+//! engine, so the next engine over the same graph starts from its files
+//! and an edited graph never sees them
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use crate::caps::Crs;
 use crate::chunk::{Chunk, PointChunk, RasterChunk, TensorChunk, VectorChunk, VectorFeature};
 use crate::error::{Error, Result};
-use crate::window::{Bbox, ChunkKey};
+use crate::window::{Bbox, ChunkKey, TimeInterval};
 use nubis_core::{Classification, Point3, PointCloud};
 use terrano_core::{BandedRaster, Raster};
 use topoi_core::geojson::FeatureGeometry;
@@ -33,40 +34,140 @@ const GEOM_MULTIPOINT: u8 = 4;
 const GEOM_MULTILINESTRING: u8 = 5;
 const GEOM_COLLECTION: u8 = 6;
 
+/// 64-bit fnv-1a, unlike std's hashers the same in every process
+#[derive(Debug)]
+pub(crate) struct Fnv1a(u64);
+
+impl Fnv1a {
+    pub(crate) fn new() -> Fnv1a {
+        Fnv1a(0xcbf29ce484222325)
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    pub(crate) fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Write for Fnv1a {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hasher = Fnv1a::new();
+    hasher.update(bytes);
+    hasher.finish()
+}
+
 pub(crate) struct SpillStore {
     dir: PathBuf,
 }
 
+/// a chunk file a store directory held when it was opened
+pub(crate) struct StoredChunk {
+    pub(crate) node: usize,
+    pub(crate) key: ChunkKey,
+    pub(crate) bytes: usize,
+    pub(crate) modified: SystemTime,
+}
+
 impl SpillStore {
-    /// creates a unique subdir of `base` this store owns outright
-    pub(crate) fn create(base: &Path) -> Result<SpillStore> {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = base.join(format!(
-            "geoplumb-spill-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).map_err(|e| Error::Source(e.to_string()))?;
-        Ok(SpillStore { dir })
+    /// opens `dir`, creating it when missing, and returns the chunk files
+    /// it holds. anything else in it, partial writes included, is deleted
+    pub(crate) fn open(dir: PathBuf) -> Result<(SpillStore, Vec<StoredChunk>)> {
+        let io = |e: std::io::Error| Error::Source(format!("spill open {}: {e}", dir.display()));
+        std::fs::create_dir_all(&dir).map_err(io)?;
+        let mut stored = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(io)? {
+            let entry = entry.map_err(io)?;
+            let metadata = entry.metadata().map_err(io)?;
+            if !metadata.is_file() {
+                continue;
+            }
+            let parsed = entry.file_name().to_str().and_then(parse_chunk_file_name);
+            let Some((node, key)) = parsed else {
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            };
+            stored.push(StoredChunk {
+                node,
+                key,
+                bytes: metadata.len() as usize,
+                modified: metadata.modified().map_err(io)?,
+            });
+        }
+        Ok((SpillStore { dir }, stored))
     }
 
     pub(crate) fn path(&self, node: usize, key: ChunkKey) -> PathBuf {
-        let mut name = format!("{node}_{}_{}_{}", key.level, key.ix, key.iy);
-        if let Some(t) = key.time {
-            name.push_str(&format!("_{}_{}", t.start_ms, t.end_ms));
-        }
-        name.push_str(".bin");
-        self.dir.join(name)
+        self.dir.join(chunk_file_name(node, key))
     }
 }
 
-impl Drop for SpillStore {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+fn chunk_file_name(node: usize, key: ChunkKey) -> String {
+    let mut name = format!("{node}_{}_{}_{}", key.level, key.ix, key.iy);
+    if let Some(t) = key.time {
+        name.push_str(&format!("_{}_{}", t.start_ms, t.end_ms));
     }
+    name.push_str(".bin");
+    name
 }
 
+/// the inverse of `chunk_file_name`, `None` for any name it would not write
+fn parse_chunk_file_name(name: &str) -> Option<(usize, ChunkKey)> {
+    let parts: Vec<&str> = name.strip_suffix(".bin")?.split('_').collect();
+    let time = match parts.len() {
+        4 => None,
+        6 => Some(TimeInterval::new(
+            parts[4].parse().ok()?,
+            parts[5].parse().ok()?,
+        )),
+        _ => return None,
+    };
+    let node = parts[0].parse().ok()?;
+    let key = ChunkKey {
+        level: parts[1].parse().ok()?,
+        ix: parts[2].parse().ok()?,
+        iy: parts[3].parse().ok()?,
+        time,
+    };
+    // a name with leading zeros or a plus sign parses but names another path
+    (chunk_file_name(node, key) == name).then_some((node, key))
+}
+
+/// writes under a temporary name and renames into place, so a chunk name
+/// never holds a partial file
 pub(crate) fn write_chunk(path: &Path, chunk: &Chunk) -> Result<()> {
+    // per write, so two engines over one graph never write the same temp file
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let partial = path.with_extension(format!(
+        "{}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = write_chunk_file(&partial, chunk).and_then(|()| {
+        std::fs::rename(&partial, path).map_err(|e| Error::Source(format!("spill write: {e}")))
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    written
+}
+
+fn write_chunk_file(path: &Path, chunk: &Chunk) -> Result<()> {
     let io = |e: std::io::Error| Error::Source(format!("spill write: {e}"));
     let mut f = std::io::BufWriter::new(std::fs::File::create(path).map_err(io)?);
     f.write_all(&MAGIC.to_le_bytes()).map_err(io)?;
@@ -140,7 +241,7 @@ fn write_coords(f: &mut impl Write, coords: &[Coord]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_polygon(f: &mut impl Write, p: &Polygon) -> std::io::Result<()> {
+pub(crate) fn write_polygon(f: &mut impl Write, p: &Polygon) -> std::io::Result<()> {
     f.write_all(&(1 + p.interiors().len() as u32).to_le_bytes())?;
     write_coords(f, p.exterior().coords())?;
     for hole in p.interiors() {
@@ -149,7 +250,10 @@ fn write_polygon(f: &mut impl Write, p: &Polygon) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_geometry(f: &mut impl Write, geometry: &FeatureGeometry) -> std::io::Result<()> {
+pub(crate) fn write_geometry(
+    f: &mut impl Write,
+    geometry: &FeatureGeometry,
+) -> std::io::Result<()> {
     match geometry {
         FeatureGeometry::Point(p) => {
             f.write_all(&[GEOM_POINT])?;
@@ -429,4 +533,29 @@ fn read_geometry(f: &mut impl Read) -> std::io::Result<Option<FeatureGeometry>> 
         }
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fnv1a_matches_the_reference_vectors() {
+        assert_eq!(fnv1a(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a(b"a"), 0xaf63dc4c8601ec8c);
+    }
+
+    #[test]
+    fn chunk_file_names_round_trip() {
+        let key = ChunkKey {
+            level: 3,
+            ix: -2,
+            iy: 7,
+            time: Some(TimeInterval::new(-5, 10)),
+        };
+        let name = chunk_file_name(4, key);
+        assert_eq!(parse_chunk_file_name(&name), Some((4, key)));
+        assert_eq!(parse_chunk_file_name("04_3_-2_7.bin"), None);
+        assert_eq!(parse_chunk_file_name("4_3_-2_7.123-0.tmp"), None);
+    }
 }

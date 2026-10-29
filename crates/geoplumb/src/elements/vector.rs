@@ -3,7 +3,7 @@
 //! simplification, `Rasterize` is the cross-kind element burning features
 //! into rasters
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::caps::{
     CapsPattern, CapsSet, Constraint, Crs, Dtype, FieldMask, RasterPattern, ResRange, SetField,
@@ -12,6 +12,7 @@ use crate::caps::{
 use crate::chunk::{Chunk, RasterChunk, VectorChunk, VectorFeature, clip_geometry};
 use crate::element::{Source, Transform};
 use crate::error::{Error, Result};
+use crate::spill::{Fnv1a, write_geometry};
 use crate::window::{GridSpec, WindowReq};
 use futures::future::BoxFuture;
 use terrano_core::{BandedRaster, Raster};
@@ -92,6 +93,28 @@ impl VecSrc {
 }
 
 impl Source for VecSrc {
+    fn identity(&self) -> String {
+        let mut digest = Fnv1a::new();
+        for feature in &self.features {
+            digest.update(&feature.id.to_le_bytes());
+            write_geometry(&mut digest, &feature.geometry).expect("hashing never fails");
+            let properties: BTreeMap<_, _> = feature.properties.iter().collect();
+            for (name, value) in properties {
+                digest.update(name.as_bytes());
+                digest.update(value.to_string().as_bytes());
+            }
+        }
+        format!(
+            "VecSrc features={} origin_x={:?} origin_y={:?} base_resolution={:?} crs={} content={:016x}",
+            self.features.len(),
+            self.origin_x,
+            self.origin_y,
+            self.base_resolution,
+            self.crs,
+            digest.finish()
+        )
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Vector(VectorPattern {
             crs: SetField::one(self.crs),
@@ -301,6 +324,7 @@ fn simplify_polygon(p: &Polygon, resolution: f64) -> Option<Polygon> {
 
 /// what `Rasterize` burns per feature: a constant, or a numeric property
 /// looked up by name (features without it are skipped)
+#[derive(Debug)]
 pub enum Burn {
     Constant(f64),
     Property(String),
@@ -323,6 +347,10 @@ impl Rasterize {
 }
 
 impl Transform for Rasterize {
+    fn identity(&self) -> String {
+        format!("Rasterize burn={:?}", self.burn)
+    }
+
     fn constraint(&self) -> Constraint {
         Constraint::Derived {
             input: CapsSet::one(CapsPattern::Vector(VectorPattern::default())),
