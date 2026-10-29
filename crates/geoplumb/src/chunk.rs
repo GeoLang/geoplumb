@@ -2,9 +2,13 @@
 //! than trusting the request, since snapping may widen or align the window
 
 use std::collections::HashMap;
+#[cfg(feature = "wgpu")]
+use std::sync::Arc;
 
-use crate::caps::Crs;
+use crate::caps::{Crs, Domain};
 use crate::error::{Error, Result};
+#[cfg(feature = "wgpu")]
+use crate::gpu::{GpuContext, WindowCopy};
 use crate::window::Bbox;
 use nubis_core::{Point3, PointCloud};
 use terrano_core::{BandedRaster, Raster};
@@ -59,11 +63,21 @@ pub struct VectorChunk {
 /// channels * width * height, both derived from the bbox and resolution
 #[derive(Debug, Clone)]
 pub struct TensorChunk {
-    pub data: Vec<f32>,
+    pub data: TensorData,
     pub channels: u16,
     pub bbox: Bbox,
     pub resolution: f64,
     pub crs: Crs,
+}
+
+#[derive(Debug, Clone)]
+pub enum TensorData {
+    System(Vec<f32>),
+    #[cfg(feature = "wgpu")]
+    Wgpu {
+        buffer: wgpu::Buffer,
+        context: Arc<GpuContext>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -598,32 +612,93 @@ impl TensorChunk {
     }
 
     pub fn byte_size(&self) -> usize {
-        self.data.len() * size_of::<f32>()
+        match &self.data {
+            TensorData::System(values) => values.len() * size_of::<f32>(),
+            #[cfg(feature = "wgpu")]
+            TensorData::Wgpu { buffer, .. } => buffer.size() as usize,
+        }
+    }
+
+    pub fn domain(&self) -> Domain {
+        match &self.data {
+            TensorData::System(_) => Domain::System,
+            #[cfg(feature = "wgpu")]
+            TensorData::Wgpu { .. } => Domain::Wgpu,
+        }
+    }
+
+    pub fn system(&self) -> &[f32] {
+        match &self.data {
+            TensorData::System(values) => values,
+            #[cfg(feature = "wgpu")]
+            TensorData::Wgpu { .. } => {
+                panic!("expected a system tensor, negotiation guarantees the domain")
+            }
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn wgpu(&self) -> (&wgpu::Buffer, &Arc<GpuContext>) {
+        match &self.data {
+            TensorData::Wgpu { buffer, context } => (buffer, context),
+            TensorData::System(_) => {
+                panic!("expected a wgpu tensor, negotiation guarantees the domain")
+            }
+        }
     }
 
     /// the row-major plane of one channel
     pub fn channel(&self, c: usize) -> &[f32] {
         let plane = self.width() * self.height();
-        &self.data[c * plane..(c + 1) * plane]
+        &self.system()[c * plane..(c + 1) * plane]
     }
 
     /// crop to a bbox that must lie on this chunk's pixel grid
-    pub fn crop_to(&self, bbox: &Bbox) -> TensorChunk {
+    pub fn crop_to(&self, bbox: &Bbox) -> Result<TensorChunk> {
         let res = self.resolution;
         let (width, height) = (self.width(), self.height());
         let col0 = ((bbox.min_x - self.bbox.min_x) / res).round().max(0.0) as usize;
         let row0 = ((self.bbox.max_y - bbox.max_y) / res).round().max(0.0) as usize;
         let cols = ((bbox.width() / res).round() as usize).min(width.saturating_sub(col0));
         let rows = ((bbox.height() / res).round() as usize).min(height.saturating_sub(row0));
-        let mut data = Vec::with_capacity(self.channels as usize * cols * rows);
-        for c in 0..self.channels as usize {
-            let plane = c * width * height;
-            for r in 0..rows {
-                let src = plane + (row0 + r) * width + col0;
-                data.extend_from_slice(&self.data[src..src + cols]);
+        let channels = self.channels as usize;
+        let data = match &self.data {
+            TensorData::System(values) => {
+                let mut data = Vec::with_capacity(channels * cols * rows);
+                for c in 0..channels {
+                    let plane = c * width * height;
+                    for r in 0..rows {
+                        let src = plane + (row0 + r) * width + col0;
+                        data.extend_from_slice(&values[src..src + cols]);
+                    }
+                }
+                TensorData::System(data)
             }
-        }
-        TensorChunk {
+            #[cfg(feature = "wgpu")]
+            TensorData::Wgpu { buffer, context } => {
+                let cropped = context.nan_buffer(channels * cols * rows)?;
+                context.copy_window(&WindowCopy {
+                    source: buffer,
+                    source_cols: width,
+                    source_rows: height,
+                    destination: &cropped,
+                    destination_cols: cols,
+                    destination_rows: rows,
+                    channels,
+                    source_col0: col0,
+                    source_row0: row0,
+                    destination_col0: 0,
+                    destination_row0: 0,
+                    cols,
+                    rows,
+                })?;
+                TensorData::Wgpu {
+                    buffer: cropped,
+                    context: context.clone(),
+                }
+            }
+        };
+        Ok(TensorChunk {
             data,
             channels: self.channels,
             bbox: Bbox {
@@ -634,6 +709,6 @@ impl TensorChunk {
             },
             resolution: res,
             crs: self.crs,
-        }
+        })
     }
 }

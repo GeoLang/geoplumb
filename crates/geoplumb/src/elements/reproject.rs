@@ -40,7 +40,7 @@ impl Reproject {
                 passthrough: FieldMask::without_crs_resolution(),
                 output: CapsPattern::Raster(RasterPattern::default()),
             },
-            build: |target| {
+            build: Box::new(|target| {
                 let CapsPattern::Raster(target) = target else {
                     return None;
                 };
@@ -48,7 +48,7 @@ impl Reproject {
                     return None;
                 };
                 Some(Box::new(Reproject::new(crss[0])))
-            },
+            }),
         }
     }
 
@@ -265,7 +265,7 @@ impl VecReproject {
                 passthrough: FieldMask::without_crs_resolution(),
                 output: CapsPattern::Vector(VectorPattern::default()),
             },
-            build: |target| {
+            build: Box::new(|target| {
                 let CapsPattern::Vector(target) = target else {
                     return None;
                 };
@@ -273,7 +273,7 @@ impl VecReproject {
                     return None;
                 };
                 Some(Box::new(VecReproject::new(crss[0])))
-            },
+            }),
         }
     }
 

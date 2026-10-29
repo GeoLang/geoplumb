@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use tokio::sync::{broadcast, oneshot};
 
-use crate::caps::{Caps, TensorCaps};
+use crate::caps::{Caps, Domain, TensorCaps};
 use crate::chunk::{
-    Chunk, PointChunk, RasterChunk, TensorChunk, VectorChunk, VectorFeature, clip_geometry,
-    tile_contains,
+    Chunk, PointChunk, RasterChunk, TensorChunk, TensorData, VectorChunk, VectorFeature,
+    clip_geometry, tile_contains,
 };
 use crate::element::{Fanin, Source, Transform};
 use crate::error::{Error, Result};
@@ -62,6 +62,7 @@ enum Entry {
         /// a copy of this chunk sits in the spill store, so memory
         /// eviction demotes to `Spilled` instead of dropping
         spilled: bool,
+        domain: Domain,
     },
     /// on disk only, reloaded through the pending machinery on a hit
     Spilled {
@@ -78,6 +79,7 @@ struct CacheState {
     entries: HashMap<(usize, ChunkKey), Entry>,
     bytes: usize,
     disk_bytes: usize,
+    gpu_bytes: usize,
     tick: u64,
 }
 
@@ -92,6 +94,7 @@ pub struct Engine {
     cache: Mutex<CacheState>,
     events: broadcast::Sender<Invalidation>,
     budget_bytes: usize,
+    gpu_budget_bytes: Option<usize>,
     spill: Option<SpillState>,
 }
 
@@ -102,6 +105,10 @@ impl Engine {
     /// consumers in index order, so construction walks the topo order
     pub fn new(graph: Graph, budget_bytes: usize) -> Result<Engine> {
         let mut graph = graph;
+        #[cfg(feature = "wgpu")]
+        let gpu_budget_bytes = graph.gpu.as_ref().map(|context| context.budget_bytes());
+        #[cfg(not(feature = "wgpu"))]
+        let gpu_budget_bytes = None;
         let caps = solver::solve(&mut graph)?;
         let topo = graph.topo_order();
         let mut boxes: Vec<Option<Node>> = graph.nodes.into_iter().map(Some).collect();
@@ -167,6 +174,7 @@ impl Engine {
             cache: Mutex::new(CacheState::default()),
             events,
             budget_bytes,
+            gpu_budget_bytes,
             spill: None,
         })
     }
@@ -263,6 +271,18 @@ impl Engine {
         &self.nodes[node.0].grid
     }
 
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn system_bytes(&self) -> usize {
+        self.cache.lock().unwrap().bytes
+    }
+
+    pub fn gpu_bytes(&self) -> usize {
+        self.cache.lock().unwrap().gpu_bytes
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Invalidation> {
         self.events.subscribe()
     }
@@ -316,6 +336,7 @@ impl Engine {
             let mut state = self.cache.lock().unwrap();
             let mut freed = 0usize;
             let mut freed_disk = 0usize;
+            let mut freed_gpu = 0usize;
             let mut deletions = Vec::new();
             state.entries.retain(|(n_idx, key), entry| {
                 if *n_idx != j {
@@ -324,8 +345,16 @@ impl Engine {
                 let keep = !grid.chunk_bbox(*key).intersects(&d);
                 if !keep {
                     match entry {
-                        Entry::Ready { bytes, spilled, .. } => {
-                            freed += *bytes;
+                        Entry::Ready {
+                            bytes,
+                            spilled,
+                            domain,
+                            ..
+                        } => {
+                            match domain {
+                                Domain::System => freed += *bytes,
+                                Domain::Wgpu => freed_gpu += *bytes,
+                            }
                             if *spilled {
                                 deletions.push((*n_idx, *key));
                             }
@@ -341,6 +370,7 @@ impl Engine {
             });
             state_bytes_sub(&mut state.bytes, freed);
             state_bytes_sub(&mut state.disk_bytes, freed_disk);
+            state_bytes_sub(&mut state.gpu_bytes, freed_gpu);
             drop(state);
             self.delete_spill_files(&deletions);
             let _ = self.events.send(Invalidation {
@@ -377,7 +407,16 @@ impl Engine {
                 .collect();
             let chunks =
                 futures::future::try_join_all(keys.iter().map(|k| self.chunk(node, *k))).await?;
-            assemble(&grid, &keys, &chunks, &aligned, res, &self.nodes[node].caps)
+            let caps = &self.nodes[node].caps;
+            let on_gpu = chunks
+                .first()
+                .is_some_and(|c| memory_domain(c) == Domain::Wgpu);
+            if !on_gpu {
+                return assemble(&grid, &keys, &chunks, &aligned, res, caps);
+            }
+            // gpu assembly blocks on device calls, which must not sit on a tokio worker
+            let caps = caps.clone();
+            offload(move || assemble(&grid, &keys, &chunks, &aligned, res, &caps)).await
         })
     }
 
@@ -473,7 +512,9 @@ impl Engine {
         key: ChunkKey,
     ) -> Result<Arc<Chunk>> {
         let chunk = self.finish_chunk(guard, result, false)?;
-        if let Some(sp) = &self.spill {
+        if let Some(sp) = &self.spill
+            && memory_domain(&chunk) == Domain::System
+        {
             let path = sp.store.path(node, key);
             let c = chunk.clone();
             let written = path.clone();
@@ -504,6 +545,7 @@ impl Engine {
         let chunk = Arc::new(result?);
         guard.done = true;
         let bytes = chunk.byte_size();
+        let domain = memory_domain(&chunk);
         let mut state = self.cache.lock().unwrap();
         state.tick += 1;
         let tick = state.tick;
@@ -514,17 +556,22 @@ impl Engine {
                 bytes,
                 last_used: tick,
                 spilled,
+                domain,
             },
         ) {
             for w in waiters {
                 let _ = w.send(());
             }
         }
-        state.bytes += bytes;
+        match domain {
+            Domain::System => state.bytes += bytes,
+            Domain::Wgpu => state.gpu_bytes += bytes,
+        }
         let deletions = evict_over_budget(
             &mut state,
             self.budget_bytes,
             self.spill.as_ref().map(|s| s.budget_bytes),
+            self.gpu_budget_bytes,
         );
         drop(state);
         self.delete_spill_files(&deletions);
@@ -611,18 +658,13 @@ fn evict_over_budget(
     state: &mut CacheState,
     budget: usize,
     disk_budget: Option<usize>,
+    gpu_budget: Option<usize>,
 ) -> Vec<(usize, ChunkKey)> {
     let mut deletions = Vec::new();
     while state.bytes > budget {
-        let oldest = state
-            .entries
-            .iter()
-            .filter_map(|(k, e)| match e {
-                Entry::Ready { last_used, .. } => Some((*last_used, *k)),
-                Entry::Spilled { .. } | Entry::Pending { .. } => None,
-            })
-            .min();
-        let Some((_, key)) = oldest else { break };
+        let Some(key) = least_recently_used_ready(state, Domain::System) else {
+            break;
+        };
         let Some(Entry::Ready {
             bytes,
             last_used,
@@ -659,7 +701,38 @@ fn evict_over_budget(
             }
         }
     }
+    if let Some(gpu_budget) = gpu_budget {
+        while state.gpu_bytes > gpu_budget {
+            let Some(key) = least_recently_used_ready(state, Domain::Wgpu) else {
+                break;
+            };
+            if let Some(Entry::Ready { bytes, .. }) = state.entries.remove(&key) {
+                state_bytes_sub(&mut state.gpu_bytes, bytes);
+            }
+        }
+    }
     deletions
+}
+
+fn least_recently_used_ready(state: &CacheState, in_domain: Domain) -> Option<(usize, ChunkKey)> {
+    state
+        .entries
+        .iter()
+        .filter_map(|(k, e)| match e {
+            Entry::Ready {
+                last_used, domain, ..
+            } if *domain == in_domain => Some((*last_used, *k)),
+            Entry::Ready { .. } | Entry::Spilled { .. } | Entry::Pending { .. } => None,
+        })
+        .min()
+        .map(|(_, key)| key)
+}
+
+fn memory_domain(chunk: &Chunk) -> Domain {
+    match chunk {
+        Chunk::Tensor(t) => t.domain(),
+        Chunk::Raster(_) | Chunk::PointCloud(_) | Chunk::Vector(_) => Domain::System,
+    }
 }
 
 fn state_bytes_sub(total: &mut usize, bytes: usize) {
@@ -753,7 +826,7 @@ fn assemble(
                 chunks.iter().map(|c| c.tensor()).collect::<Result<_>>()?;
             Ok(Chunk::Tensor(assemble_tensor(
                 grid, keys, &tensors, window, res, t,
-            )))
+            )?))
         }
     }
 }
@@ -824,45 +897,116 @@ fn assemble_tensor(
     window: &Bbox,
     res: f64,
     caps: &TensorCaps,
-) -> TensorChunk {
+) -> Result<TensorChunk> {
     let cols = (window.width() / res).round() as usize;
     let rows = (window.height() / res).round() as usize;
     let channels = chunks.first().map_or(caps.channels, |c| c.channels) as usize;
-    let mut data = vec![f32::NAN; channels * cols * rows];
-    for (key, chunk) in keys.iter().zip(chunks) {
-        let cb = grid.chunk_bbox(*key);
-        let (w, h) = (chunk.width(), chunk.height());
-        for row in 0..h {
-            let y = cb.max_y - (row as f64 + 0.5) * res;
-            if y > window.max_y || y < window.min_y {
-                continue;
-            }
-            let out_row = ((window.max_y - y) / res).floor() as usize;
-            if out_row >= rows {
-                continue;
-            }
-            for col in 0..w {
-                let x = cb.min_x + (col as f64 + 0.5) * res;
-                if x < window.min_x || x > window.max_x {
-                    continue;
-                }
-                let out_col = ((x - window.min_x) / res).floor() as usize;
-                if out_col >= cols {
-                    continue;
-                }
-                for c in 0..channels {
-                    data[c * cols * rows + out_row * cols + out_col] =
-                        chunk.data[c * w * h + row * w + col];
-                }
-            }
-        }
-    }
-    TensorChunk {
+    let placements: Vec<Placement> = keys
+        .iter()
+        .zip(chunks)
+        .map(|(key, chunk)| Placement::new(&grid.chunk_bbox(*key), chunk, window, res))
+        .collect();
+    let data = mosaic(chunks, &placements, channels, cols, rows)?;
+    Ok(TensorChunk {
         data,
         channels: channels as u16,
         bbox: *window,
         resolution: res,
         crs: caps.crs,
+    })
+}
+
+fn mosaic(
+    chunks: &[&TensorChunk],
+    placements: &[Placement],
+    channels: usize,
+    cols: usize,
+    rows: usize,
+) -> Result<TensorData> {
+    #[cfg(feature = "wgpu")]
+    if let Some(TensorData::Wgpu { context, .. }) = chunks.first().map(|c| &c.data) {
+        let assembled = context.nan_buffer(channels * cols * rows)?;
+        for (placement, chunk) in placements.iter().zip(chunks) {
+            let (buffer, _) = chunk.wgpu();
+            context.copy_window(&crate::gpu::WindowCopy {
+                source: buffer,
+                source_cols: chunk.width(),
+                source_rows: chunk.height(),
+                destination: &assembled,
+                destination_cols: cols,
+                destination_rows: rows,
+                channels,
+                source_col0: placement.columns.source_start,
+                source_row0: placement.rows.source_start,
+                destination_col0: placement.columns.destination_start,
+                destination_row0: placement.rows.destination_start,
+                cols: placement.columns.length,
+                rows: placement.rows.length,
+            })?;
+        }
+        return Ok(TensorData::Wgpu {
+            buffer: assembled,
+            context: context.clone(),
+        });
+    }
+    let mut data = vec![f32::NAN; channels * cols * rows];
+    for (placement, chunk) in placements.iter().zip(chunks) {
+        let (w, h) = (chunk.width(), chunk.height());
+        let values = chunk.system();
+        let length = placement.columns.length;
+        if length == 0 {
+            continue;
+        }
+        for c in 0..channels {
+            for r in 0..placement.rows.length {
+                let from = c * w * h
+                    + (placement.rows.source_start + r) * w
+                    + placement.columns.source_start;
+                let to = c * cols * rows
+                    + (placement.rows.destination_start + r) * cols
+                    + placement.columns.destination_start;
+                data[to..to + length].copy_from_slice(&values[from..from + length]);
+            }
+        }
+    }
+    Ok(TensorData::System(data))
+}
+
+struct Placement {
+    columns: Span,
+    rows: Span,
+}
+
+struct Span {
+    source_start: usize,
+    destination_start: usize,
+    length: usize,
+}
+
+impl Placement {
+    fn new(chunk_bbox: &Bbox, chunk: &TensorChunk, window: &Bbox, res: f64) -> Placement {
+        let window_cols = (window.width() / res).round() as usize;
+        let window_rows = (window.height() / res).round() as usize;
+        let col_offset = ((chunk_bbox.min_x - window.min_x) / res).round() as isize;
+        let row_offset = ((window.max_y - chunk_bbox.max_y) / res).round() as isize;
+        Placement {
+            columns: Span::new(col_offset, chunk.width(), window_cols),
+            rows: Span::new(row_offset, chunk.height(), window_rows),
+        }
+    }
+}
+
+impl Span {
+    fn new(chunk_start_in_window: isize, chunk_length: usize, window_length: usize) -> Span {
+        let source_start = (-chunk_start_in_window).max(0);
+        let source_end = (chunk_length as isize)
+            .min(window_length as isize - chunk_start_in_window)
+            .max(source_start);
+        Span {
+            source_start: source_start as usize,
+            destination_start: (source_start + chunk_start_in_window) as usize,
+            length: (source_end - source_start) as usize,
+        }
     }
 }
 

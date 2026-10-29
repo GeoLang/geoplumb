@@ -32,6 +32,13 @@ pub enum TensorDtype {
     F32,
 }
 
+// PartialOrd only because SetField needs it, the order means nothing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
+pub enum Domain {
+    System,
+    Wgpu,
+}
+
 /// preference-ordered set pattern for one caps field. `AtLeast` is an open
 /// lower bound, for demands like "at least n bands" that have no ceiling to
 /// enumerate. construct it only where the order means something
@@ -232,6 +239,7 @@ pub struct TensorPattern {
     pub crs: SetField<Crs>,
     pub resolution: ResRange,
     pub chunk_px: SetField<u32>,
+    pub domain: SetField<Domain>,
 }
 
 impl Default for TensorPattern {
@@ -242,6 +250,7 @@ impl Default for TensorPattern {
             crs: SetField::Any,
             resolution: ResRange::ANY,
             chunk_px: SetField::Any,
+            domain: SetField::one(Domain::System),
         }
     }
 }
@@ -254,6 +263,7 @@ impl TensorPattern {
             crs: self.crs.intersect(&other.crs),
             resolution: self.resolution.intersect(&other.resolution),
             chunk_px: self.chunk_px.intersect(&other.chunk_px),
+            domain: self.domain.intersect(&other.domain),
         }
     }
 
@@ -263,6 +273,7 @@ impl TensorPattern {
             || self.crs.is_empty()
             || self.resolution.is_empty()
             || self.chunk_px.is_empty()
+            || self.domain.is_empty()
     }
 }
 
@@ -437,7 +448,10 @@ impl CapsSet {
                 CapsPattern::Raster(RasterPattern::default()),
                 CapsPattern::PointCloud(PointPattern::default()),
                 CapsPattern::Vector(VectorPattern::default()),
-                CapsPattern::Tensor(TensorPattern::default()),
+                CapsPattern::Tensor(TensorPattern {
+                    domain: SetField::Any,
+                    ..TensorPattern::default()
+                }),
             ],
         }
     }
@@ -489,6 +503,7 @@ impl CapsSet {
                 crs: first.crs.fixate()?,
                 resolution: first.resolution,
                 chunk_px: first.chunk_px.fixate().unwrap_or(256),
+                domain: first.domain.fixate().unwrap_or(Domain::System),
             })),
         }
     }
@@ -533,6 +548,7 @@ pub struct TensorCaps {
     pub crs: Crs,
     pub resolution: ResRange,
     pub chunk_px: u32,
+    pub domain: Domain,
 }
 
 impl Caps {
@@ -612,6 +628,7 @@ impl Caps {
                 crs: SetField::one(t.crs),
                 resolution: t.resolution,
                 chunk_px: SetField::one(t.chunk_px),
+                domain: SetField::one(t.domain),
             }),
         }
     }
@@ -652,6 +669,7 @@ impl Caps {
                 t.chunk_px.hash(&mut h);
                 t.resolution.min.to_bits().hash(&mut h);
                 t.resolution.max.to_bits().hash(&mut h);
+                t.domain.hash(&mut h);
             }
         }
         h.finish()

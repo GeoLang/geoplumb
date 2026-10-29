@@ -3,7 +3,12 @@
 //! auto-plugged reprojects are appended after their consumers, so walk in
 //! `topo_order`, not index order
 
+#[cfg(feature = "wgpu")]
+use std::sync::Arc;
+
 use crate::element::{Adapter, Fanin, Source, Transform};
+#[cfg(feature = "wgpu")]
+use crate::gpu::GpuContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) usize);
@@ -23,6 +28,8 @@ pub(crate) enum Node {
 pub struct Graph {
     pub(crate) nodes: Vec<Node>,
     pub(crate) adapters: Vec<Adapter>,
+    #[cfg(feature = "wgpu")]
+    pub(crate) gpu: Option<Arc<GpuContext>>,
 }
 
 impl Default for Graph {
@@ -37,7 +44,18 @@ impl Graph {
         Graph {
             nodes: Vec::new(),
             adapters: crate::elements::default_adapters(),
+            #[cfg(feature = "wgpu")]
+            gpu: None,
         }
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn with_gpu(context: Arc<GpuContext>) -> Graph {
+        let mut graph = Graph::new();
+        graph.register_adapter(crate::elements::Upload::adapter(context.clone()));
+        graph.register_adapter(crate::elements::Download::adapter());
+        graph.gpu = Some(context);
+        graph
     }
 
     /// offer another transform to the solver for auto-plugging

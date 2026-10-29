@@ -217,7 +217,7 @@ impl Transform for SmallTensorChunks {
     }
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> geoplumb::Result<Chunk> {
-        Ok(Chunk::Tensor(input.tensor()?.crop_to(&out.bbox)))
+        Ok(Chunk::Tensor(input.tensor()?.crop_to(&out.bbox)?))
     }
 }
 
@@ -366,7 +366,8 @@ async fn tensor_chunks_spill_to_disk_and_reload() {
     drop(engine);
     let _ = std::fs::remove_dir_all(&spill_base);
 
-    let bits = |t: &geoplumb::TensorChunk| t.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let bits =
+        |t: &geoplumb::TensorChunk| t.system().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
     assert_eq!(
         bits(&first),
         bits(&again),

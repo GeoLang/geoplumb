@@ -14,9 +14,13 @@ pub mod tensor;
 pub mod terrain;
 pub mod vec_ops;
 pub mod vector;
+#[cfg(feature = "wgpu")]
+pub mod wgpu;
 
 #[cfg(feature = "gdal")]
 pub use self::gdal::GdalSrc;
+#[cfg(feature = "wgpu")]
+pub use self::wgpu::{Download, Upload, WgpuConvolve};
 pub use algebra::{Combine, MapAlgebra};
 pub use band_math::BandMath;
 pub use cog::{CogSrc, HttpRange};

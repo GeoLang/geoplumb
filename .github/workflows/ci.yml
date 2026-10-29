@@ -15,9 +15,10 @@ jobs:
     strategy:
       matrix:
         include:
-          # only the ubuntu leg installs libgdal, so only it builds the gdal feature
+          # only the ubuntu leg installs libgdal and lavapipe, so only it builds the gdal and wgpu features
           - os: ubuntu-latest
             features: --all-features
+            require_gpu: "1"
           - os: windows-latest
             features: ""
           - os: macos-latest
@@ -29,14 +30,16 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Install GDAL
+      - name: Install GDAL and lavapipe
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libgdal-dev
+        run: sudo apt-get update && sudo apt-get install -y libgdal-dev mesa-vulkan-drivers
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
       - name: Test
+        env:
+          GEOPLUMB_REQUIRE_GPU: ${{ matrix.require_gpu }}
         run: cargo test --all ${{ matrix.features }}
 
   deny:
@@ -60,8 +63,8 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
-      - name: Install GDAL
-        run: sudo apt-get update && sudo apt-get install -y libgdal-dev
+      - name: Install GDAL and lavapipe
+        run: sudo apt-get update && sudo apt-get install -y libgdal-dev mesa-vulkan-drivers
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage

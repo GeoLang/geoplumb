@@ -8,7 +8,7 @@ use crate::caps::{
     Caps, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField, TensorDtype,
     TensorPattern,
 };
-use crate::chunk::{Chunk, RasterChunk, TensorChunk};
+use crate::chunk::{Chunk, RasterChunk, TensorChunk, TensorData};
 use crate::element::Transform;
 use crate::error::{Error, Result};
 use crate::window::{Bbox, WindowReq};
@@ -88,7 +88,7 @@ impl Transform for ToTensor {
             }
         }
         Ok(Chunk::Tensor(TensorChunk {
-            data,
+            data: TensorData::System(data),
             channels: channels as u16,
             bbox: input.bbox,
             resolution: input.resolution,
@@ -123,13 +123,16 @@ impl Transform for TensorConv {
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let input = input.tensor()?;
-        let res = out.resolution;
-        let cols = (out.bbox.width() / res).round() as usize;
-        let rows = (out.bbox.height() / res).round() as usize;
-        let (in_cols, in_rows) = (input.width(), input.height());
-        let col0 = ((out.bbox.min_x - input.bbox.min_x) / res).round() as isize;
-        let row0 = ((input.bbox.max_y - out.bbox.max_y) / res).round() as isize;
+        let ConvolutionWindow {
+            input_cols: in_cols,
+            input_rows: in_rows,
+            col0,
+            row0,
+            output_cols: cols,
+            output_rows: rows,
+        } = ConvolutionWindow::new(out, input);
         let channels = input.channels as usize;
+        let values = input.system();
         let mut data = vec![f32::NAN; channels * cols * rows];
         for c in 0..channels {
             let plane = c * in_cols * in_rows;
@@ -137,7 +140,7 @@ impl Transform for TensorConv {
                 if r < 0 || col < 0 || r >= in_rows as isize || col >= in_cols as isize {
                     return f32::NAN;
                 }
-                input.data[plane + r as usize * in_cols + col as usize]
+                values[plane + r as usize * in_cols + col as usize]
             };
             for row in 0..rows {
                 for col in 0..cols {
@@ -159,12 +162,35 @@ impl Transform for TensorConv {
             }
         }
         Ok(Chunk::Tensor(TensorChunk {
-            data,
+            data: TensorData::System(data),
             channels: input.channels,
             bbox: out.bbox,
-            resolution: res,
+            resolution: out.resolution,
             crs: input.crs,
         }))
+    }
+}
+
+pub(crate) struct ConvolutionWindow {
+    pub input_cols: usize,
+    pub input_rows: usize,
+    pub col0: isize,
+    pub row0: isize,
+    pub output_cols: usize,
+    pub output_rows: usize,
+}
+
+impl ConvolutionWindow {
+    pub(crate) fn new(out: &WindowReq, input: &TensorChunk) -> ConvolutionWindow {
+        let res = out.resolution;
+        ConvolutionWindow {
+            input_cols: input.width(),
+            input_rows: input.height(),
+            col0: ((out.bbox.min_x - input.bbox.min_x) / res).round() as isize,
+            row0: ((input.bbox.max_y - out.bbox.max_y) / res).round() as isize,
+            output_cols: (out.bbox.width() / res).round() as usize,
+            output_rows: (out.bbox.height() / res).round() as usize,
+        }
     }
 }
 
@@ -192,7 +218,7 @@ impl Transform for ToRaster {
     }
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
-        let input = input.tensor()?.crop_to(&out.bbox);
+        let input = input.tensor()?.crop_to(&out.bbox)?;
         let (cols, rows) = (input.width(), input.height());
         let bands: Vec<Raster> = (0..input.channels as usize)
             .map(|c| {

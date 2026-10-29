@@ -23,9 +23,11 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 gdal = { version = "0.19", optional = true }
 copc-reader = "0.9"
 copc-core = "0.9"
+wgpu = { version = "30", optional = true, default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
 
 [features]
 gdal = ["dep:gdal"]
+wgpu = ["dep:wgpu"]
 
 [dev-dependencies]
 projicio-core.workspace = true

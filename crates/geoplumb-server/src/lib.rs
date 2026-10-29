@@ -7,6 +7,9 @@
 //! the endpoints are public by decision: these are tiles rendered from
 //! public collections, the same policy tiletopia's public tiles follow
 
+// proving Send for geoplumb's wgpu chunks exceeds the default limit
+#![recursion_limit = "256"]
+
 pub mod config;
 mod zonal;
 

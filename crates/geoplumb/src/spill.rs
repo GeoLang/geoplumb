@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::caps::Crs;
-use crate::chunk::{Chunk, PointChunk, RasterChunk, TensorChunk, VectorChunk, VectorFeature};
+use crate::chunk::{
+    Chunk, PointChunk, RasterChunk, TensorChunk, TensorData, VectorChunk, VectorFeature,
+};
 use crate::error::{Error, Result};
 use crate::window::{Bbox, ChunkKey, TimeInterval};
 use nubis_core::{Classification, Point3, PointCloud};
@@ -224,7 +226,7 @@ fn write_chunk_file(path: &Path, chunk: &Chunk) -> Result<()> {
             f.write_all(&(chunk.height() as u32).to_le_bytes())
                 .map_err(io)?;
             write_geo(&mut f, chunk.resolution, &chunk.bbox, chunk.crs).map_err(io)?;
-            for v in &chunk.data {
+            for v in chunk.system() {
                 f.write_all(&v.to_le_bytes()).map_err(io)?;
             }
         }
@@ -457,7 +459,7 @@ pub(crate) fn read_chunk(path: &Path) -> Result<Chunk> {
                 .map(|c| f32::from_le_bytes(*c))
                 .collect();
             Ok(Chunk::Tensor(TensorChunk {
-                data,
+                data: TensorData::System(data),
                 channels,
                 bbox,
                 resolution,

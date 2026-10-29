@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-29
+
+- tensors negotiate a memory domain, `System` or `Wgpu`, and every existing tensor element stays `System`. A new `wgpu` feature on `geoplumb`, which the server does not enable, adds `GpuContext`, `Graph::with_gpu` and three elements: the solve splices `Upload` and `Download` wherever a tensor link crosses domains, and `WgpuConvolve` runs the 3x3 tensor convolve as a compute shader that matches `TensorConv` to 1e-5, NaN rule included. Wgpu chunks count against the context's own byte budget, never spill and are dropped on eviction, and a wgpu node's chunks assemble on the device
+- `TensorChunk::data` is a `TensorData` enum, read on the host through `system()`, `TensorChunk::crop_to` returns a `Result` since a device copy can fail, and `Adapter::build` is a boxed closure so an adapter can hold a context
+- the ubuntu CI leg installs mesa's lavapipe and sets `GEOPLUMB_REQUIRE_GPU=1`, so the gpu tests run on a software Vulkan device there instead of skipping
+
 ## 2026-10-28
 
 - the disk cache survives restarts: every element names what it computes through a required `identity()` method, the engine hashes those with the fixated caps into the store directory name, a reopened directory serves its files for time-invariant nodes and drops time-keyed ones, an edited graph gets a new directory, and chunk files are written under a temporary name and renamed into place

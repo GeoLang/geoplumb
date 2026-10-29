@@ -155,32 +155,45 @@ rtree over envelopes. A GeoPackage carries its own rtree in SQLite.
 
 ## 6. Memory domains and the GPU tensor path
 
-Two to three weeks before any inference. The solver is kind-blind, so the
-caps change is small. The cost is in the chunk type, the cache and the
-runtime.
+The solver is kind-blind, so the caps change is small. The cost is in the
+chunk type, the cache and the runtime. A 3x3 convolve alone does not pay
+for the upload and download around it, the path pays when a tensor stays
+on the device for something heavier, so the convolve here is the proof
+that the solver splices uploads correctly, not a speedup. Decisions:
+inference stays a separate decision (DESIGN.md puts it outside this repo,
+panoptes holds the ONNX code); one `wgpu` device per graph, handed in by
+the driver through `Graph::with_gpu`, never a process-wide device; the
+ubuntu CI leg installs lavapipe so the shader path runs on every push;
+two slices, batching alone in the second because it needs the engine to
+group a pull's chunks by node, which it does not do today.
 
-- [ ] `TensorPattern` gains a `domain: SetField<Domain>` with `System` and
+Slice 1, the domain:
+
+- [x] `TensorPattern` gains a `domain: SetField<Domain>` with `System` and
       `Wgpu`, defaulting to `OneOf([System])`. Raster, point and vector
       patterns stay system-only. This is glass2glass's memory-domain idea,
       narrowed to the one kind that has a GPU consumer.
-- [ ] `TensorChunk::data` becomes an enum: `System(Vec<f32>)` or
-      `Wgpu(wgpu::Buffer)` with its device. `Chunk` stays an enum over kinds.
-- [ ] Two auto-plugged adapters, `Upload` and `Download`, registered through
-      `Graph::register_adapter` the way the reproject adapter is, so a
-      `System` producer wired into a `Wgpu` consumer gets an upload inserted
-      by the solver and a mismatch never reaches `compute`.
-- [ ] A `WgpuConvolve` transform: the 3x3 kernel as a compute shader over
-      the chunk, halo handled by `plan` as today. `Convolve` on the CPU stays
-      as the `System` variant of the same element.
-- [ ] Cache rules: a `Wgpu` chunk counts against a separate GPU byte budget,
-      never spills (the disk tier downloads and spills the system copy, or
-      drops it), and eviction frees the buffer. `Entry::Ready` carries which
-      budget it is in.
-- [ ] Batching: a pull's chunks at one node are submitted as one command
-      encoder when they share a device, which is where the GPU wins over
-      per-chunk dispatch.
-- [ ] `geoplumb` gains a `wgpu` feature. The server builds without it by
-      default. A GPU test skips without an adapter, as glass2glass's do.
+- [x] `TensorChunk::data` becomes an enum: `System(Vec<f32>)` or
+      `Wgpu(wgpu::Buffer)` with its context. `Chunk` stays an enum over kinds.
+- [x] Two adapters, `Upload` and `Download`, registered by
+      `Graph::with_gpu` the way the reproject adapter is, so a `System`
+      producer wired into a `Wgpu` consumer gets an upload inserted by the
+      solver and a mismatch never reaches `compute`.
+- [x] A `WgpuConvolve` transform: the 3x3 kernel as a compute shader over
+      the chunk, halo handled by `plan` as today. `TensorConv` on the CPU
+      stays as the `System` element.
+- [x] Cache rules: a `Wgpu` chunk counts against the context's own GPU byte
+      budget, never spills, and is dropped on eviction. `Entry::Ready`
+      carries which budget it is in.
+- [x] `geoplumb` gains a `wgpu` feature. The server builds without it. The
+      gpu tests skip without an adapter unless `GEOPLUMB_REQUIRE_GPU` is
+      set, which the ubuntu CI leg sets after installing lavapipe.
+
+Slice 2, batching:
+
+- [ ] A pull's chunks at one node are submitted as one command encoder when
+      they share a device, which is where the GPU wins over per-chunk
+      dispatch.
 
 An inference element (ONNX through `ort`, following g2g-ml's element) is
 another one to two weeks on top. `DESIGN.md` currently puts inference

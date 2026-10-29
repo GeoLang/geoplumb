@@ -13,6 +13,8 @@ pub mod elements;
 pub mod encode;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "wgpu")]
+pub mod gpu;
 pub mod graph;
 pub mod resample;
 pub mod solver;

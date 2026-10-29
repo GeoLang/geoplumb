@@ -231,7 +231,7 @@ fn band_pick_adapter() -> Adapter {
             },
             output: CapsPattern::Raster(RasterPattern::default()),
         },
-        build: |target| {
+        build: Box::new(|target| {
             let CapsPattern::Raster(target) = target else {
                 return None;
             };
@@ -239,7 +239,7 @@ fn band_pick_adapter() -> Adapter {
                 SetField::OneOf(v) if v.contains(&1) => Some(Box::new(BandPick)),
                 _ => None,
             }
-        },
+        }),
     }
 }
 

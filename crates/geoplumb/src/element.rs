@@ -18,8 +18,10 @@ use futures::future::BoxFuture;
 /// wrong kind
 pub struct Adapter {
     pub template: Constraint,
-    pub build: fn(&CapsPattern) -> Option<Box<dyn Transform>>,
+    pub build: Box<AdapterBuilder>,
 }
+
+pub type AdapterBuilder = dyn Fn(&CapsPattern) -> Option<Box<dyn Transform>> + Send + Sync;
 
 pub trait Source: Send + Sync {
     /// must be `Constraint::Produces`
