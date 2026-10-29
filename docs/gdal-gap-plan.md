@@ -141,9 +141,8 @@ rtree over envelopes. A GeoPackage carries its own rtree in SQLite.
 
 ## 5. Small items
 
-- [ ] STAC assets within an item read in parallel, one day. The per-asset
-      loop in `StacSrc` reads sequentially. Join the asset futures the same
-      way item reads already fan out, under the same 64-in-flight cap.
+- [x] STAC assets within an item read in parallel, each asset read under
+      the same 64-in-flight cap item reads used, bands joined in asset order.
 - [ ] Disk cache across processes, one to two days. The spill store is a
       fresh directory per engine because nothing identifies the graph. Add
       an element identity hash: each element contributes a stable
