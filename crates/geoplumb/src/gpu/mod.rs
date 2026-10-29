@@ -28,6 +28,19 @@ pub struct GpuContext {
 struct Pending {
     encoder: Option<wgpu::CommandEncoder>,
     dispatches: usize,
+    failed_submission: Option<String>,
+}
+
+impl Pending {
+    // the engine has cached chunks whose dispatches the failed batch dropped
+    fn usable(&self) -> Result<()> {
+        match &self.failed_submission {
+            Some(failure) => Err(Error::Gpu(format!(
+                "context unusable after a failed submission: {failure}"
+            ))),
+            None => Ok(()),
+        }
+    }
 }
 
 impl fmt::Debug for GpuContext {
@@ -101,21 +114,23 @@ impl GpuContext {
     }
 
     pub(crate) fn upload(&self, data: &[f32]) -> Result<wgpu::Buffer> {
+        self.pending.lock().unwrap().usable()?;
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.scoped(|| self.initialized_buffer(&bytes, TENSOR_USAGE))
     }
 
     pub(crate) fn nan_buffer(&self, len: usize) -> Result<wgpu::Buffer> {
+        self.pending.lock().unwrap().usable()?;
         let bytes = f32::NAN.to_le_bytes().repeat(len);
         self.scoped(|| self.initialized_buffer(&bytes, TENSOR_USAGE))
     }
 
     pub(crate) fn download(&self, buffer: &wgpu::Buffer) -> Result<Vec<f32>> {
+        self.flush()?;
         let size = buffer.size();
         if size == 0 {
             return Ok(Vec::new());
         }
-        self.flush()?;
         self.scoped(|| {
             let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("download"),
@@ -234,6 +249,18 @@ impl GpuContext {
         let workgroups_x = shader_word(invocations[0].div_ceil(WORKGROUP_SIDE))?;
         let workgroups_y = shader_word(invocations[1].div_ceil(WORKGROUP_SIDE))?;
         let workgroups_z = shader_word(invocations[2])?;
+        let limit = self.device.limits().max_compute_workgroups_per_dimension;
+        for (dimension, count) in
+            ["x", "y", "z"]
+                .into_iter()
+                .zip([workgroups_x, workgroups_y, workgroups_z])
+        {
+            if count > limit {
+                return Err(Error::Gpu(format!(
+                    "{count} workgroups along {dimension} exceed the device limit of {limit}"
+                )));
+            }
+        }
         // an invalid bind group recorded into the shared encoder fails the whole batch
         let bind_group = self.scoped(|| {
             let uniform = self.initialized_buffer(params, wgpu::BufferUsages::UNIFORM)?;
@@ -257,6 +284,7 @@ impl GpuContext {
             }))
         })?;
         let mut pending = self.pending.lock().unwrap();
+        pending.usable()?;
         {
             let encoder = pending.encoder.get_or_insert_with(|| {
                 self.device
@@ -285,6 +313,7 @@ impl GpuContext {
 
     // runs under the pending lock so batches reach the queue in recording order
     fn submit_pending(&self, pending: &mut Pending) -> Result<()> {
+        pending.usable()?;
         let Some(encoder) = pending.encoder.take() else {
             return Ok(());
         };
@@ -294,6 +323,7 @@ impl GpuContext {
             self.submissions.fetch_add(1, Ordering::Relaxed);
             Ok(())
         })
+        .inspect_err(|error| pending.failed_submission = Some(error.to_string()))
     }
 
     fn initialized_buffer(&self, bytes: &[u8], usage: wgpu::BufferUsages) -> Result<wgpu::Buffer> {
@@ -369,4 +399,66 @@ fn shader_word(value: usize) -> Result<u32> {
 
 fn signed_shader_word(value: isize) -> Result<i32> {
     i32::try_from(value).map_err(|_| Error::Gpu(format!("{value} does not fit a shader i32")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_submission_makes_the_context_unusable() {
+        let context = match GpuContext::request(64 << 20) {
+            Ok(context) => context,
+            Err(e) if std::env::var("GEOPLUMB_REQUIRE_GPU").is_ok_and(|value| value == "1") => {
+                panic!("GEOPLUMB_REQUIRE_GPU is set: {e}")
+            }
+            Err(_) => return,
+        };
+        let buffer = context.nan_buffer(64).unwrap();
+        {
+            let mut pending = context.pending.lock().unwrap();
+            let encoder = pending.encoder.insert(
+                context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
+            );
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&context.copy_window_pipeline);
+            // no bind group is set, which wgpu rejects only when the encoder is finished
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        let first = context.flush().unwrap_err().to_string();
+        let later = [
+            context.flush().map(|_| ()),
+            context.upload(&[1.0]).map(|_| ()),
+            context.nan_buffer(1).map(|_| ()),
+            context.download(&buffer).map(|_| ()),
+            context.copy_window(&WindowCopy {
+                source: &buffer,
+                source_cols: 8,
+                source_rows: 8,
+                destination: &buffer,
+                destination_cols: 8,
+                destination_rows: 8,
+                channels: 1,
+                source_col0: 0,
+                source_row0: 0,
+                destination_col0: 0,
+                destination_row0: 0,
+                cols: 1,
+                rows: 1,
+            }),
+        ];
+        for result in later {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("context unusable") && error.contains(&first),
+                "{error} does not name the failed submission {first}"
+            );
+        }
+    }
 }

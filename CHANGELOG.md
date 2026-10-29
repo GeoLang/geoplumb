@@ -6,6 +6,7 @@
 - `TensorChunk::data` is a `TensorData` enum, read on the host through `system()`, `TensorChunk::crop_to` returns a `Result` since a device copy can fail, and `Adapter::build` is a boxed closure so an adapter can hold a context
 - the ubuntu CI leg installs mesa's lavapipe and sets `GEOPLUMB_REQUIRE_GPU=1`, so the gpu tests run on a software Vulkan device there instead of skipping
 - gpu window copies and convolves are recorded into one pending command encoder per `GpuContext` and submitted when sixty-four are pending or a download needs the results, instead of one submission each. An 80 by 64 pixel pull over twenty 16 px tiles went from 260 submissions to 42 for its 240 dispatches. `GpuContext::submissions()` and `dispatches()` count both
+- a gpu dispatch over the device's workgroup limit fails in its own compute instead of failing the batch it shares, and a batch submission that fails makes its `GpuContext` return an error naming that failure from every later call, since the engine has cached chunks whose buffers that batch never wrote
 
 ## 2026-10-28
 

@@ -266,62 +266,82 @@ async fn a_pull_submits_once_per_batch() {
     );
 }
 
+// crops a chunk claiming one more workgroup along x than wgpu allows per dimension
+struct OversizedCrop;
+
+impl Transform for OversizedCrop {
+    fn identity(&self) -> String {
+        "OversizedCrop".into()
+    }
+
+    fn constraint(&self) -> Constraint {
+        Constraint::Identity(CapsSet::one(CapsPattern::Tensor(TensorPattern {
+            domain: SetField::one(Domain::Wgpu),
+            ..TensorPattern::default()
+        })))
+    }
+
+    fn plan(&self, out: &WindowReq) -> WindowReq {
+        *out
+    }
+
+    fn compute(&self, _out: &WindowReq, input: &Chunk) -> geoplumb::Result<Chunk> {
+        let too_wide = TensorChunk {
+            channels: 1,
+            bbox: Bbox {
+                min_x: ORIGIN_X,
+                max_x: ORIGIN_X + (8 * 65_536) as f64 * CELL,
+                max_y: ORIGIN_Y,
+                min_y: ORIGIN_Y - CELL,
+            },
+            ..input.tensor()?.clone()
+        };
+        Ok(Chunk::Tensor(too_wide.crop_to(&too_wide.bbox)?))
+    }
+}
+
 #[tokio::test]
-async fn a_flush_error_does_not_poison_the_next_batch() {
+async fn an_oversized_dispatch_fails_its_own_pull() {
     let Some(context) = context(64 << 20) else {
         return;
     };
-    let build = || {
-        let mut g = Graph::with_gpu(context.clone());
-        let nodes = small_tile_chain(&mut g, src(), Box::new(WgpuConvolve { kernel: KERNEL }));
-        (Engine::new(g, 64 << 20).unwrap(), nodes)
-    };
-    let (engine, nodes) = build();
-    let want = engine
-        .pull(nodes.raster, seam_window_request())
+    let mut g = Graph::new();
+    let cpu_nodes = small_tile_chain(&mut g, src(), Box::new(TensorConv { kernel: KERNEL }));
+    let cpu = Engine::new(g, 64 << 20).unwrap();
+    let mut g = Graph::with_gpu(context);
+    let gpu_nodes = small_tile_chain(&mut g, src(), Box::new(WgpuConvolve { kernel: KERNEL }));
+    let oversized = g.add_transform(gpu_nodes.convolve, Box::new(OversizedCrop));
+    let gpu = Engine::new(g, 64 << 20).unwrap();
+
+    match gpu.pull(oversized, seam_window_request()).await {
+        Err(Error::Gpu(message)) => assert!(
+            message.contains("exceed the device limit"),
+            "the gpu error does not name the limit: {message}"
+        ),
+        Err(other) => panic!("expected a gpu error from the oversized dispatch, got {other:?}"),
+        Ok(_) => panic!("a dispatch over the workgroup limit was recorded"),
+    }
+
+    let want = cpu
+        .pull(cpu_nodes.raster, seam_window_request())
         .await
         .unwrap()
         .into_raster()
         .unwrap();
-    let on_device = engine
-        .pull(nodes.convolve, seam_window_request())
-        .await
-        .unwrap()
-        .into_tensor()
-        .unwrap();
-
-    // one more workgroup than wgpu allows per dimension, rejected only when the batch is finished
-    let too_wide = TensorChunk {
-        channels: 1,
-        bbox: Bbox {
-            min_x: ORIGIN_X,
-            max_x: ORIGIN_X + (8 * 65_536) as f64 * CELL,
-            max_y: ORIGIN_Y,
-            min_y: ORIGIN_Y - CELL,
-        },
-        ..on_device
-    };
-    too_wide.crop_to(&too_wide.bbox).unwrap();
-    let (engine, nodes) = build();
-    match engine.pull(nodes.raster, seam_window_request()).await {
-        Err(Error::Gpu(_)) => {}
-        Err(other) => panic!("expected a gpu error from the poisoned batch, got {other:?}"),
-        Ok(_) => panic!("the batch holding the invalid dispatch was submitted cleanly"),
-    }
-
-    let (engine, nodes) = build();
-    let got = engine
-        .pull(nodes.raster, seam_window_request())
+    let got = gpu
+        .pull(gpu_nodes.raster, seam_window_request())
         .await
         .unwrap()
         .into_raster()
         .unwrap();
     for c in 0..CHANNELS {
-        assert_eq!(
-            got.bands.band(c).unwrap().data(),
-            want.bands.band(c).unwrap().data(),
-            "channel {c} differs after the failed batch"
-        );
+        let (a, b) = (got.bands.band(c).unwrap(), want.bands.band(c).unwrap());
+        for (i, (x, y)) in a.data().iter().zip(b.data()).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-5,
+                "channel {c} cell {i}: wgpu {x} vs cpu {y}"
+            );
+        }
     }
 }
 
