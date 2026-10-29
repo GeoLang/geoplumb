@@ -139,6 +139,13 @@ pub enum SourceConfig {
         /// not carry in a form the reader trusts
         crs: u32,
     },
+    // a cloud-optimized point cloud read node by node, from a local `path` or
+    // a `url` that answers range requests. like `las` the chain needs an `idw`
+    Copc {
+        path: Option<PathBuf>,
+        url: Option<String>,
+        crs: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -384,6 +391,9 @@ impl Config {
     }
 }
 
+pub(crate) const COPC_NEEDS_ONE_LOCATION: &str =
+    "the copc source names exactly one of path and url";
+
 pub(crate) const GDAL_NOT_BUILT: &str =
     "the gdal source needs a server built with the gdal feature, this one was built without it";
 
@@ -414,6 +424,14 @@ fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
         }
         SourceConfig::Las { .. } if !ops.iter().any(|op| matches!(op, OpConfig::Idw { .. })) => {
             return Err("the las source has no idw op, so the chain hands \
+                        points to a png encoder that wants pixels"
+                .into());
+        }
+        SourceConfig::Copc { path, url, .. } if path.is_some() == url.is_some() => {
+            return Err(COPC_NEEDS_ONE_LOCATION.into());
+        }
+        SourceConfig::Copc { .. } if !ops.iter().any(|op| matches!(op, OpConfig::Idw { .. })) => {
+            return Err("the copc source has no idw op, so the chain hands \
                         points to a png encoder that wants pixels"
                 .into());
         }
@@ -577,7 +595,8 @@ impl SourceConfig {
             | SourceConfig::Gdal { .. }
             | SourceConfig::Geojson { .. }
             | SourceConfig::Gpkg { .. }
-            | SourceConfig::Las { .. } => None,
+            | SourceConfig::Las { .. }
+            | SourceConfig::Copc { .. } => None,
             SourceConfig::Stac {
                 api,
                 collection,

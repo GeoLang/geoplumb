@@ -38,4 +38,6 @@ tokio = { version = "1", features = ["test-util"] }
 png = "0.17"
 rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
+copc-writer = "0.9"
+copc-core = "0.9"
 tower = { version = "0.5", features = ["util"] }

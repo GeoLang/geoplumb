@@ -222,3 +222,15 @@ kind = "idw"
 power = 2.0
 radius_px = 8.0
 min_points = 3
+
+# a cloud-optimized point cloud over http. a tile fetches only the octree
+# nodes it touches, down to the level its zoom needs, so the file is never
+# read whole. `path` in place of `url` reads a local file instead.
+[[layer]]
+name = "lidar-remote"
+source = { kind = "copc", url = "https://example.com/ground.copc.laz", crs = 26910 }
+gray = { min = 0.0, max = 500.0 }
+
+[[layer.op]]
+kind = "idw"
+radius_px = 8.0
