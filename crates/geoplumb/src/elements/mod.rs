@@ -3,6 +3,7 @@ pub mod band_math;
 pub mod cog;
 #[cfg(feature = "gdal")]
 pub mod gdal;
+pub mod gpkg;
 pub mod mosaic;
 pub mod points;
 pub mod reproject;
@@ -18,6 +19,7 @@ pub use self::gdal::GdalSrc;
 pub use algebra::{Combine, MapAlgebra};
 pub use band_math::BandMath;
 pub use cog::{CogSrc, HttpRange};
+pub use gpkg::GpkgSrc;
 pub use mosaic::Mosaic;
 pub use points::{IdwGrid, LasSrc};
 pub use reproject::{Reproject, VecReproject};
