@@ -649,6 +649,34 @@ fn las_layer_file(dir: &Path) -> String {
     LAS.replace("LAS_PATH", &path.display().to_string().replace('\\', "/"))
 }
 
+const COPC: &str = r#"
+[[layer]]
+name = "copc-heights"
+source = { kind = "copc", path = "COPC_PATH", crs = 3857 }
+gray = { min = 0.0, max = 300.0 }
+
+[[layer.op]]
+kind = "idw"
+"#;
+
+fn copc_layer_file(dir: &Path) -> String {
+    let las_path = dir.join("heights.las");
+    std::fs::write(&las_path, heights_las()).unwrap();
+    let copc_path = dir.join("heights.copc.laz");
+    copc_writer::convert_las_to_copc_streaming(
+        &las_path,
+        &copc_path,
+        &copc_writer::CopcWriterParams::default(),
+        dir,
+        &copc_core::NeverCancel,
+    )
+    .unwrap();
+    COPC.replace(
+        "COPC_PATH",
+        &copc_path.display().to_string().replace('\\', "/"),
+    )
+}
+
 /// the plain parcels layer beside one layer per vector op, all over the
 /// same fixtures written into `dir`
 fn vec_ops_layer_file(dir: &Path) -> String {
@@ -1656,6 +1684,39 @@ async fn a_las_layer_grids_its_points_into_the_tile() {
     let layers: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(layers[0]["source"], "las");
     assert!(layers[0]["temporal_extent"].is_null());
+}
+
+#[tokio::test]
+async fn a_copc_layer_grids_its_points_into_the_tile() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&copc_layer_file(dir.path()));
+    let (x, y) = tile_of(12, 7.3, 46.8);
+    let (status, png) = get(&app, &format!("/tiles/copc-heights/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    let grays = opaque_grays(&png);
+    assert!(grays.len() > 60_000, "only {} pixels gridded", grays.len());
+    for (i, g) in grays.iter().enumerate() {
+        assert_eq!(*g, HEIGHT_GRAY, "pixel {i}");
+    }
+
+    let (status, body) = get(&app, "/layers").await;
+    assert_eq!(status, StatusCode::OK);
+    let layers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(layers[0]["source"], "copc");
+}
+
+#[test]
+fn a_copc_source_names_exactly_one_of_path_and_url() {
+    let both = COPC.replace(
+        "path = \"COPC_PATH\"",
+        "path = \"/data/heights.copc.laz\", url = \"http://127.0.0.1:1/heights.copc.laz\"",
+    );
+    let neither = COPC.replace("path = \"COPC_PATH\", ", "");
+    for text in [both, neither] {
+        let error = Config::parse(&text).expect_err("a copc source needs one location");
+        assert!(error.contains("layer copc-heights"), "{error}");
+        assert!(error.contains("exactly one of path and url"), "{error}");
+    }
 }
 
 #[test]

@@ -412,6 +412,30 @@ impl HttpRange {
             }
         }
     }
+
+    // one HEAD request, blocking
+    pub fn content_length(&self) -> Result<u64> {
+        let named = |detail: String| Error::Source(format!("{}: {detail}", self.url));
+        FETCH_RT.block_on(async {
+            let resp = FETCH_CLIENT
+                .head(&self.url)
+                .send()
+                .await
+                .map_err(|e| named(format!("head request failed: {e}")))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(named(format!("head request failed: status {status}")));
+            }
+            // reqwest's content_length() measures the empty HEAD body, not this header
+            resp.headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .ok_or_else(|| named("head response has no content length".into()))?
+                .to_str()
+                .ok()
+                .and_then(|length| length.parse().ok())
+                .ok_or_else(|| named("head response content length is not a byte count".into()))
+        })
+    }
 }
 
 impl RangeRead for HttpRange {

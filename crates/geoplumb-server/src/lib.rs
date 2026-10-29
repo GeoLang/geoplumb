@@ -26,9 +26,9 @@ use tokio::sync::Semaphore;
 use geoplumb::elements::GdalSrc;
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::{
-    Aspect, BandMath, CogSrc, Combine, Focal, GpkgSrc, Hillshade, IdwGrid, LasSrc, MapAlgebra,
-    Mosaic, QualityMask, Rasterize, Reproject, Slope, StacSrc, TensorConv, ToRaster, ToTensor,
-    VecClip, VecFilter, VecSchema, VecSrc,
+    Aspect, BandMath, CogSrc, Combine, CopcSrc, Focal, GpkgSrc, Hillshade, IdwGrid, LasSrc,
+    MapAlgebra, Mosaic, QualityMask, Rasterize, Reproject, Slope, StacSrc, TensorConv, ToRaster,
+    ToTensor, VecClip, VecFilter, VecSchema, VecSrc,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Crs, Engine, Graph, NodeId, Source, TimeInterval};
@@ -56,7 +56,7 @@ pub struct Layer {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerInfo {
     pub name: String,
-    /// `stac`, `cog`, `gdal`, `geojson`, `gpkg`, `las`, or `composite` for a fan-in
+    /// `stac`, `cog`, `gdal`, `geojson`, `gpkg`, `las`, `copc`, or `composite` for a fan-in
     /// layer
     pub source: &'static str,
     pub collection: Option<String>,
@@ -311,6 +311,27 @@ fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, L
                 LayerInfo {
                     name,
                     source: "las",
+                    collection: None,
+                    default_datetime: None,
+                    temporal_extent: None,
+                },
+            ))
+        }
+        SourceConfig::Copc { path, url, crs } => {
+            let src: Box<dyn Source> = match (path, url) {
+                (Some(path), None) => {
+                    Box::new(CopcSrc::open_path(path, Crs(*crs)).map_err(|e| e.to_string())?)
+                }
+                (None, Some(url)) => {
+                    Box::new(CopcSrc::open_url(url, Crs(*crs)).map_err(|e| e.to_string())?)
+                }
+                _ => return Err(config::COPC_NEEDS_ONE_LOCATION.into()),
+            };
+            Ok((
+                src,
+                LayerInfo {
+                    name,
+                    source: "copc",
                     collection: None,
                     default_datetime: None,
                     temporal_extent: None,

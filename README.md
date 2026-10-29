@@ -17,10 +17,10 @@ You build a graph of sources and transforms, the engine negotiates caps once, an
 
 A served layer file can name these:
 
-- Sources: `stac` (a STAC collection), `cog` (a local COG file), `gdal` (any raster GDAL opens, in a build with the `gdal` feature), `geojson`, `gpkg` (a GeoPackage feature table) and `las`.
+- Sources: `stac` (a STAC collection), `cog` (a local COG file), `gdal` (any raster GDAL opens, in a build with the `gdal` feature), `geojson`, `gpkg` (a GeoPackage feature table), `las` and `copc` (a cloud-optimized point cloud, local or over HTTP).
 - Raster ops: `hillshade`, `slope`, `aspect`, `bandmath`, `focal`, `mask`, `reclassify`, `unary` and `convolve`.
 - Vector ops: `vec_filter`, `vec_schema` and `vec_clip`, then `rasterize`, which burns a constant or a numeric property per feature.
-- Point op: `idw`, which grids LAS points into one raster band.
+- Point op: `idw`, which grids LAS or COPC points into one raster band.
 - Fan-in: several `input` entries, each with its own op chain, joined by `mosaic` or a two-input `combine`, with an optional chain after the join.
 
 Source behaviour:
@@ -31,6 +31,7 @@ Source behaviour:
 - `geojson` reads a feature collection whole at startup, then simplifies it per level and clips it to the pulled window.
 - `gpkg` reads a GeoPackage feature table tile by tile through the file's rtree index, decoding only the rows a pull touches, then simplifies and clips them like `geojson`: `source = { kind = "gpkg", path = "parcels.gpkg", table = "parcels", crs = 4326 }`. `table` defaults to the first feature table and `crs` to the table's EPSG srs. A file without the rtree is refused.
 - `las` reads a point cloud whole at startup and thins it by voxel decimation per level.
+- `copc` fetches only the octree nodes a pull touches, from the root level down to the one its resolution needs, unthinned: `source = { kind = "copc", url = "https://example.com/cloud.copc.laz", crs = 3857 }`, or `path` in place of `url` for a local file. Like `las` it takes the `crs` its coordinates are in and needs an `idw`.
 
 Every layer ends reprojected to web mercator and encoded as PNG. Neither step is named in the file. The PNG stretch range comes from the last op that fixes one, or from the layer's own `gray = { min, max }`. A layer has to name `gray` when it ends in `reclassify`, `rasterize` or `idw`, since class numbers, burned values and interpolated heights carry no range. A fan-in layer with no range-fixing op after the join has to name it too.
 
