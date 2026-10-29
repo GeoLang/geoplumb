@@ -7,6 +7,7 @@
 - the ubuntu CI leg installs mesa's lavapipe and sets `GEOPLUMB_REQUIRE_GPU=1`, so the gpu tests run on a software Vulkan device there instead of skipping
 - gpu window copies and convolves are recorded into one pending command encoder per `GpuContext` and submitted when sixty-four are pending or a download needs the results, instead of one submission each. An 80 by 64 pixel pull over twenty 16 px tiles went from 260 submissions to 42 for its 240 dispatches. `GpuContext::submissions()` and `dispatches()` count both
 - a gpu dispatch over the device's workgroup limit fails in its own compute instead of failing the batch it shares, and a batch submission that fails makes its `GpuContext` return an error naming that failure from every later call, since the engine has cached chunks whose buffers that batch never wrote
+- `geoplumb_server::build_layer_graph` turns one `LayerConfig` into a `LayerGraph`: the graph with the layer's sources, fan-in and ops, its tip node and its `LayerInfo`, stopping before the web mercator reproject. `Layer::build` calls it and appends that reproject, so another crate can pull a layer file's layer onto a grid of its own choosing
 
 ## 2026-10-28
 

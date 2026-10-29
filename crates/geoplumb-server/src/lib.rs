@@ -95,32 +95,12 @@ impl Layer {
     }
 
     fn build(cfg: &LayerConfig, budget_bytes: usize, disk: Option<&Path>) -> Result<Layer, String> {
-        let mut graph = Graph::new();
         let gray = cfg.gray_range()?;
-        let (node, info) = match cfg.shape()? {
-            LayerShape::Single(source) => {
-                let (source, info) = open_source(&cfg.name, source)?;
-                (graph.add_source(source), info)
-            }
-            LayerShape::Fanin(fanin, inputs) => {
-                let mut tips = Vec::with_capacity(inputs.len());
-                let mut infos = Vec::with_capacity(inputs.len());
-                for input in inputs {
-                    let (source, info) = open_source(&cfg.name, &input.source)?;
-                    let head = graph.add_source(source);
-                    tips.push(add_ops(&mut graph, head, &input.ops)?);
-                    infos.push(info);
-                }
-                let joined = match fanin {
-                    FaninConfig::Mosaic => graph.add_fanin(&tips, Box::new(Mosaic)),
-                    FaninConfig::Combine { op } => {
-                        graph.add_fanin(&tips, Box::new(Combine::new((*op).into())))
-                    }
-                };
-                (joined, composite_info(&cfg.name, infos))
-            }
-        };
-        let node = add_ops(&mut graph, node, &cfg.ops)?;
+        let LayerGraph {
+            mut graph,
+            node,
+            info,
+        } = build_layer_graph(cfg)?;
         let node = graph.add_transform(node, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
         let engine = match disk {
             None => Engine::new(graph, budget_bytes),
@@ -140,6 +120,41 @@ impl Layer {
     pub fn info(&self) -> &LayerInfo {
         &self.info
     }
+}
+
+pub struct LayerGraph {
+    pub graph: Graph,
+    pub node: NodeId,
+    pub info: LayerInfo,
+}
+
+pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
+    let mut graph = Graph::new();
+    let (node, info) = match layer.shape()? {
+        LayerShape::Single(source) => {
+            let (source, info) = open_source(&layer.name, source)?;
+            (graph.add_source(source), info)
+        }
+        LayerShape::Fanin(fanin, inputs) => {
+            let mut tips = Vec::with_capacity(inputs.len());
+            let mut infos = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let (source, info) = open_source(&layer.name, &input.source)?;
+                let head = graph.add_source(source);
+                tips.push(add_ops(&mut graph, head, &input.ops)?);
+                infos.push(info);
+            }
+            let joined = match fanin {
+                FaninConfig::Mosaic => graph.add_fanin(&tips, Box::new(Mosaic)),
+                FaninConfig::Combine { op } => {
+                    graph.add_fanin(&tips, Box::new(Combine::new((*op).into())))
+                }
+            };
+            (joined, composite_info(&layer.name, infos))
+        }
+    };
+    let node = add_ops(&mut graph, node, &layer.ops)?;
+    Ok(LayerGraph { graph, node, info })
 }
 
 /// one op chain over `node`, the translation a layer's own ops and a
