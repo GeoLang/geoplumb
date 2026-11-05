@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-04
+
+- the release workflow calls `docker-image.yml` from `GeoLang/.github` instead of carrying its own steps. The image tags stay `ghcr.io/geolang/geoplumb:<tag>` and `:latest`, and the actions move to checkout v7, setup-buildx v4, login v4 and build-push v7
+
 ## 2026-10-29
 
 - tensors negotiate a memory domain, `System` or `Wgpu`, and every existing tensor element stays `System`. A new `wgpu` feature on `geoplumb`, which the server does not enable, adds `GpuContext`, `Graph::with_gpu` and three elements: the solve splices `Upload` and `Download` wherever a tensor link crosses domains, and `WgpuConvolve` runs the 3x3 tensor convolve as a compute shader that matches `TensorConv` to 1e-5, NaN rule included. Wgpu chunks count against the context's own byte budget, never spill and are dropped on eviction, and a wgpu node's chunks assemble on the device
@@ -19,6 +23,8 @@
 - `gpkg` as a layer source, `source = { kind = "gpkg", path = "parcels.gpkg", table = "parcels", crs = 4326 }` with `table` and `crs` optional, serving a GeoPackage feature table tile by tile through the file's own rtree index, so a tile read decodes only the rows whose envelopes touch it and the table is never held in memory. `table` defaults to the first feature table in the file and `crs` to the table's EPSG srs. A file with no rtree for the table, or a non-EPSG srs and no `crs`, is refused at startup naming the table, and like `geojson` the chain over it needs a `rasterize`
 - `LasSrc` bins its points by base-grid tile at construction, so a tile read scans only the bins its window touches instead of the whole cloud, with the same points out as before
 - `copc` as a layer source, `source = { kind = "copc", path = "/data/cloud.copc.laz", crs = 3857 }`, or `url = "https://..."` in place of `path` for a server that answers range requests, exactly one of the two or the layer file fails to parse naming the layer. Startup reads the header, the COPC info and the hierarchy pages, and a tile pull then fetches only the octree nodes its window touches, from the root down to the coarsest level at or finer than the pull's resolution, never the rest of the file. Remote reads go through `HttpRange` like COGs. Like `las` it takes the `crs` its coordinates are in and needs an `idw`, and its points come out unthinned, the level selection standing in for voxel thinning
+- rusqlite moves from 0.40 to 0.39, so a crate that also depends on sqlx 0.9 links one sqlite
+- `LasSrc::candidates` returns no points at once for an inverted bbox. An x range inverted past one bin with a y range spanning every row used to walk all those rows, which did not return
 
 ## 2026-09-16
 

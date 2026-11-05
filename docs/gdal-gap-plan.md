@@ -18,7 +18,9 @@ Where GDAL still is today, across the org:
   the `gdb` feature. The owner decision of 2026-07-29 in
   `viewtopia/DESIGN_TODO.md`: GDAL stays behind one crate or adapter trait,
   feature-gated, shipped in a container with GDAL from the distro.
-- geoplumb: nothing. Its sources are `stac`, `cog`, `geojson` and `las`.
+- geoplumb: `GdalSrc` over the `gdal` crate, behind the `gdal` feature and
+  off in the default build (section 1). Its other layer sources, `stac`,
+  `cog`, `geojson`, `gpkg`, `las` and `copc`, use no GDAL.
 
 Pure-Rust coverage today: terrano reads and writes COGs (deflate and raw,
 horizontal and floating-point predictors, u8 through f64, multi-band pixel
@@ -164,8 +166,8 @@ inference stays a separate decision (DESIGN.md puts it outside this repo,
 panoptes holds the ONNX code); one `wgpu` device per graph, handed in by
 the driver through `Graph::with_gpu`, never a process-wide device; the
 ubuntu CI leg installs lavapipe so the shader path runs on every push;
-two slices, batching alone in the second because it needs the engine to
-group a pull's chunks by node, which it does not do today.
+two slices, batching alone in the second, recorded per `GpuContext` with no
+engine change.
 
 Slice 1, the domain:
 
@@ -206,10 +208,12 @@ outside this repo, so that is a decision before it is a task.
 The question splits by who brings the file.
 
 For the stack's own paths, yes, in two to three years at one or two
-engineers, and section 1 is the mechanism rather than a detour. The
-feature-gated `gdal` source counts which drivers it opens in production. Each
-driver with hits gets a pure-Rust reader, by hit count. When the counter has
-been zero for a year the feature is deleted. What that porting list looks
+engineers, and section 1 is the mechanism rather than a detour.
+`GdalSrc::driver()` returns the short name of the driver that opened a file,
+and `geoplumb-server` prints it at startup for each `gdal` layer. No counter
+of opens per driver exists. The plan needs one in production: each driver
+with opens gets a pure-Rust reader, most opens first, and when the counter
+has been zero for a year the feature is deleted. What that porting list looks
 like today, by what the org already touches:
 
 - COG tile compressions beyond deflate: LZW (`weezl`, pure Rust), JPEG and
@@ -260,8 +264,8 @@ behind a feature for the rest, and the feature off in every default build.
 
 ## Order
 
-1. Section 1, the `gdal` source: the coverage, and the hit counter that
-   drives section 7.
+1. Section 1, the `gdal` source: the coverage, and the driver name that
+   section 7's counter needs.
 2. Section 2, `RangeRead` by shared reference: a small change that removes
    the one serialization point on the hot path.
 3. Sections 3 and 4, windowed point and vector sources: they stop two
@@ -269,5 +273,5 @@ behind a feature for the rest, and the feature off in every default build.
 4. Section 5, the small items.
 5. Section 6, GPU, when a workload needs it. Nothing above depends on it.
 
-Everything except inference is roughly two months, with section 6 taking
-more than half of that.
+Every box in sections 1 to 6 is ticked. What remains is `OgrSrc` (section 1),
+the inference decision (section 6) and section 7.
