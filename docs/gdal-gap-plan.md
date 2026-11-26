@@ -370,7 +370,14 @@ only after a proof script passes on real input, recorded in
       are in geoplumb. `Contours` is proven: over 900 x 900 pixels of
       Copernicus GLO-30 pulled in 256 px chunks, every 100 m level has
       `gdal_contour`'s length, and no line ends inside the window.
-      `Polygonize` and `Viewshed` still need a proof on real input. Left
+      `Polygonize` is proven: over 1024 x 1024 pixels of ESA WorldCover
+      pulled in 256 px chunks and dissolved, every class has gdal
+      Polygonize's polygon count, hole count and area, no invalid polygon,
+      and a symmetric difference under 1e-5 cells. That needed terrano's
+      pinch turn fixed (7ed5e85), topoi's union made OGC-valid on an i64
+      grid with a hole re-binding that stands in for iOverlay#104 (4d791e9),
+      and `dissolve` unioning each id in one call. `Viewshed` still needs a
+      proof on real input. Left
       open: tiles wholly outside a viewshed's disc still pull the whole
       disc, and `align_outward`'s 1e-9 cell tolerance is below the rounding
       of web mercator coordinates near the antimeridian at resolutions

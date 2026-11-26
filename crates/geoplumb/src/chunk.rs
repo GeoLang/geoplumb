@@ -448,19 +448,16 @@ fn merge_class(parts: &[&FeatureGeometry]) -> Option<FeatureGeometry> {
 }
 
 fn merge_polygonal(parts: &[&FeatureGeometry]) -> Option<FeatureGeometry> {
-    let mut polys: Vec<&Polygon> = Vec::new();
+    let mut polys: Vec<Polygon> = Vec::new();
     for part in parts {
         match part {
-            FeatureGeometry::Polygon(p) => polys.push(p),
-            FeatureGeometry::MultiPolygon(mp) => polys.extend(mp.polygons()),
+            FeatureGeometry::Polygon(p) => polys.push(p.clone()),
+            FeatureGeometry::MultiPolygon(mp) => polys.extend(mp.polygons().iter().cloned()),
             _ => {}
         }
     }
-    let (first, rest) = polys.split_first()?;
-    let mut merged = MultiPolygon::new(vec![(*first).clone()]);
-    for p in rest {
-        merged = topoi_core::union(&merged, *p);
-    }
+    // i_overlay snaps each call's input to an integer grid sized to that call's bounds
+    let merged = topoi_core::union(&polys, &[] as &[Polygon]);
     match merged.polygons() {
         [] => None,
         [single] => Some(FeatureGeometry::Polygon(single.clone())),

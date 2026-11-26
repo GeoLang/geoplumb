@@ -52,7 +52,10 @@ cargo run --release -p geoplumb --example tile_server
 cargo run --release -p geoplumb --example pyramid -- 12 tiles
 
 # 100 m contours over a 900 px square of a DEM COG from pixel 2520, 1080, as GeoJSON
-cargo run --release -p geoplumb --example contours_geojson -- dem.tif 2520 1080 900 900 100 contours.geojson
+cargo run --release -p geoplumb --example raster_vector_geojson -- dem.tif 2520 1080 900 900 contours.geojson contours 100
+
+# one polygon set per class over the same kind of window of a land cover COG
+cargo run --release -p geoplumb --example raster_vector_geojson -- landcover.tif 18000 18000 1024 1024 classes.geojson polygonize
 ```
 
 ## Serving

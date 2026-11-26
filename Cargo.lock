@@ -1941,7 +1941,7 @@ dependencies = [
 [[package]]
 name = "terrano-core"
 version = "0.3.0"
-source = "git+https://github.com/GeoLang/terrano.git?branch=master#a4cc373b8f135293f96dd5a91dc1f9506b0edb59"
+source = "git+https://github.com/GeoLang/terrano.git?branch=master#7ed5e85e5c489284c0dae2c826db2aef85c2fe57"
 dependencies = [
  "flate2",
  "thiserror",
@@ -2074,7 +2074,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 [[package]]
 name = "topoi-core"
 version = "0.1.0"
-source = "git+https://github.com/GeoLang/topoi.git?branch=master#65cdbadd51fd21900d7b5b5812fe573e5c529a69"
+source = "git+https://github.com/GeoLang/topoi.git?branch=master#4d791e942ae2e2aa9e65459b510018cd7609c0d0"
 dependencies = [
  "i_overlay",
  "serde",
