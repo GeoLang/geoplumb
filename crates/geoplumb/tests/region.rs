@@ -184,7 +184,8 @@ async fn sixteen_concurrent_tile_pulls_in_a_region_compute_it_once() {
     for (index, pulled) in tiles.into_iter().enumerate() {
         let raster = pulled.unwrap().unwrap().into_raster().unwrap();
         assert_eq!((raster.width(), raster.height()), (16, 16));
-        let values = raster.bands.band(0).unwrap().data();
+        let values = raster.bands.band(0).unwrap().to_raster();
+        let values = values.data();
         let (column0, row0) = tile_origin(index);
         for row in 0..16 {
             for column in 0..16 {
@@ -213,7 +214,8 @@ async fn a_tile_outside_the_region_reads_no_source() {
         .unwrap();
     assert_eq!(fixture.reads.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.computes.load(Ordering::SeqCst), 0);
-    let values = outside.bands.band(0).unwrap().data();
+    let values = outside.bands.band(0).unwrap().to_raster();
+    let values = values.data();
     assert_eq!(values.len(), 16 * 16);
     assert!(values.iter().all(|value| value.is_nan()), "{values:?}");
 

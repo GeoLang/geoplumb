@@ -4,8 +4,9 @@
 
 use std::collections::HashMap;
 
+use crate::bands::RasterBands;
 use crate::caps::{
-    BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, FieldMask, PointPattern,
+    BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, FieldMask, PointPattern,
     RasterPattern, ResRange, SetField, ValueKind,
 };
 use crate::chunk::{Chunk, PointChunk, RasterChunk, tile_contains};
@@ -15,7 +16,7 @@ use crate::spill::Fnv1a;
 use crate::window::{Bbox, GridSpec, WindowReq};
 use futures::future::BoxFuture;
 use nubis_core::{GridWindow, Point3, PointCloud, idw_window, thin_voxel};
-use terrano_core::{BandedRaster, Raster};
+use terrano_core::Raster;
 
 const TILE_PX: u32 = 256;
 
@@ -214,13 +215,13 @@ impl Transform for IdwGrid {
             passthrough: FieldMask {
                 crs: true,
                 chunk_px: true,
-                dtype: false,
+                dtypes: false,
                 bands: false,
                 resolution: false,
                 value_kinds: false,
             },
             output: CapsPattern::Raster(RasterPattern {
-                dtype: SetField::one(Dtype::F64),
+                dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
                 bands: SetField::one(1),
                 value_kinds: SetField::one(BandKinds::from(ValueKind::Continuous)),
                 ..RasterPattern::default()
@@ -271,7 +272,7 @@ impl Transform for IdwGrid {
         }
         let band = Raster::from_vec(cols, rows, data, res, f64::NAN).expect("idw dims");
         Ok(Chunk::Raster(RasterChunk {
-            bands: BandedRaster::new(vec![band]).expect("single band"),
+            bands: RasterBands::from_rasters(vec![band]).expect("single band"),
             bbox: out.bbox,
             resolution: res,
             crs: input.crs,

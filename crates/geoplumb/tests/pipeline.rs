@@ -156,7 +156,7 @@ async fn hillshade_is_seam_free_across_chunks() {
     let patch = Raster::from_vec(cols, rows, data, CELL, f64::NAN).unwrap();
     let reference = terrano_core::hillshade(&patch, 315.0, 45.0);
 
-    let band = got.bands.band(0).unwrap();
+    let band = got.bands.band(0).unwrap().to_raster();
     assert_eq!(band.width(), 320);
     assert_eq!(band.height(), 210);
     for r in 0..210 {
@@ -329,7 +329,7 @@ async fn reprojected_tile_matches_source_values() {
     assert_eq!(chunk.width(), geoplumb::tile::TILE_PX);
 
     // center pixel against the analytic elevation at the tile center
-    let band = chunk.bands.band(0).unwrap();
+    let band = chunk.bands.band(0).unwrap().to_raster();
     let center = band.data()[128 * 256 + 128];
     let b = tile.bbox();
     let (cx, cy) = ((b.min_x + b.max_x) / 2.0, (b.min_y + b.max_y) / 2.0);

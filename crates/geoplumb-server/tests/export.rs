@@ -788,6 +788,7 @@ fn geoplumb_info_prints_what_the_cog_declares() {
         deflate: true,
         format: SampleFormat::U16,
         nodata: Some(0.0),
+        palette: None,
     };
     let path = dir.path().join("dem-u16.tif");
     write_cog(&raster, &params, &mut std::fs::File::create(&path).unwrap()).unwrap();

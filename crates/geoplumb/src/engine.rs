@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use tokio::sync::{broadcast, oneshot};
 
+use crate::bands::{RasterBands, gathered, narrowed};
 use crate::caps::{Caps, Domain, TensorCaps};
 use crate::chunk::{
     Chunk, PointChunk, RasterChunk, TensorChunk, TensorData, VectorChunk, VectorFeature,
@@ -21,7 +22,6 @@ use crate::graph::{Graph, Node, NodeId};
 use crate::solver;
 use crate::spill::{self, SpillStore, StoredChunk};
 use crate::window::{Bbox, ChunkKey, GridSpec, MAX_LEVEL, TimeInterval, WindowReq};
-use terrano_core::{BandedRaster, Raster};
 
 /// generous per-pull bound: a million 256 px tiles is far past what
 /// assembly could hold in memory anyway
@@ -941,7 +941,7 @@ fn assemble(
                 window,
                 res,
                 caps,
-            )))
+            )?))
         }
         Caps::PointCloud(p) => {
             let mut pts = Vec::new();
@@ -997,60 +997,71 @@ fn assemble(
     }
 }
 
-/// mosaic same-level raster chunks into one raster covering `window`
 fn assemble_raster(
     chunk_bboxes: &[Bbox],
     chunks: &[&RasterChunk],
     window: &Bbox,
     res: f64,
     caps: &Caps,
-) -> RasterChunk {
+) -> Result<RasterChunk> {
     let cols = (window.width() / res).round() as usize;
     let rows = (window.height() / res).round() as usize;
-    let band_count = chunks
-        .first()
-        .map(|c| c.bands.band_count())
-        .unwrap_or(usize::from(caps.raster().bands));
-    let nodata = chunks
-        .first()
-        .and_then(|c| c.bands.band(0).map(|b| b.nodata))
-        .unwrap_or(f64::NAN);
-    let mut bands: Vec<Vec<f64>> = vec![vec![nodata; cols * rows]; band_count];
-    for (cb, chunk) in chunk_bboxes.iter().zip(chunks) {
-        for (bi, band) in chunk.bands.bands().iter().enumerate() {
-            let w = chunk.width();
-            for row in 0..chunk.height() {
-                let y = cb.max_y - (row as f64 + 0.5) * res;
-                if y > window.max_y || y < window.min_y {
+    let mut sources: Vec<Option<(u32, u32)>> = vec![None; cols * rows];
+    for (k, (cb, chunk)) in chunk_bboxes.iter().zip(chunks).enumerate() {
+        let w = chunk.width();
+        for row in 0..chunk.height() {
+            let y = cb.max_y - (row as f64 + 0.5) * res;
+            if y > window.max_y || y < window.min_y {
+                continue;
+            }
+            let out_row = ((window.max_y - y) / res).floor() as usize;
+            if out_row >= rows {
+                continue;
+            }
+            for col in 0..w {
+                let x = cb.min_x + (col as f64 + 0.5) * res;
+                if x < window.min_x || x > window.max_x {
                     continue;
                 }
-                let out_row = ((window.max_y - y) / res).floor() as usize;
-                if out_row >= rows {
-                    continue;
-                }
-                for col in 0..w {
-                    let x = cb.min_x + (col as f64 + 0.5) * res;
-                    if x < window.min_x || x > window.max_x {
-                        continue;
-                    }
-                    let out_col = ((x - window.min_x) / res).floor() as usize;
-                    if out_col < cols {
-                        bands[bi][out_row * cols + out_col] = band.data()[row * w + col];
-                    }
+                let out_col = ((x - window.min_x) / res).floor() as usize;
+                if out_col < cols {
+                    sources[out_row * cols + out_col] = Some((k as u32, (row * w + col) as u32));
                 }
             }
         }
     }
-    let rasters: Vec<Raster> = bands
-        .into_iter()
-        .map(|d| Raster::from_vec(cols, rows, d, res, nodata).expect("assemble dims"))
-        .collect();
-    RasterChunk {
-        bands: BandedRaster::new(rasters).expect("assemble bands uniform"),
+    let raster_caps = caps.raster();
+    let band_count = chunks
+        .first()
+        .map(|chunk| chunk.bands.band_count())
+        .unwrap_or(usize::from(raster_caps.bands));
+    let bands = (0..band_count)
+        .map(|bi| {
+            if chunks.is_empty() {
+                let absent = vec![f64::NAN; cols * rows];
+                return Ok(narrowed(
+                    raster_caps.dtypes.band(bi),
+                    cols,
+                    rows,
+                    res,
+                    absent,
+                ));
+            }
+            let band: Vec<_> = chunks
+                .iter()
+                .map(|chunk| chunk.bands.band(bi).expect("negotiated bands"))
+                .collect();
+            gathered(&band, cols, rows, res, |index| {
+                sources[index].map(|(k, at)| (k as usize, at as usize))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RasterChunk {
+        bands: RasterBands::new(bands)?,
         bbox: *window,
         resolution: res,
-        crs: caps.raster().crs,
-    }
+        crs: raster_caps.crs,
+    })
 }
 
 /// mosaic same-level tensor chunks into one tensor covering `window`

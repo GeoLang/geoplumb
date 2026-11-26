@@ -8,8 +8,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
+use geoplumb::RasterBands;
 use geoplumb::caps::{
-    CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField, ValueKind,
+    BandDtypes, CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField,
+    ValueKind,
 };
 use geoplumb::element::Source;
 use geoplumb::elements::RasterSrc;
@@ -184,7 +186,7 @@ impl Source for ClockSrc {
 
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
-            dtype: SetField::one(Dtype::F64),
+            dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
             bands: SetField::one(1),
             crs: SetField::one(Crs::WGS84),
             resolution: ResRange::at_least(CELL),
@@ -219,7 +221,7 @@ impl Source for ClockSrc {
             )
             .unwrap();
             Ok(Chunk::Raster(RasterChunk {
-                bands: BandedRaster::new(vec![band]).unwrap(),
+                bands: RasterBands::from_rasters(vec![band]).unwrap(),
                 bbox: req.bbox,
                 resolution: req.resolution,
                 crs: Crs::WGS84,

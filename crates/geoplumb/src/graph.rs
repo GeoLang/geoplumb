@@ -39,7 +39,6 @@ impl Default for Graph {
 }
 
 impl Graph {
-    /// starts with the crate's standard adapters registered (reproject)
     pub fn new() -> Self {
         Graph {
             nodes: Vec::new(),

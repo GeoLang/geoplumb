@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use gdal::raster::Buffer;
 use gdal::spatial_ref::SpatialRef;
 use gdal::{Dataset, DatasetOptions, DriverManager, GdalOpenFlags};
+use geoplumb::RasterBands;
 use geoplumb::caps::ValueKind;
 use geoplumb::element::Source;
 use geoplumb::elements::{GdalSrc, RasterSrc};
@@ -153,8 +154,9 @@ fn assert_matches_memory(gdal: &RasterChunk, memory: &RasterChunk, relative_tole
         .zip(memory.bands.bands())
         .enumerate()
     {
+        let (gb, mb) = (gb.to_raster(), mb.to_raster());
         for (i, (&g, &m)) in gb.data().iter().zip(mb.data()).enumerate() {
-            let m = memory_value(mb, m);
+            let m = memory_value(&mb, m);
             let (row, col) = (i / width, i % width);
             assert_eq!(
                 g.is_nan(),
@@ -231,7 +233,7 @@ async fn one_band_serves_alone() {
     let b = read(&memory, &req).await;
     assert_eq!(a.bands.band_count(), 1);
     let only_third = RasterChunk {
-        bands: BandedRaster::new(vec![b.bands.band(2).unwrap().clone()]).unwrap(),
+        bands: RasterBands::new(vec![b.bands.band(2).unwrap().clone()]).unwrap(),
         ..b
     };
     assert_matches_memory(&a, &only_third, 0.0);
@@ -285,6 +287,7 @@ async fn nodata_value_reads_as_nan() {
         .bands
         .band(0)
         .unwrap()
+        .to_raster()
         .data()
         .iter()
         .zip(&values)
@@ -339,6 +342,7 @@ async fn concurrent_chunks_match_one_read() {
     let whole = read(&GdalSrc::open(&path, ValueKind::Continuous).unwrap(), &req).await;
     assert_eq!(pulled.width(), W);
     for (a, b) in pulled.bands.bands().iter().zip(whole.bands.bands()) {
+        let (a, b) = (a.to_raster(), b.to_raster());
         for (x, y) in a.data().iter().zip(b.data()) {
             assert!(x == y || (x.is_nan() && y.is_nan()), "{x} vs {y}");
         }

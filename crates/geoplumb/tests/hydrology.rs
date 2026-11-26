@@ -1,3 +1,4 @@
+use geoplumb::RasterBands;
 use geoplumb::caps::{BandKinds, ValueKind};
 use geoplumb::elements::{FlowAccumulation, FlowDirection, RasterSrc, StreamOrder, Watershed};
 use geoplumb::{Bbox, Chunk, Crs, Engine, Graph, RasterChunk, Transform, WindowReq};
@@ -31,7 +32,7 @@ fn grid(columns: usize, rows: usize, value: impl Fn(usize, usize) -> f64) -> Vec
 fn computed(element: &dyn Transform, dem: Vec<f64>, columns: usize, rows: usize) -> Vec<f64> {
     let bbox = cells_bbox(0, 0, columns, rows);
     let input = RasterChunk {
-        bands: BandedRaster::new(vec![
+        bands: RasterBands::from_rasters(vec![
             Raster::from_vec(columns, rows, dem, CELL, f64::NAN).unwrap(),
         ])
         .unwrap(),
@@ -50,7 +51,7 @@ fn computed(element: &dyn Transform, dem: Vec<f64>, columns: usize, rows: usize)
         .into_raster()
         .unwrap();
     assert_eq!(output.bbox, bbox);
-    output.bands.band(0).unwrap().data().to_vec()
+    output.bands.band(0).unwrap().to_raster().data().to_vec()
 }
 
 const PLANE_SIDE: usize = 4;
@@ -375,7 +376,8 @@ async fn a_pull_cuts_its_window_out_of_the_one_region_compute() {
         .unwrap()
         .into_raster()
         .unwrap();
-    let area = pulled.bands.band(0).unwrap().data();
+    let area = pulled.bands.band(0).unwrap().to_raster();
+    let area = area.data();
     assert_eq!(area.len(), side * side);
     for row in 0..side {
         for column in 0..side {

@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 
+use crate::bands::RasterBands;
 use crate::caps::{
     BandKinds, Caps, CapsPattern, CapsSet, Constraint, Crs, FieldMask, RasterPattern, SetField,
     VectorPattern,
@@ -14,8 +15,8 @@ use crate::caps::{
 use crate::chunk::{Chunk, RasterChunk, VectorChunk, VectorFeature, clip_geometry};
 use crate::element::Transform;
 use crate::error::{Error, Result};
+use crate::resample::{OutputGrid, resampled_band};
 use crate::window::{Bbox, GridSpec, WindowReq};
-use terrano_core::{BandedRaster, Raster};
 use topoi_core::geojson::FeatureGeometry;
 use topoi_core::{
     Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon, Ring,
@@ -185,10 +186,6 @@ pub(crate) fn inverse_window(
     (env.expand(2.0 * source_resolution), source_resolution)
 }
 
-/// resample `input` onto the output window by inverse-projecting every
-/// output pixel center and sampling there. the one warp both this element
-/// and a stac item on another crs go through, so a pixel looks the same
-/// whichever asked for it
 pub(crate) fn warp_to_grid(
     input: &RasterChunk,
     out: &WindowReq,
@@ -211,25 +208,24 @@ pub(crate) fn warp_to_grid(
     let src_pts = inverse
         .convert_batch(&centers)
         .map_err(|e| Error::Projection(e.to_string()))?;
-    let bands: Vec<Raster> = input
+    let grid = OutputGrid {
+        cols,
+        rows,
+        cell_size: res,
+    };
+    let bands = input
         .bands
         .bands()
         .iter()
         .enumerate()
         .map(|(bi, band)| {
-            let value_kind = value_kinds.band(bi);
-            let nodata = band.nodata;
-            let data = src_pts
-                .iter()
-                .map(|&(sx, sy)| {
-                    crate::resample::sample_point(value_kind, band, input, sx, sy).unwrap_or(nodata)
-                })
-                .collect();
-            Raster::from_vec(cols, rows, data, res, nodata).expect("reproject dims")
+            resampled_band(band, value_kinds.band(bi), input, &grid, |index| {
+                src_pts[index]
+            })
         })
         .collect();
     Ok(RasterChunk {
-        bands: BandedRaster::new(bands).expect("uniform bands"),
+        bands: RasterBands::new(bands)?,
         bbox: out.bbox,
         resolution: res,
         crs: to,

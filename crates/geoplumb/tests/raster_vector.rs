@@ -624,7 +624,7 @@ async fn viewshed_hides_what_the_wall_hides_pulled_whole_or_chunked() {
         );
         pulled.push(pull(&engine, node, bbox, CELL).await.into_raster().unwrap());
     }
-    let values = |chunk: &RasterChunk| chunk.bands.band(0).unwrap().data().to_vec();
+    let values = |chunk: &RasterChunk| chunk.bands.band(0).unwrap().to_raster().data().to_vec();
     let (whole, chunked) = (values(&pulled[0]), values(&pulled[1]));
     assert_eq!(whole.len(), 64 * 48);
     for (i, (a, b)) in whole.iter().zip(&chunked).enumerate() {
@@ -731,7 +731,8 @@ async fn a_viewshed_tile_clear_of_the_disc_reads_no_input() {
         0,
         "a tile clear of the disc read its input"
     );
-    let values = clear.bands.band(0).unwrap().data();
+    let values = clear.bands.band(0).unwrap().to_raster();
+    let values = values.data();
     assert_eq!(values.len(), 16 * 16);
     assert!(values.iter().all(|value| value.is_nan()), "{values:?}");
 

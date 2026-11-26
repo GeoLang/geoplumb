@@ -107,6 +107,7 @@ async fn pull(engine: &Engine, node: NodeId) -> Vec<f64> {
         .bands
         .band(0)
         .unwrap()
+        .to_raster()
         .data()
         .to_vec()
 }

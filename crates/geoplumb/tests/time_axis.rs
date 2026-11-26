@@ -6,16 +6,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
+use geoplumb::RasterBands;
 use geoplumb::caps::{
-    BandKinds, Caps, CapsPattern, CapsSet, Constraint, Dtype, RasterCaps, RasterPattern, ResRange,
-    SetField, ValueKind,
+    BandDtypes, BandKinds, Caps, CapsPattern, CapsSet, Constraint, Dtype, RasterCaps,
+    RasterPattern, ResRange, SetField, ValueKind,
 };
 use geoplumb::element::{Source, Transform};
 use geoplumb::elements::stac::{format_rfc3339, parse_rfc3339};
 use geoplumb::elements::{Hillshade, Reproject};
 use geoplumb::window::GridSpec;
 use geoplumb::{Bbox, Chunk, Crs, Engine, Graph, NodeId, RasterChunk, TimeInterval, WindowReq};
-use terrano_core::{BandedRaster, Raster};
+use terrano_core::Raster;
 
 const CELL: f64 = 0.001;
 const ORIGIN_X: f64 = 7.0;
@@ -59,7 +60,7 @@ impl Source for ClockSrc {
 
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
-            dtype: SetField::one(Dtype::F64),
+            dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
             bands: SetField::one(1),
             crs: SetField::one(Crs::WGS84),
             resolution: ResRange::at_least(CELL),
@@ -96,7 +97,7 @@ impl Source for ClockSrc {
             )
             .unwrap();
             Ok(Chunk::Raster(RasterChunk {
-                bands: BandedRaster::new(vec![band]).unwrap(),
+                bands: RasterBands::from_rasters(vec![band]).unwrap(),
                 bbox: req.bbox,
                 resolution: req.resolution,
                 crs: Crs::WGS84,
@@ -126,9 +127,11 @@ impl Transform for AddOne {
     fn compute(&self, out: &WindowReq, input: &Chunk) -> geoplumb::Result<Chunk> {
         self.computes.fetch_add(1, Ordering::SeqCst);
         let mut chunk = input.raster()?.crop_to(&out.bbox);
-        for v in chunk.bands.band_mut(0).unwrap().data_mut() {
+        let mut band = chunk.bands.band(0).unwrap().to_raster().into_owned();
+        for v in band.data_mut() {
             *v += 1.0;
         }
+        chunk.bands = RasterBands::from_rasters(vec![band])?;
         Ok(Chunk::Raster(chunk))
     }
 }
@@ -190,7 +193,7 @@ async fn pull_value(rig: &Rig, bbox: Bbox, time: Option<TimeInterval>) -> f64 {
         .unwrap()
         .into_raster()
         .unwrap();
-    let band = chunk.bands.band(0).unwrap();
+    let band = chunk.bands.band(0).unwrap().to_raster();
     let first = band.data()[0];
     assert!(
         band.data().iter().all(|v| *v == first),
@@ -283,7 +286,7 @@ async fn a_time_invariant_graph_computes_once_for_two_times() {
 
 fn raster_caps(crs: Crs) -> Caps {
     Caps::Raster(RasterCaps {
-        dtype: Dtype::F64,
+        dtypes: BandDtypes::from(Dtype::F64),
         bands: 1,
         crs,
         resolution: ResRange::at_least(CELL),
@@ -361,7 +364,7 @@ async fn timed_chunks_spill_and_reload_apart() {
     let engine = Engine::with_disk_cache(g, ONE_CHUNK, &base, 64 << 20).unwrap();
     let w = window(0, 0, 224, 224);
 
-    let value = |chunk: RasterChunk| chunk.bands.band(0).unwrap().data()[0];
+    let value = |chunk: RasterChunk| chunk.bands.band(0).unwrap().to_raster().data()[0];
     let pull = async |time| {
         value(
             engine

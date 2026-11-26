@@ -1,16 +1,18 @@
+use crate::bands::RasterBands;
 use crate::caps::{
-    BandKinds, Caps, CapsPattern, CapsSet, Constraint, Crs, RasterPattern, SetField, ValueKind,
+    BandKinds, Caps, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, SetField,
+    ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::error::{Error, Result};
 use crate::window::{Bbox, WindowReq};
 use terrano_core::{
-    BandedRaster, Raster, fill_sinks, flow_accumulation, flow_direction, stream_order, watershed,
+    Raster, fill_sinks, flow_accumulation, flow_direction, stream_order, watershed,
 };
 
 fn projected_dem(crs: Crs, output: ValueKind) -> Constraint {
-    Constraint::pinned_value_kind(
+    Constraint::pinned_value_kind_and_dtype(
         CapsSet::one(CapsPattern::Raster(RasterPattern {
             bands: SetField::one(1),
             crs: SetField::one(crs),
@@ -18,6 +20,7 @@ fn projected_dem(crs: Crs, output: ValueKind) -> Constraint {
             ..RasterPattern::default()
         })),
         output,
+        Dtype::F64,
     )
 }
 
@@ -47,10 +50,11 @@ fn filled_flow_directions(out: &WindowReq, input: &Chunk) -> Result<RasterChunk>
     let band = dem
         .bands
         .band(0)
-        .ok_or(Error::Source("empty input chunk".into()))?;
-    let directions = flow_direction(&fill_sinks(band));
+        .ok_or(Error::Source("empty input chunk".into()))?
+        .to_raster();
+    let directions = flow_direction(&fill_sinks(&band));
     Ok(RasterChunk {
-        bands: BandedRaster::new(vec![directions]).expect("one band"),
+        bands: RasterBands::from_rasters(vec![directions]).expect("one band"),
         ..dem
     })
 }
@@ -82,7 +86,7 @@ fn contributing_area(directions: &Raster, resolution: f64) -> Raster {
 
 fn with_band(grid: RasterChunk, band: Raster) -> Chunk {
     Chunk::Raster(RasterChunk {
-        bands: BandedRaster::new(vec![band]).expect("one band"),
+        bands: RasterBands::from_rasters(vec![band]).expect("one band"),
         ..grid
     })
 }
@@ -146,8 +150,8 @@ impl Transform for FlowAccumulation {
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let directions = filled_flow_directions(out, input)?;
-        let codes = directions.bands.band(0).expect("one band");
-        let area = contributing_area(codes, directions.resolution);
+        let codes = directions.bands.band(0).expect("one band").to_raster();
+        let area = contributing_area(&codes, directions.resolution);
         Ok(with_band(directions, area))
     }
 }
@@ -180,7 +184,7 @@ impl Transform for Watershed {
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let directions = filled_flow_directions(out, input)?;
-        let basins = watershed(directions.bands.band(0).expect("one band"));
+        let basins = watershed(&directions.bands.band(0).expect("one band").to_raster());
         Ok(with_band(directions, basins))
     }
 }
@@ -223,9 +227,9 @@ impl Transform for StreamOrder {
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let directions = filled_flow_directions(out, input)?;
-        let codes = directions.bands.band(0).expect("one band");
-        let area = contributing_area(codes, directions.resolution);
-        let orders = stream_order(&area, codes, self.threshold);
+        let codes = directions.bands.band(0).expect("one band").to_raster();
+        let area = contributing_area(&codes, directions.resolution);
+        let orders = stream_order(&area, &codes, self.threshold);
         Ok(with_band(directions, orders))
     }
 }

@@ -4,8 +4,10 @@
 //! categorical ones. for tiled cogs use CogSrc, which reads windows without
 //! holding the file
 
+use crate::bands::RasterBands;
 use crate::caps::{
-    BandKinds, CapsPattern, CapsSet, Constraint, Crs, RasterPattern, ResRange, SetField,
+    BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange,
+    SetField,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
@@ -105,7 +107,7 @@ impl RasterSrc {
             })
             .collect();
         RasterChunk {
-            bands: BandedRaster::new(bands).expect("uniform bands"),
+            bands: RasterBands::from_rasters(bands).expect("uniform bands"),
             bbox: req.bbox,
             resolution: res,
             crs: self.crs,
@@ -138,7 +140,7 @@ impl Source for RasterSrc {
 
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
-            dtype: SetField::one(crate::caps::Dtype::F64),
+            dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
             bands: SetField::one(self.data.band_count() as u16),
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.base_resolution),

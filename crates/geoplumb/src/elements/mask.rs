@@ -3,17 +3,14 @@
 //! equality. window-local on an identity plan, so chunked output equals
 //! whole-window output
 
-use crate::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
+use crate::bands::{RasterBands, finite_value, masked};
+use crate::caps::{Caps, CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::error::{Error, Result};
 use crate::window::WindowReq;
-use terrano_core::{BandedRaster, Raster};
+use terrano_core::TypedBand;
 
-/// keeps a pixel where the quality band holds one of `valid_values` and sets
-/// every band to NaN where it does not, the quality band included. band count
-/// and band order are untouched, so downstream band indices stay put. nodata
-/// in the quality band is already an invalid pixel, so it masks too
 pub struct QualityMask {
     pub band: usize,
     pub valid_values: Vec<f64>,
@@ -26,34 +23,19 @@ impl QualityMask {
 }
 
 pub(crate) fn mask_by_quality(
-    bands: &[Raster],
-    quality: &Raster,
+    bands: &[TypedBand],
+    quality: &TypedBand,
     valid_values: &[f64],
     resolution: f64,
-) -> Vec<Raster> {
-    let keep: Vec<bool> = quality
-        .data()
-        .iter()
-        .map(|v| !quality.is_nodata(*v) && valid_values.contains(v))
+) -> Result<Vec<TypedBand>> {
+    let keep: Vec<bool> = (0..quality.width() * quality.height())
+        .map(|index| {
+            finite_value(quality, index).is_some_and(|value| valid_values.contains(&value))
+        })
         .collect();
     bands
         .iter()
-        .map(|band| {
-            let data: Vec<f64> = band
-                .data()
-                .iter()
-                .zip(&keep)
-                .map(|(v, keep)| {
-                    if *keep && !band.is_nodata(*v) {
-                        *v
-                    } else {
-                        f64::NAN
-                    }
-                })
-                .collect();
-            Raster::from_vec(band.width(), band.height(), data, resolution, f64::NAN)
-                .expect("mask dims")
-        })
+        .map(|band| masked(band, &keep, resolution))
         .collect()
 }
 
@@ -73,6 +55,19 @@ impl Transform for QualityMask {
         })))
     }
 
+    fn configure(&mut self, input: &Caps, _output: &Caps) -> Result<()> {
+        let input = input.raster();
+        for band in 0..usize::from(input.bands) {
+            let dtype = input.dtypes.band(band);
+            if !dtype.marks_absent_cells() {
+                return Err(Error::InvalidGraph(format!(
+                    "quality mask needs a nodata value on band {band}, its dtype {dtype:?} has none"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn plan(&self, out: &WindowReq) -> WindowReq {
         *out
     }
@@ -85,9 +80,9 @@ impl Transform for QualityMask {
             quality,
             &self.valid_values,
             input.resolution,
-        );
+        )?;
         Ok(Chunk::Raster(RasterChunk {
-            bands: BandedRaster::new(bands).map_err(Error::Terrano)?,
+            bands: RasterBands::new(bands)?,
             bbox: input.bbox,
             resolution: input.resolution,
             crs: input.crs,

@@ -8,9 +8,10 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
+use crate::bands::{RasterBands, narrowed_like};
 use crate::caps::{
-    BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
-    ValueKind,
+    BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange,
+    SetField, ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
@@ -19,7 +20,7 @@ use crate::resample::reduce_block;
 use crate::spill::Fnv1a;
 use crate::window::{GridSpec, WindowReq};
 use futures::future::BoxFuture;
-use terrano_core::{BandedRaster, CogReader, RangeRead, Raster};
+use terrano_core::{CogReader, RangeRead, Raster, TypedBand};
 
 pub struct CogSrc<R: RangeRead + Send + Sync + 'static> {
     reader: Arc<CogReader<R>>,
@@ -86,7 +87,7 @@ impl<R: RangeRead + Send + Sync + 'static> Source for CogSrc<R> {
 
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
-            dtype: SetField::one(Dtype::F64),
+            dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
             bands: SetField::one(self.bands),
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.base_resolution),
@@ -157,24 +158,37 @@ pub(crate) fn read_chunk<R: RangeRead>(
         }
     }
 
-    let bands: Vec<Raster> = fine
+    let bands = fine
         .into_iter()
         .enumerate()
         .map(|(bi, plane)| {
-            let data = if factor == 1 {
-                plane
-            } else {
-                decimate(&plane, cols, rows, factor, value_kinds.band(bi))
-            };
-            Raster::from_vec(cols, rows, data, req.resolution, f64::NAN).expect("window dims")
+            if factor == 1 {
+                let raster = Raster::from_vec(cols, rows, plane, req.resolution, f64::NAN);
+                return TypedBand::F64(raster.expect("window dims"));
+            }
+            let fine = Raster::from_vec(fcols, frows, plane, lres, f64::NAN);
+            let fine = TypedBand::F64(fine.expect("window dims"));
+            decimate_band(&fine, factor, value_kinds.band(bi), req.resolution)
         })
         .collect();
     Ok(RasterChunk {
-        bands: BandedRaster::new(bands).map_err(Error::Terrano)?,
+        bands: RasterBands::new(bands)?,
         bbox: req.bbox,
         resolution: req.resolution,
         crs,
     })
+}
+
+fn decimate_band(
+    fine: &TypedBand,
+    factor: usize,
+    value_kind: ValueKind,
+    cell_size: f64,
+) -> TypedBand {
+    let (cols, rows) = (fine.width() / factor, fine.height() / factor);
+    let widened = fine.to_raster();
+    let decimated = decimate(widened.data(), cols, rows, factor, value_kind);
+    narrowed_like(fine, cols, rows, cell_size, decimated)
 }
 
 pub(crate) fn decimate(

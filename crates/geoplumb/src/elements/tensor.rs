@@ -4,15 +4,16 @@
 //! lives outside this repo, these are the windowed pre- and post-processing
 //! ends of it
 
+use crate::bands::RasterBands;
 use crate::caps::{
-    BandKinds, Caps, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField,
-    TensorDtype, TensorPattern, ValueKind,
+    BandDtypes, BandKinds, Caps, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern,
+    SetField, TensorDtype, TensorPattern, ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk, TensorChunk, TensorData};
 use crate::element::Transform;
 use crate::error::{Error, Result};
 use crate::window::{Bbox, WindowReq};
-use terrano_core::{BandedRaster, Raster};
+use terrano_core::Raster;
 
 /// fields a raster to tensor transform carries over: the common fields plus
 /// the plane count, which couples raster bands to tensor channels so a band
@@ -22,7 +23,7 @@ fn cross_kind_passthrough() -> FieldMask {
         crs: true,
         chunk_px: true,
         bands: true,
-        dtype: false,
+        dtypes: false,
         resolution: false,
         value_kinds: false,
     }
@@ -84,6 +85,7 @@ impl Transform for ToTensor {
         let mut data = vec![f32::NAN; channels * plane];
         for (c, band) in input.bands.bands().iter().enumerate() {
             let (scale, offset) = (self.scales[c], self.offsets[c]);
+            let band = band.to_raster();
             for (i, v) in band.data().iter().enumerate() {
                 data[c * plane + i] = *v as f32 * scale + offset;
             }
@@ -208,7 +210,7 @@ impl Transform for ToRaster {
             input: CapsSet::one(CapsPattern::Tensor(TensorPattern::default())),
             passthrough: cross_kind_passthrough(),
             output: CapsPattern::Raster(RasterPattern {
-                dtype: SetField::one(Dtype::F64),
+                dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
                 value_kinds: SetField::one(BandKinds::from(ValueKind::Continuous)),
                 ..RasterPattern::default()
             }),
@@ -230,7 +232,7 @@ impl Transform for ToRaster {
             })
             .collect();
         Ok(Chunk::Raster(RasterChunk {
-            bands: BandedRaster::new(bands).map_err(Error::Terrano)?,
+            bands: RasterBands::from_rasters(bands)?,
             bbox: input.bbox,
             resolution: input.resolution,
             crs: input.crs,

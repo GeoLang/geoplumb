@@ -5,9 +5,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::bands::RasterBands;
 use crate::caps::{
-    BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, FieldMask, RasterPattern, ResRange,
-    SetField, ValueKind, VectorPattern,
+    BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, FieldMask, RasterPattern,
+    ResRange, SetField, ValueKind, VectorPattern,
 };
 use crate::chunk::{Chunk, RasterChunk, VectorChunk, VectorFeature, clip_geometry};
 use crate::element::{Source, Transform};
@@ -15,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::spill::{Fnv1a, write_geometry};
 use crate::window::{GridSpec, WindowReq};
 use futures::future::BoxFuture;
-use terrano_core::{BandedRaster, Raster};
+use terrano_core::Raster;
 use topoi_core::geojson::{FeatureCollection, FeatureGeometry};
 use topoi_core::{
     Coord, Envelope, GridWindow, LineString, MultiLineString, MultiPolygon, Polygon, RTree, Ring,
@@ -357,13 +358,13 @@ impl Transform for Rasterize {
             passthrough: FieldMask {
                 crs: true,
                 chunk_px: true,
-                dtype: false,
+                dtypes: false,
                 bands: false,
                 resolution: false,
                 value_kinds: false,
             },
             output: CapsPattern::Raster(RasterPattern {
-                dtype: SetField::one(Dtype::F64),
+                dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
                 bands: SetField::one(1),
                 value_kinds: SetField::one(BandKinds::from(ValueKind::Categorical)),
                 ..RasterPattern::default()
@@ -401,7 +402,7 @@ impl Transform for Rasterize {
         }
         let band = Raster::from_vec(cols, rows, data, res, f64::NAN).expect("rasterize dims");
         Ok(Chunk::Raster(RasterChunk {
-            bands: BandedRaster::new(vec![band]).expect("single band"),
+            bands: RasterBands::from_rasters(vec![band]).expect("single band"),
             bbox: out.bbox,
             resolution: res,
             crs: input.crs,

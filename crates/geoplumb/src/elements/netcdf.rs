@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
+use terrano_core::Raster;
 use terrano_core::netcdf::{
     AttributeValue, NetCdfMetadata, Variable, read_netcdf_metadata, read_netcdf_values,
 };
-use terrano_core::{BandedRaster, Raster};
 
+use crate::bands::RasterBands;
 use crate::caps::{Constraint, Crs, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
@@ -310,7 +311,7 @@ fn empty_window(req: &WindowReq, crs: Crs) -> Result<RasterChunk> {
         f64::NAN,
     )?;
     Ok(RasterChunk {
-        bands: BandedRaster::new(vec![band])?,
+        bands: RasterBands::from_rasters(vec![band])?,
         bbox: req.bbox,
         resolution: req.resolution,
         crs,

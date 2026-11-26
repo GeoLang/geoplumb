@@ -2,15 +2,17 @@
 //! bands through an expression parsed at construction. window-local on an
 //! identity plan, so chunked output equals whole-window output
 
+use crate::bands::RasterBands;
 use crate::caps::{
-    BandKinds, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField,
-    ValueKind,
+    BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern,
+    SetField, ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::error::{Error, Result};
 use crate::window::WindowReq;
-use terrano_core::{BandedRaster, Raster};
+use std::borrow::Cow;
+use terrano_core::Raster;
 
 /// what a true comparison yields, and what `where` reads as its true
 /// branch. any other finite value is true to `where` as well
@@ -407,7 +409,7 @@ impl Transform for BandMath {
                 ..RasterPattern::default()
             })),
             passthrough: FieldMask {
-                dtype: false,
+                dtypes: false,
                 bands: false,
                 crs: true,
                 resolution: true,
@@ -415,7 +417,7 @@ impl Transform for BandMath {
                 value_kinds: false,
             },
             output: CapsPattern::Raster(RasterPattern {
-                dtype: SetField::one(Dtype::F64),
+                dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
                 bands: SetField::one(1),
                 value_kinds: SetField::one(BandKinds::from(ValueKind::Continuous)),
                 ..RasterPattern::default()
@@ -429,8 +431,8 @@ impl Transform for BandMath {
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let input = input.raster()?.crop_to(&out.bbox);
-        let planes: Vec<&Raster> = (0..self.bands)
-            .map(|b| input.bands.band(b).expect("negotiated bands"))
+        let planes: Vec<Cow<'_, Raster>> = (0..self.bands)
+            .map(|b| input.bands.band(b).expect("negotiated bands").to_raster())
             .collect();
         let (cols, rows) = (input.width(), input.height());
         let mut values = vec![f64::NAN; self.bands];
@@ -445,7 +447,7 @@ impl Transform for BandMath {
         let band = Raster::from_vec(cols, rows, data, input.resolution, f64::NAN)
             .map_err(Error::Terrano)?;
         Ok(Chunk::Raster(RasterChunk {
-            bands: BandedRaster::new(vec![band]).expect("one band"),
+            bands: RasterBands::from_rasters(vec![band]).expect("one band"),
             bbox: input.bbox,
             resolution: input.resolution,
             crs: input.crs,

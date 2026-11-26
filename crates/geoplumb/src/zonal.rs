@@ -3,6 +3,7 @@
 //! sees that tile, so aggregating across tiles has to sit above the graph
 //! the way `materialize` and `VectorChunk::dissolve` do
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::chunk::{RasterChunk, VectorFeature};
@@ -130,7 +131,7 @@ pub async fn window_statistics(
 ) -> Result<PixelStatistics> {
     let mut merged = PixelStatistics::default();
     for_each_tile(engine, node, &window, |tile| {
-        merged.merge(&reduce_band(band_zero(tile)?));
+        merged.merge(&reduce_band(&*band_zero(tile)?));
         Ok(())
     })
     .await?;
@@ -180,8 +181,12 @@ fn zone_shapes(features: &[VectorFeature]) -> Vec<(FeatureGeometry, f64)> {
         .collect()
 }
 
-fn band_zero(tile: &RasterChunk) -> Result<&Raster> {
-    tile.bands.band(0).ok_or(Error::Kind("raster with a band"))
+fn band_zero(tile: &RasterChunk) -> Result<Cow<'_, Raster>> {
+    let band = tile
+        .bands
+        .band(0)
+        .ok_or(Error::Kind("raster with a band"))?;
+    Ok(band.to_raster())
 }
 
 fn reduce_band(band: &Raster) -> PixelStatistics {

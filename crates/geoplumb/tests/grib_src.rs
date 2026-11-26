@@ -225,7 +225,8 @@ async fn read_all(src: &RasterSrc) -> RasterChunk {
 }
 
 fn assert_values(chunk: &RasterChunk, expected: &[f64]) {
-    let actual = chunk.bands.bands()[0].data();
+    let actual = chunk.bands.bands()[0].to_raster();
+    let actual = actual.data();
     assert_eq!(actual.len(), expected.len());
     for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
         assert!(

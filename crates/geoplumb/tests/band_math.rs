@@ -103,7 +103,7 @@ async fn ndvi_matches_the_hand_computed_reference() {
 
     assert_eq!(got.bands.band_count(), 1);
     assert_eq!((got.width(), got.height()), (cols, rows));
-    let band = got.bands.band(0).unwrap();
+    let band = got.bands.band(0).unwrap().to_raster();
     for row in 0..rows {
         for col in 0..cols {
             let want = ndvi(px0 + col, py0 + row);
@@ -185,6 +185,7 @@ async fn chunked_pull_matches_the_whole_window() {
         c.bands
             .band(0)
             .unwrap()
+            .to_raster()
             .data()
             .iter()
             .map(|v| v.to_bits())
@@ -226,7 +227,7 @@ async fn nan_propagates_through_every_operator() {
         "where(b1 > 0.1, b1, b0)",
     ] {
         let got = pull(expr, src_with(hole), bbox).await;
-        let band = got.bands.band(0).unwrap();
+        let band = got.bands.band(0).unwrap().to_raster();
         let at = |col: usize, row: usize| band.data()[row * 16 + col];
         assert!(
             at(hole_col, hole_row).is_nan(),
@@ -314,7 +315,7 @@ const OP_WINDOW: (usize, usize, usize, usize) = (16, 24, 32, 24);
 async fn each_cell(expr: &str, source: RasterSrc, mut check: impl FnMut(usize, usize, f64)) {
     let (px0, py0, cols, rows) = OP_WINDOW;
     let got = pull(expr, source, window(px0, py0, px0 + cols, py0 + rows)).await;
-    let band = got.bands.band(0).unwrap();
+    let band = got.bands.band(0).unwrap().to_raster();
     assert_eq!((got.width(), got.height()), (cols, rows));
     for row in 0..rows {
         for col in 0..cols {

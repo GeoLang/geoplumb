@@ -3,13 +3,16 @@
 //! bilinearly for continuous bands and from the containing pixel for
 //! categorical ones, exact when an input shares the output alignment
 
-use crate::caps::{BandKinds, Caps, CapsSet, Constraint};
+use std::borrow::Cow;
+
+use crate::bands::{RasterBands, finite_value, gathered, narrowed_like};
+use crate::caps::{BandKinds, Caps, CapsSet, Constraint, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Fanin;
 use crate::error::Result;
-use crate::resample::sample_point;
+use crate::resample::{nearest_index, sample_point};
 use crate::window::WindowReq;
-use terrano_core::{BandedRaster, Raster};
+use terrano_core::{Raster, TypedBand};
 
 #[derive(Default)]
 pub struct Mosaic {
@@ -36,36 +39,49 @@ impl Fanin for Mosaic {
         let res = out.resolution;
         let cols = (out.bbox.width() / res).round() as usize;
         let rows = (out.bbox.height() / res).round() as usize;
+        let center = |index: usize| {
+            let (row, col) = (index / cols, index % cols);
+            (
+                out.bbox.min_x + (col as f64 + 0.5) * res,
+                out.bbox.max_y - (row as f64 + 0.5) * res,
+            )
+        };
         let band_count = inputs[0].bands.band_count();
-        let bands: Vec<Raster> = (0..band_count)
+        let bands = (0..band_count)
             .map(|bi| {
-                let value_kind = value_kinds.band(bi);
-                let nodata = inputs[0].bands.band(bi).expect("negotiated bands").nodata;
-                let mut data = Vec::with_capacity(cols * rows);
-                for row in 0..rows {
-                    let y = out.bbox.max_y - (row as f64 + 0.5) * res;
-                    for col in 0..cols {
-                        let x = out.bbox.min_x + (col as f64 + 0.5) * res;
-                        let v = inputs
-                            .iter()
-                            .find_map(|c| {
-                                sample_point(
-                                    value_kind,
-                                    c.bands.band(bi).expect("negotiated bands"),
-                                    c,
-                                    x,
-                                    y,
-                                )
-                            })
-                            .unwrap_or(nodata);
-                        data.push(v);
-                    }
+                let band: Vec<&TypedBand> = inputs
+                    .iter()
+                    .map(|c| c.bands.band(bi).expect("negotiated bands"))
+                    .collect();
+                if value_kinds.band(bi) == ValueKind::Categorical {
+                    return gathered(&band, cols, rows, res, |index| {
+                        let (x, y) = center(index);
+                        inputs.iter().enumerate().find_map(|(k, c)| {
+                            let at = nearest_index(c, x, y)?;
+                            finite_value(band[k], at).map(|_| (k, at))
+                        })
+                    });
                 }
-                Raster::from_vec(cols, rows, data, res, nodata).expect("mosaic dims")
+                let rasters: Vec<Cow<'_, Raster>> =
+                    band.iter().map(|band| band.to_raster()).collect();
+                let nodata = rasters[0].nodata;
+                let data = (0..cols * rows)
+                    .map(|index| {
+                        let (x, y) = center(index);
+                        inputs
+                            .iter()
+                            .zip(&rasters)
+                            .find_map(|(c, raster)| {
+                                sample_point(ValueKind::Continuous, raster, c, x, y)
+                            })
+                            .unwrap_or(nodata)
+                    })
+                    .collect();
+                Ok(narrowed_like(band[0], cols, rows, res, data))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Chunk::Raster(RasterChunk {
-            bands: BandedRaster::new(bands).expect("uniform bands"),
+            bands: RasterBands::new(bands)?,
             bbox: out.bbox,
             resolution: res,
             crs: inputs[0].crs,

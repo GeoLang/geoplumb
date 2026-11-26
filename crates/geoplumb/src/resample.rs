@@ -3,10 +3,12 @@
 //! chunk-aligned windows at ladder resolutions, a tile wants an exact
 //! 256 px grid, this bridges the two
 
+use terrano_core::{Raster, TypedBand};
+
+use crate::bands::{RasterBands, finite_value, narrowed_like, picked};
 use crate::caps::{BandKinds, ValueKind};
 use crate::chunk::RasterChunk;
 use crate::window::Bbox;
-use terrano_core::{BandedRaster, Raster};
 
 pub fn resample_to_grid(
     src: &RasterChunk,
@@ -17,30 +19,61 @@ pub fn resample_to_grid(
 ) -> RasterChunk {
     let out_res_x = bbox.width() / cols as f64;
     let out_res_y = bbox.height() / rows as f64;
-    let bands: Vec<Raster> = src
+    let center = |index: usize| {
+        let (row, col) = (index / cols, index % cols);
+        (
+            bbox.min_x + (col as f64 + 0.5) * out_res_x,
+            bbox.max_y - (row as f64 + 0.5) * out_res_y,
+        )
+    };
+    let grid = OutputGrid {
+        cols,
+        rows,
+        cell_size: out_res_x,
+    };
+    let bands = src
         .bands
         .bands()
         .iter()
         .enumerate()
-        .map(|(bi, band)| {
-            let value_kind = value_kinds.band(bi);
-            let nodata = band.nodata;
-            let mut data = Vec::with_capacity(cols * rows);
-            for row in 0..rows {
-                let y = bbox.max_y - (row as f64 + 0.5) * out_res_y;
-                for col in 0..cols {
-                    let x = bbox.min_x + (col as f64 + 0.5) * out_res_x;
-                    data.push(sample_point(value_kind, band, src, x, y).unwrap_or(nodata));
-                }
-            }
-            Raster::from_vec(cols, rows, data, out_res_x, nodata).expect("resample dims")
-        })
+        .map(|(bi, band)| resampled_band(band, value_kinds.band(bi), src, &grid, center))
         .collect();
     RasterChunk {
-        bands: BandedRaster::new(bands).expect("uniform bands"),
+        bands: RasterBands::new(bands).expect("uniform bands"),
         bbox: *bbox,
         resolution: out_res_x,
         crs: src.crs,
+    }
+}
+
+pub(crate) struct OutputGrid {
+    pub(crate) cols: usize,
+    pub(crate) rows: usize,
+    pub(crate) cell_size: f64,
+}
+
+pub(crate) fn resampled_band(
+    band: &TypedBand,
+    value_kind: ValueKind,
+    chunk: &RasterChunk,
+    grid: &OutputGrid,
+    point: impl Fn(usize) -> (f64, f64),
+) -> TypedBand {
+    match value_kind {
+        ValueKind::Categorical => picked(band, grid.cols, grid.rows, grid.cell_size, |index| {
+            let (x, y) = point(index);
+            nearest_index(chunk, x, y).filter(|&at| finite_value(band, at).is_some())
+        }),
+        ValueKind::Continuous => {
+            let raster = band.to_raster();
+            let values = (0..grid.cols * grid.rows)
+                .map(|index| {
+                    let (x, y) = point(index);
+                    sample_bilinear(&raster, chunk, x, y).unwrap_or(raster.nodata)
+                })
+                .collect();
+            narrowed_like(band, grid.cols, grid.rows, grid.cell_size, values)
+        }
     }
 }
 
@@ -101,17 +134,21 @@ fn sample_bilinear(band: &Raster, chunk: &RasterChunk, x: f64, y: f64) -> Option
     }
 }
 
-fn sample_nearest(band: &Raster, chunk: &RasterChunk, x: f64, y: f64) -> Option<f64> {
+pub(crate) fn nearest_index(chunk: &RasterChunk, x: f64, y: f64) -> Option<usize> {
     let col = ((x - chunk.bbox.min_x) / chunk.resolution).floor();
     let row = ((chunk.bbox.max_y - y) / chunk.resolution).floor();
     if col.is_nan() || row.is_nan() || col < 0.0 || row < 0.0 {
         return None;
     }
     let (row, col) = (row as usize, col as usize);
-    if row >= band.height() || col >= band.width() {
+    if row >= chunk.height() || col >= chunk.width() {
         return None;
     }
-    let v = band.data()[row * band.width() + col];
+    Some(row * chunk.width() + col)
+}
+
+fn sample_nearest(band: &Raster, chunk: &RasterChunk, x: f64, y: f64) -> Option<f64> {
+    let v = band.data()[nearest_index(chunk, x, y)?];
     (!band.is_nodata(v) && v.is_finite()).then_some(v)
 }
 

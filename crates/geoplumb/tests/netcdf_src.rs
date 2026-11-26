@@ -190,7 +190,8 @@ fn interval(start: &str, end: &str) -> TimeInterval {
 }
 
 fn assert_values(chunk: &RasterChunk, expected: &[f64]) {
-    let actual = chunk.bands.bands()[0].data();
+    let actual = chunk.bands.bands()[0].to_raster();
+    let actual = actual.data();
     assert_eq!(actual.len(), expected.len());
     for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
         assert!(
@@ -448,7 +449,8 @@ async fn a_cell_centred_on_180_serves_both_sides_of_the_antimeridian() {
         &request(Bbox::new(-180.5, -0.5, 180.5, 0.5), 1.0, None),
     )
     .await;
-    let values = row.bands.bands()[0].data();
+    let values = row.bands.bands()[0].to_raster();
+    let values = values.data();
     assert_eq!(values.len(), 361);
     assert_eq!((values[0], values[360]), (100.0, 100.0));
 
@@ -464,7 +466,7 @@ async fn a_cell_centred_on_180_serves_both_sides_of_the_antimeridian() {
             .unwrap();
         let tile_west = -180.0 + f64::from(x) * 256.0 * pixel_size;
         let column = ((lon - tile_west) / pixel_size) as usize;
-        let value = tile.bands.bands()[0].data()[128 * 256 + column];
+        let value = tile.bands.bands()[0].to_raster().data()[128 * 256 + column];
         assert!(
             value > 90.0,
             "lon {lon}: served {value}, the 180 cell holds 100"
@@ -491,7 +493,8 @@ async fn a_global_grid_with_edges_on_180_keeps_its_columns() {
         &request(Bbox::new(-180.0, -0.5, 180.0, 0.5), 1.0, None),
     )
     .await;
-    let values = row.bands.bands()[0].data();
+    let values = row.bands.bands()[0].to_raster();
+    let values = values.data();
     assert_eq!(values.len(), 360);
     assert_eq!((values[0], values[359]), (0.0, 100.0));
 }

@@ -104,7 +104,8 @@ async fn listed_codes_pass_and_every_other_pixel_is_nan_in_all_bands() {
     for row in 0..rows {
         for col in 0..cols {
             let (sx, sy) = (px0 + col, py0 + row);
-            let cell = |band: usize| got.bands.band(band).unwrap().data()[row * cols + col];
+            let cell =
+                |band: usize| got.bands.band(band).unwrap().to_raster().data()[row * cols + col];
             if KEEP.contains(&quality_code(sx, sy)) {
                 kept += 1;
                 for band in 0..2 {
@@ -149,7 +150,7 @@ async fn nodata_in_the_quality_band_masks_the_pixel() {
     let got = pull(src_with(hole), window(px0, py0, px0 + cols, py0 + rows)).await;
 
     let cell = |band: usize, col: usize, row: usize| {
-        got.bands.band(band).unwrap().data()[row * cols + col]
+        got.bands.band(band).unwrap().to_raster().data()[row * cols + col]
     };
     let (hole_col, hole_row) = (hole_x - px0, hole_y - py0);
     for band in 0..3 {
@@ -184,7 +185,8 @@ async fn nodata_in_a_reflectance_band_stays_nan_where_the_code_passes() {
     let got = pull(src_with(hole), window(px0, py0, px0 + cols, py0 + rows)).await;
 
     let (hole_col, hole_row) = (hole_x - px0, hole_y - py0);
-    let cell = |band: usize| got.bands.band(band).unwrap().data()[hole_row * cols + hole_col];
+    let cell =
+        |band: usize| got.bands.band(band).unwrap().to_raster().data()[hole_row * cols + hole_col];
     assert!(
         cell(0).is_nan(),
         "a nodata reflectance cell must stay nodata"

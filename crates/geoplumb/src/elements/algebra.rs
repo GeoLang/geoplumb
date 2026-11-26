@@ -1,12 +1,13 @@
 //! per-cell map algebra and reclassification over terrano ops
 
-use crate::caps::{BandKinds, Caps, CapsSet, Constraint, ValueKind};
+use crate::bands::RasterBands;
+use crate::caps::{BandKinds, Caps, CapsSet, Constraint, Dtype, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::{Fanin, Transform};
 use crate::error::{Error, Result};
 use crate::resample::sample_point;
 use crate::window::WindowReq;
-use terrano_core::{BandedRaster, BinaryOp, Raster, UnaryOp, reclassify};
+use terrano_core::{BinaryOp, Raster, UnaryOp, reclassify};
 
 pub enum AlgebraOp {
     Unary(UnaryOp),
@@ -42,7 +43,7 @@ impl Transform for MapAlgebra {
             AlgebraOp::Unary(_) => ValueKind::Continuous,
             AlgebraOp::Reclassify(_) => ValueKind::Categorical,
         };
-        Constraint::pinned_value_kind(CapsSet::any_raster(), value_kind)
+        Constraint::pinned_value_kind_and_dtype(CapsSet::any_raster(), value_kind, Dtype::F64)
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
@@ -55,13 +56,16 @@ impl Transform for MapAlgebra {
             .bands
             .bands()
             .iter()
-            .map(|b| match &self.op {
-                AlgebraOp::Unary(op) => b.apply_unary(op),
-                AlgebraOp::Reclassify(classes) => reclassify(b, classes),
+            .map(|band| {
+                let band = band.to_raster();
+                match &self.op {
+                    AlgebraOp::Unary(op) => band.apply_unary(op),
+                    AlgebraOp::Reclassify(classes) => reclassify(&band, classes),
+                }
             })
             .collect();
         let full = RasterChunk {
-            bands: BandedRaster::new(bands).expect("uniform bands"),
+            bands: RasterBands::from_rasters(bands).expect("uniform bands"),
             bbox: input.bbox,
             resolution: input.resolution,
             crs: input.crs,
@@ -98,7 +102,11 @@ impl Fanin for Combine {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::pinned_value_kind(CapsSet::any_raster(), ValueKind::Continuous)
+        Constraint::pinned_value_kind_and_dtype(
+            CapsSet::any_raster(),
+            ValueKind::Continuous,
+            Dtype::F64,
+        )
     }
 
     fn configure(&mut self, inputs: &[Caps], _output: &Caps) -> Result<()> {
@@ -122,13 +130,13 @@ impl Fanin for Combine {
         let cols = (out.bbox.width() / res).round() as usize;
         let rows = (out.bbox.height() / res).round() as usize;
         let on_grid = |chunk: &RasterChunk, value_kind: ValueKind, bi: usize| -> Raster {
-            let band = chunk.bands.band(bi).expect("negotiated bands");
+            let band = chunk.bands.band(bi).expect("negotiated bands").to_raster();
             let mut data = Vec::with_capacity(cols * rows);
             for row in 0..rows {
                 let y = out.bbox.max_y - (row as f64 + 0.5) * res;
                 for col in 0..cols {
                     let x = out.bbox.min_x + (col as f64 + 0.5) * res;
-                    data.push(sample_point(value_kind, band, chunk, x, y).unwrap_or(band.nodata));
+                    data.push(sample_point(value_kind, &band, chunk, x, y).unwrap_or(band.nodata));
                 }
             }
             Raster::from_vec(cols, rows, data, res, band.nodata).expect("combine dims")
@@ -141,7 +149,7 @@ impl Fanin for Combine {
             })
             .collect();
         Ok(Chunk::Raster(RasterChunk {
-            bands: BandedRaster::new(bands).expect("uniform bands"),
+            bands: RasterBands::from_rasters(bands).expect("uniform bands"),
             bbox: out.bbox,
             resolution: res,
             crs: inputs[0].crs,

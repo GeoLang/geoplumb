@@ -2,12 +2,14 @@
 //! so the upstream plan widens the window by one cell of halo and compute
 //! crops it back off, which is what keeps chunk borders seam-free
 
-use crate::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField, ValueKind};
+use crate::bands::RasterBands;
+use crate::caps::{CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, SetField, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::error::{Error, Result};
 use crate::window::{Bbox, WindowReq};
-use terrano_core::{BandedRaster, Raster};
+use std::borrow::Cow;
+use terrano_core::Raster;
 
 const HALO_CELLS: f64 = 1.0;
 
@@ -24,7 +26,7 @@ fn plan_with_halo(out: &WindowReq) -> WindowReq {
 
 fn crop(result: Raster, input: &RasterChunk, out: &WindowReq) -> Result<Chunk> {
     let full = RasterChunk {
-        bands: BandedRaster::new(vec![result]).expect("one band"),
+        bands: RasterBands::from_rasters(vec![result]).expect("one band"),
         bbox: input.bbox,
         resolution: input.resolution,
         crs: input.crs,
@@ -32,11 +34,11 @@ fn crop(result: Raster, input: &RasterChunk, out: &WindowReq) -> Result<Chunk> {
     Ok(Chunk::Raster(full.crop_to(&out.bbox)))
 }
 
-fn dem_band(input: &RasterChunk) -> Result<&Raster> {
-    input
-        .bands
-        .band(0)
-        .ok_or(Error::Source("empty input chunk".into()))
+fn dem_band(input: &RasterChunk) -> Result<Cow<'_, Raster>> {
+    let band = input.bands.band(0);
+    Ok(band
+        .ok_or(Error::Source("empty input chunk".into()))?
+        .to_raster())
 }
 
 pub struct Hillshade {
@@ -59,7 +61,7 @@ impl Transform for Hillshade {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::pinned_value_kind(single_band(), ValueKind::Continuous)
+        Constraint::pinned_value_kind_and_dtype(single_band(), ValueKind::Continuous, Dtype::F64)
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
@@ -72,7 +74,7 @@ impl Transform for Hillshade {
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let input = input.raster()?;
-        let shaded = terrano_core::hillshade(dem_band(input)?, self.azimuth, self.altitude);
+        let shaded = terrano_core::hillshade(&*dem_band(input)?, self.azimuth, self.altitude);
         crop(shaded, input, out)
     }
 }
@@ -85,7 +87,7 @@ impl Transform for Slope {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::pinned_value_kind(single_band(), ValueKind::Continuous)
+        Constraint::pinned_value_kind_and_dtype(single_band(), ValueKind::Continuous, Dtype::F64)
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
@@ -98,7 +100,7 @@ impl Transform for Slope {
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let input = input.raster()?;
-        let sloped = terrano_core::slope(dem_band(input)?);
+        let sloped = terrano_core::slope(&*dem_band(input)?);
         crop(sloped, input, out)
     }
 }
@@ -113,7 +115,7 @@ impl Transform for Aspect {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::pinned_value_kind(single_band(), ValueKind::Continuous)
+        Constraint::pinned_value_kind_and_dtype(single_band(), ValueKind::Continuous, Dtype::F64)
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
@@ -126,7 +128,7 @@ impl Transform for Aspect {
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let input = input.raster()?;
-        let faced = terrano_core::aspect(dem_band(input)?);
+        let faced = terrano_core::aspect(&*dem_band(input)?);
         crop(faced, input, out)
     }
 }

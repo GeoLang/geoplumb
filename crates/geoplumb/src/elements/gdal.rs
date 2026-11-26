@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use gdal::Dataset;
 use gdal::raster::{RasterBand, ResampleAlg};
-use terrano_core::{BandedRaster, Raster};
+use terrano_core::Raster;
 
+use crate::bands::RasterBands;
 use crate::caps::{
-    BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
+    BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange,
+    SetField,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
@@ -238,7 +240,7 @@ impl GdalFile {
             })
             .collect();
         Ok(RasterChunk {
-            bands: BandedRaster::new(bands).map_err(Error::Terrano)?,
+            bands: RasterBands::from_rasters(bands)?,
             bbox: req.bbox,
             resolution: req.resolution,
             crs: self.crs,
@@ -316,7 +318,7 @@ impl Source for GdalSrc {
 
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
-            dtype: SetField::one(Dtype::F64),
+            dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
             bands: SetField::one(self.file.served_band_count()),
             crs: SetField::one(self.file.crs),
             resolution: ResRange::at_least(self.file.level_resolutions[0]),

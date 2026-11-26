@@ -304,7 +304,7 @@ async fn chunked_rasterize_matches_the_whole_window_reference() {
         },
     );
 
-    let band = got.bands.band(0).unwrap();
+    let band = got.bands.band(0).unwrap().to_raster();
     for row in 0..rows {
         for col in 0..cols {
             let a = band.data()[row * cols + col];

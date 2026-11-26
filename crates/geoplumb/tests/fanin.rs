@@ -2,8 +2,10 @@
 //! fixation across a diamond, and invalidation through a fanin node
 
 use futures::future::BoxFuture;
+use geoplumb::RasterBands;
 use geoplumb::caps::{
-    CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField, ValueKind,
+    BandDtypes, CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField,
+    ValueKind,
 };
 use geoplumb::element::Source;
 use geoplumb::elements::{Combine, Hillshade, Mosaic, RasterSrc, Slope};
@@ -53,7 +55,7 @@ fn window(px0: usize, py0: usize, px1: usize, py1: usize) -> Bbox {
 }
 
 fn assert_close(chunk: &RasterChunk, reference: &Raster, tol: f64) {
-    let band = chunk.bands.band(0).unwrap();
+    let band = chunk.bands.band(0).unwrap().to_raster();
     assert_eq!(band.width(), reference.width());
     assert_eq!(band.height(), reference.height());
     for (i, (a, b)) in band.data().iter().zip(reference.data()).enumerate() {
@@ -94,7 +96,7 @@ async fn combine_subtracts_per_cell() {
         time: None,
     };
     let got = engine.pull(c, req).await.unwrap().into_raster().unwrap();
-    let band = got.bands.band(0).unwrap();
+    let band = got.bands.band(0).unwrap().to_raster();
     for (i, v) in band.data().iter().enumerate() {
         assert!(v.abs() < 1e-12, "pixel {i}: {v} should be zero");
     }
@@ -118,9 +120,9 @@ async fn diamond_pull_combines_branches() {
     let h = engine.pull(hs, req).await.unwrap().into_raster().unwrap();
     let s = engine.pull(sl, req).await.unwrap().into_raster().unwrap();
     let (sb, hb, slb) = (
-        sum.bands.band(0).unwrap(),
-        h.bands.band(0).unwrap(),
-        s.bands.band(0).unwrap(),
+        sum.bands.band(0).unwrap().to_raster(),
+        h.bands.band(0).unwrap().to_raster(),
+        s.bands.band(0).unwrap().to_raster(),
     );
     for i in 0..sb.data().len() {
         let expected = hb.data()[i] + slb.data()[i];
@@ -149,7 +151,7 @@ impl Source for PrefSrc {
                 .iter()
                 .map(|&crs| {
                     CapsPattern::Raster(RasterPattern {
-                        dtype: SetField::one(Dtype::F64),
+                        dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
                         bands: SetField::one(1),
                         crs: SetField::one(crs),
                         resolution: ResRange::at_least(CELL),
@@ -178,7 +180,7 @@ impl Source for PrefSrc {
                 Raster::from_vec(cols, rows, vec![1.0; cols * rows], req.resolution, f64::NAN)
                     .unwrap();
             Ok(Chunk::Raster(RasterChunk {
-                bands: BandedRaster::new(vec![band]).unwrap(),
+                bands: RasterBands::from_rasters(vec![band]).unwrap(),
                 bbox: req.bbox,
                 resolution: req.resolution,
                 crs: self.crss[0],

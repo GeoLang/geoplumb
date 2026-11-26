@@ -2,9 +2,9 @@ use std::io::{Seek, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use terrano_core::{CogParams, SampleFormat, write_cog_tiles};
+use terrano_core::{CogParams, TypedBand, typed_tile_bytes, write_cog_tiles};
 
-use crate::caps::Caps;
+use crate::caps::{Caps, Dtype};
 use crate::chunk::RasterChunk;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
@@ -92,6 +92,10 @@ pub async fn write_cog<W: Write + Seek + Send + 'static>(
     })?;
     let bands = usize::from(caps.bands);
     let value_kinds = caps.value_kinds.clone();
+    let first = caps.dtypes.band(0);
+    let one_dtype = (1..bands).all(|band| caps.dtypes.band(band) == first);
+    // a cog level has one sample format and one nodata value for every band
+    let dtype = if one_dtype { first } else { Dtype::F64 };
     let params = CogParams {
         tile_width: COG_TILE_PX as u32,
         tile_height: COG_TILE_PX as u32,
@@ -102,8 +106,9 @@ pub async fn write_cog<W: Write + Seek + Send + 'static>(
         pixel_width: grid.pixel_size,
         pixel_height: grid.pixel_size,
         deflate: true,
-        format: SampleFormat::F64,
-        nodata: None,
+        format: dtype.format(),
+        nodata: dtype.integer_nodata(),
+        palette: None,
     };
     let runtime = tokio::runtime::Handle::current();
     let dropped = Arc::new(AtomicBool::new(false));
@@ -141,7 +146,7 @@ pub async fn write_cog<W: Write + Seek + Send + 'static>(
                         ))
                     });
                 match exact {
-                    Ok(exact) => Ok(padded_tile_samples(&exact)),
+                    Ok(exact) => tile_bytes(exact, dtype, &params),
                     Err(error) => {
                         let message = error.to_string();
                         failed_pull = Some(error);
@@ -161,21 +166,20 @@ pub async fn write_cog<W: Write + Seek + Send + 'static>(
     .expect("cog export task panicked")
 }
 
-fn padded_tile_samples(exact: &RasterChunk) -> Vec<u8> {
-    let bands = exact.bands.bands();
-    let sample_bytes = SampleFormat::F64.bytes() as usize;
-    let mut samples = Vec::with_capacity(COG_TILE_PX * COG_TILE_PX * bands.len() * sample_bytes);
-    for row in 0..COG_TILE_PX {
-        for col in 0..COG_TILE_PX {
-            for band in bands {
-                // terrano pads float cogs that declare no nodata with nan past the image edge
-                let value = band
-                    .get(row, col)
-                    .filter(|value| !band.is_nodata(*value))
-                    .unwrap_or(f64::NAN);
-                SampleFormat::F64.encode(value, &mut samples);
-            }
-        }
-    }
-    samples
+fn tile_bytes(
+    exact: RasterChunk,
+    dtype: Dtype,
+    params: &CogParams,
+) -> core::result::Result<Vec<u8>, terrano_core::Error> {
+    let bands: Vec<TypedBand> = match dtype {
+        Dtype::F64 => exact
+            .bands
+            .into_rasters()
+            .into_iter()
+            .map(TypedBand::F64)
+            .collect(),
+        _ => exact.bands.into_bands(),
+    };
+    // typed_tile_bytes fills cells past the band edge with nodata, or nan for floats
+    typed_tile_bytes(&bands, 0, 0, params)
 }

@@ -6,7 +6,7 @@ use geoplumb::caps::{
 };
 use geoplumb::element::{Adapter, Transform};
 use geoplumb::elements::{Hillshade, Mosaic, RasterSrc};
-use geoplumb::{Bbox, Chunk, Crs, Engine, Graph, RasterChunk, Result, WindowReq};
+use geoplumb::{Bbox, Chunk, Crs, Engine, Graph, RasterBands, RasterChunk, Result, WindowReq};
 use terrano_core::{BandedRaster, Raster};
 
 const W: usize = 600;
@@ -81,7 +81,7 @@ fn assert_matches_analytic(
     to_lonlat: impl Fn(f64, f64) -> (f64, f64),
     tol: f64,
 ) {
-    let band = chunk.bands.band(0).unwrap();
+    let band = chunk.bands.band(0).unwrap().to_raster();
     let res = chunk.resolution;
     let mut checked = 0;
     for row in 0..band.height() {
@@ -215,7 +215,7 @@ impl Transform for BandPick {
         let first = input.bands.band(0).expect("at least one band").clone();
         Ok(Chunk::Raster(
             RasterChunk {
-                bands: BandedRaster::new(vec![first]).expect("single band"),
+                bands: RasterBands::new(vec![first]).expect("single band"),
                 bbox: input.bbox,
                 resolution: input.resolution,
                 crs: input.crs,
@@ -321,7 +321,10 @@ async fn registered_adapter_bridges_a_bands_mismatch() {
         .unwrap()
         .into_raster()
         .unwrap();
-    let (ba, bb) = (a.bands.band(0).unwrap(), b.bands.band(0).unwrap());
+    let (ba, bb) = (
+        a.bands.band(0).unwrap().to_raster(),
+        b.bands.band(0).unwrap().to_raster(),
+    );
     for (i, (x, y)) in ba.data().iter().zip(bb.data()).enumerate() {
         assert!((x - y).abs() < 1e-12, "pixel {i}: {x} vs {y}");
     }

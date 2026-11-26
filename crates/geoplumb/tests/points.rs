@@ -190,7 +190,7 @@ async fn chunked_idw_matches_the_whole_window_reference() {
     )
     .unwrap();
 
-    let band = got.bands.band(0).unwrap();
+    let band = got.bands.band(0).unwrap().to_raster();
     for row in 0..rows {
         for col in 0..cols {
             let a = band.data()[row * cols + col];
@@ -227,7 +227,7 @@ async fn constant_cloud_hillshades_flat() {
         .unwrap()
         .into_raster()
         .unwrap();
-    let band = got.bands.band(0).unwrap();
+    let band = got.bands.band(0).unwrap().to_raster();
     let flat: Vec<f64> = band
         .data()
         .iter()

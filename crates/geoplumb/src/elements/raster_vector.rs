@@ -28,7 +28,7 @@ fn raster_to_features(value_kind: ValueKind) -> Constraint {
             crs: true,
             resolution: true,
             chunk_px: true,
-            dtype: false,
+            dtypes: false,
             bands: false,
             value_kinds: false,
         },
@@ -120,12 +120,13 @@ impl Transform for Contours {
         let band = input
             .bands
             .band(0)
-            .ok_or(Error::Source("empty input chunk".into()))?;
+            .ok_or(Error::Source("empty input chunk".into()))?
+            .to_raster();
         let (x_axis, y_axis) = (TileAxis::x(out), TileAxis::y(out));
         let halo_columns = ((out.bbox.min_x - input.bbox.min_x) / out.resolution).round() as i64;
         let halo_rows = ((input.bbox.max_y - out.bbox.max_y) / out.resolution).round() as i64;
         let mut levels: BTreeMap<i64, (f64, Vec<LineString>)> = BTreeMap::new();
-        for line in contours(band, self.interval, self.base) {
+        for line in contours(&band, self.interval, self.base) {
             let coords = line
                 .vertices
                 .iter()
@@ -195,9 +196,10 @@ impl Transform for Polygonize {
         let band = input
             .bands
             .band(0)
-            .ok_or(Error::Source("empty input chunk".into()))?;
+            .ok_or(Error::Source("empty input chunk".into()))?
+            .to_raster();
         let (x_axis, y_axis) = (TileAxis::x(out), TileAxis::y(out));
-        let mut cells = band.clone();
+        let mut cells = band.into_owned();
         cells.cell_size = 1.0;
         let mut classes: BTreeMap<i64, Vec<Polygon>> = BTreeMap::new();
         for region in polygonize(&cells) {

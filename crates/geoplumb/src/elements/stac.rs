@@ -21,9 +21,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 
+use crate::bands::{RasterBands, gathered};
 use crate::caps::{
-    BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
-    ValueKind,
+    BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange,
+    SetField, ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
@@ -671,7 +672,7 @@ impl StacSrc {
             )));
         }
         let bands = asset_bands[..output_assets].iter().sum();
-        let value_kinds = BandKinds::per_band(
+        let value_kinds = BandKinds::from_bands(
             asset_value_kinds
                 .iter()
                 .zip(&asset_bands[..output_assets])
@@ -976,7 +977,7 @@ impl Inner {
             .collect::<core::result::Result<Vec<_>, _>>()
             .map_err(Error::Terrano)?;
         Ok(RasterChunk {
-            bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
+            bands: RasterBands::from_rasters(bands)?,
             bbox: req.bbox,
             resolution: req.resolution,
             crs: self.crs,
@@ -1111,7 +1112,7 @@ async fn read_item(
         }
     });
     let mut chunks = futures::future::try_join_all(reads).await?;
-    let bands: Vec<terrano_core::Raster> = match inner.search.item_mask.clone() {
+    let bands: Vec<terrano_core::TypedBand> = match inner.search.item_mask.clone() {
         None => chunks
             .into_iter()
             .flat_map(|chunk| chunk.bands.into_bands())
@@ -1134,11 +1135,11 @@ async fn read_item(
                     resolution,
                 )
             })
-            .await
+            .await?
         }
     };
     Ok(RasterChunk {
-        bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
+        bands: RasterBands::new(bands)?,
         bbox: req.bbox,
         resolution: req.resolution,
         crs: inner.crs,
@@ -1162,32 +1163,41 @@ async fn read_items(
 
 /// most-recent-first fill: each chunk patches the nodata the newer ones
 /// left
-fn fill_latest(mut merged: Option<RasterChunk>, chunks: Vec<RasterChunk>) -> Option<RasterChunk> {
+fn fill_latest(
+    mut merged: Option<RasterChunk>,
+    chunks: Vec<RasterChunk>,
+) -> Result<Option<RasterChunk>> {
     for chunk in chunks {
         match &mut merged {
             None => merged = Some(chunk),
             Some(out) => {
-                for (bi, src) in chunk.bands.bands().iter().enumerate() {
-                    let dst = out.bands.band_mut(bi).expect("equal band counts");
-                    for (o, v) in dst.data_mut().iter_mut().zip(src.data()) {
-                        if o.is_nan() {
-                            *o = *v;
-                        }
-                    }
-                }
+                let (cols, rows) = (out.width(), out.height());
+                let filled = out
+                    .bands
+                    .bands()
+                    .iter()
+                    .zip(chunk.bands.bands())
+                    .map(|(newer, older)| {
+                        gathered(&[newer, older], cols, rows, newer.cell_size(), |index| {
+                            Some((usize::from(newer.is_absent(index)), index))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                out.bands = RasterBands::new(filled)?;
             }
         }
     }
-    merged
+    Ok(merged)
 }
 
 /// a pixel is complete only when every band has a value there
 fn complete(chunk: &RasterChunk) -> bool {
+    let cells = chunk.width() * chunk.height();
     !chunk
         .bands
         .bands()
         .iter()
-        .any(|b| b.data().iter().any(|v| v.is_nan()))
+        .any(|band| (0..cells).any(|index| band.is_absent(index)))
 }
 
 /// the fill walks in waves so the early exit survives parallel reads: it
@@ -1200,7 +1210,7 @@ async fn latest_window(
     let mut merged: Option<RasterChunk> = None;
     for wave in items.chunks(MAX_PARALLEL_ITEM_READS) {
         let chunks = read_items(inner, wave, req, &req.bbox).await?;
-        merged = crate::engine::offload(move || fill_latest(merged, chunks)).await;
+        merged = crate::engine::offload(move || fill_latest(merged, chunks)).await?;
         if merged.as_ref().is_some_and(complete) {
             break;
         }
@@ -1221,10 +1231,11 @@ fn reduce_chunks(
     let (cols, rows) = (chunks[0].width(), chunks[0].height());
     let mut planes = Vec::with_capacity(usize::from(bands));
     for bi in 0..usize::from(bands) {
-        let stack: Vec<&[f64]> = chunks
+        let widened: Vec<_> = chunks
             .iter()
-            .map(|c| c.bands.band(bi).expect("equal band counts").data())
+            .map(|c| c.bands.band(bi).expect("equal band counts").to_raster())
             .collect();
+        let stack: Vec<&[f64]> = widened.iter().map(|raster| raster.data()).collect();
         let mut values = Vec::with_capacity(stack.len());
         let mut data = Vec::with_capacity(cols * rows);
         for p in 0..cols * rows {
@@ -1238,7 +1249,7 @@ fn reduce_chunks(
         );
     }
     Ok(RasterChunk {
-        bands: terrano_core::BandedRaster::new(planes).map_err(Error::Terrano)?,
+        bands: RasterBands::from_rasters(planes)?,
         bbox: req.bbox,
         resolution: req.resolution,
         crs,
@@ -1291,19 +1302,26 @@ fn join_strips(
     crs: Crs,
 ) -> Result<RasterChunk> {
     let cols = parts[0].width();
-    let rows = parts.iter().map(|p| p.height()).sum();
+    let part_rows: Vec<(usize, usize)> = parts
+        .iter()
+        .enumerate()
+        .flat_map(|(k, part)| (0..part.height()).map(move |row| (k, row)))
+        .collect();
+    let rows = part_rows.len();
     let planes = (0..usize::from(bands))
         .map(|bi| {
-            let mut data = Vec::with_capacity(cols * rows);
-            for part in &parts {
-                data.extend_from_slice(part.bands.band(bi).expect("equal band counts").data());
-            }
-            terrano_core::Raster::from_vec(cols, rows, data, req.resolution, f64::NAN)
+            let strips: Vec<_> = parts
+                .iter()
+                .map(|part| part.bands.band(bi).expect("equal band counts"))
+                .collect();
+            gathered(&strips, cols, rows, req.resolution, |index| {
+                let (k, row) = part_rows[index / cols];
+                Some((k, row * cols + index % cols))
+            })
         })
-        .collect::<core::result::Result<Vec<_>, _>>()
-        .map_err(Error::Terrano)?;
+        .collect::<Result<Vec<_>>>()?;
     Ok(RasterChunk {
-        bands: terrano_core::BandedRaster::new(planes).map_err(Error::Terrano)?,
+        bands: RasterBands::new(planes)?,
         bbox: req.bbox,
         resolution: req.resolution,
         crs,
@@ -1462,6 +1480,7 @@ impl WindowFold {
     /// pixel no item had a value at stays nodata, count included
     fn absorb(&mut self, chunk: &RasterChunk) {
         for (plane, band) in self.planes.iter_mut().zip(chunk.bands.bands()) {
+            let band = band.to_raster();
             for (pixel, value) in plane.iter_mut().zip(band.data()) {
                 if value.is_finite() {
                     pixel.absorb(*value, self.op);
@@ -1481,7 +1500,7 @@ impl WindowFold {
             .collect::<core::result::Result<Vec<_>, _>>()
             .map_err(Error::Terrano)?;
         Ok(RasterChunk {
-            bands: terrano_core::BandedRaster::new(planes).map_err(Error::Terrano)?,
+            bands: RasterBands::from_rasters(planes)?,
             bbox: req.bbox,
             resolution: req.resolution,
             crs,
@@ -1592,7 +1611,7 @@ impl Source for StacSrc {
 
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
-            dtype: SetField::one(Dtype::F64),
+            dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
             bands: SetField::one(self.bands),
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.inner.base_resolution),
@@ -1800,7 +1819,7 @@ mod fold_tests {
                     })
                     .collect();
                 RasterChunk {
-                    bands: terrano_core::BandedRaster::new(planes).unwrap(),
+                    bands: RasterBands::from_rasters(planes).unwrap(),
                     bbox: FOLD_REQ.bbox,
                     resolution: FOLD_RES,
                     crs: Crs::WGS84,
@@ -1820,7 +1839,9 @@ mod fold_tests {
     fn assert_matches(stacked: &RasterChunk, folded: &RasterChunk, tolerance: f64, what: &str) {
         let (mut covered, mut bare) = (0, 0);
         for (bi, band) in stacked.bands.bands().iter().enumerate() {
-            let got = folded.bands.band(bi).unwrap().data();
+            let got = folded.bands.band(bi).unwrap().to_raster();
+            let got = got.data();
+            let band = band.to_raster();
             for (pixel, want) in band.data().iter().enumerate() {
                 let got = got[pixel];
                 if want.is_nan() {

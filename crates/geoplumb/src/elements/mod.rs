@@ -1,5 +1,6 @@
 pub mod algebra;
 pub mod band_math;
+pub mod cast;
 pub mod cog;
 pub mod copc;
 #[cfg(feature = "gdal")]
@@ -29,6 +30,7 @@ pub use self::gdal::GdalSrc;
 pub use self::wgpu::{Download, Upload, WgpuConvolve};
 pub use algebra::{Combine, MapAlgebra};
 pub use band_math::BandMath;
+pub use cast::Cast;
 pub use cog::{CogSrc, HttpRange};
 pub use copc::{CopcHttpRange, CopcSrc};
 pub use gpkg::GpkgSrc;
@@ -45,9 +47,8 @@ pub use vec_ops::{VecClip, VecFilter, VecSchema};
 pub use vector::{Burn, Rasterize, VecSrc};
 pub use viewshed::Viewshed;
 
-/// adapters every graph starts with, see `Graph::register_adapter`
 pub(crate) fn default_adapters() -> Vec<crate::element::Adapter> {
-    vec![Reproject::adapter()]
+    vec![Reproject::adapter(), Cast::adapter()]
 }
 pub use terrain::{Aspect, Hillshade, Slope};
 pub mod mask;

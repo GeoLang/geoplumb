@@ -119,7 +119,7 @@ async fn every_op_matches_the_hand_computed_window() {
             );
             assert_eq!((got.width(), got.height()), (cols, rows));
             for band in 0..BANDS {
-                let plane = got.bands.band(band).unwrap();
+                let plane = got.bands.band(band).unwrap().to_raster();
                 for row in 0..rows {
                     for col in 0..cols {
                         let want = reference(op, radius, band, px0 + col, py0 + row);
@@ -152,7 +152,7 @@ async fn a_nodata_neighbour_drops_out_and_a_nodata_centre_holds() {
     .await;
 
     let cell = |band: usize, col: usize, row: usize| {
-        got.bands.band(band).unwrap().data()[(row - py0) * cols + (col - px0)]
+        got.bands.band(band).unwrap().to_raster().data()[(row - py0) * cols + (col - px0)]
     };
     assert!(
         cell(0, hole_x, hole_y).is_nan(),
@@ -199,7 +199,7 @@ async fn an_all_nodata_window_comes_back_nodata() {
     )
     .await;
 
-    let plane = got.bands.band(0).unwrap();
+    let plane = got.bands.band(0).unwrap().to_raster();
     let cell = |col: usize, row: usize| plane.data()[(row - py0) * cols + (col - px0)];
     assert!(
         cell(block_x, block_y).is_nan(),
@@ -271,6 +271,7 @@ async fn chunked_pull_matches_the_whole_window() {
         c.bands
             .band(band)
             .unwrap()
+            .to_raster()
             .data()
             .iter()
             .map(|v| v.to_bits())

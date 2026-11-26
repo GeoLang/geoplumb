@@ -5,12 +5,13 @@
 //! grid, so the engine's outward alignment adds nothing and radius cells of
 //! halo is exactly enough
 
-use crate::caps::{CapsSet, Constraint, ValueKind};
+use crate::bands::RasterBands;
+use crate::caps::{CapsSet, Constraint, Dtype, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::window::{Bbox, WindowReq};
-use terrano_core::{BandedRaster, FocalStat, Neighborhood, focal_stats};
+use terrano_core::{FocalStat, Neighborhood, focal_stats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocalOp {
@@ -56,7 +57,11 @@ impl Transform for Focal {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::pinned_value_kind(CapsSet::any_raster(), ValueKind::Continuous)
+        Constraint::pinned_value_kind_and_dtype(
+            CapsSet::any_raster(),
+            ValueKind::Continuous,
+            Dtype::F64,
+        )
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
@@ -75,7 +80,7 @@ impl Transform for Focal {
             .iter()
             .map(|band| {
                 focal_stats(
-                    band,
+                    &band.to_raster(),
                     self.radius as usize,
                     Neighborhood::Square,
                     self.op.into(),
@@ -83,7 +88,7 @@ impl Transform for Focal {
             })
             .collect();
         let full = RasterChunk {
-            bands: BandedRaster::new(bands).map_err(Error::Terrano)?,
+            bands: RasterBands::from_rasters(bands)?,
             bbox: input.bbox,
             resolution: input.resolution,
             crs: input.crs,

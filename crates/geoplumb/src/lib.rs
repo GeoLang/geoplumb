@@ -6,6 +6,7 @@
 //! chunks flow back, cached and coalesced per node. batch is a full-extent
 //! pull, live is invalidation plus re-pull. see DESIGN.md
 
+pub mod bands;
 pub mod caps;
 pub mod chunk;
 pub mod element;
@@ -24,6 +25,7 @@ pub mod tile;
 pub mod window;
 pub mod zonal;
 
+pub use bands::RasterBands;
 pub use caps::{Caps, CapsSet, Constraint, Crs};
 pub use chunk::{Chunk, PointChunk, RasterChunk, TensorChunk, VectorChunk, VectorFeature};
 pub use element::{Adapter, Fanin, Source, Transform};

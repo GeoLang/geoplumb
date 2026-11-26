@@ -229,7 +229,10 @@ async fn wgpu_convolve_matches_the_cpu_convolve() {
 
     let mut nan_cells = 0;
     for c in 0..CHANNELS {
-        let (a, b) = (got.bands.band(c).unwrap(), want.bands.band(c).unwrap());
+        let (a, b) = (
+            got.bands.band(c).unwrap().to_raster(),
+            want.bands.band(c).unwrap().to_raster(),
+        );
         for (i, (x, y)) in a.data().iter().zip(b.data()).enumerate() {
             assert!(
                 (x - y).abs() < 1e-5 || (x.is_nan() && y.is_nan()),
@@ -339,7 +342,10 @@ async fn an_oversized_dispatch_fails_its_own_pull() {
         .into_raster()
         .unwrap();
     for c in 0..CHANNELS {
-        let (a, b) = (got.bands.band(c).unwrap(), want.bands.band(c).unwrap());
+        let (a, b) = (
+            got.bands.band(c).unwrap().to_raster(),
+            want.bands.band(c).unwrap().to_raster(),
+        );
         for (i, (x, y)) in a.data().iter().zip(b.data()).enumerate() {
             assert!(
                 (x - y).abs() < 1e-5,

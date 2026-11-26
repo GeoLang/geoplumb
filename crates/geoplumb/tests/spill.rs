@@ -150,9 +150,10 @@ fn assert_same(a: &geoplumb::RasterChunk, b: &geoplumb::RasterChunk) {
         .bands
         .band(0)
         .unwrap()
+        .to_raster()
         .data()
         .iter()
-        .zip(b.bands.band(0).unwrap().data())
+        .zip(b.bands.band(0).unwrap().to_raster().data())
     {
         assert!(
             (x.is_nan() && y.is_nan()) || x == y,

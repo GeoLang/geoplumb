@@ -170,6 +170,7 @@ fn assert_bands_close(a: &geoplumb::RasterChunk, b: &geoplumb::RasterChunk, tol:
     assert_eq!(a.height(), b.height());
     assert_eq!(a.bands.band_count(), b.bands.band_count());
     for (bi, (ba, bb)) in a.bands.bands().iter().zip(b.bands.bands()).enumerate() {
+        let (ba, bb) = (ba.to_raster(), bb.to_raster());
         for (i, (x, y)) in ba.data().iter().zip(bb.data()).enumerate() {
             if x.is_nan() && y.is_nan() {
                 continue;
@@ -320,7 +321,7 @@ async fn window_outside_the_file_pads_nan() {
         time: None,
     };
     let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
-    let band = chunk.bands.band(0).unwrap();
+    let band = chunk.bands.band(0).unwrap().to_raster();
     assert_eq!(band.width(), 80);
     assert!(band.data()[0].is_nan(), "outside pixel not nan");
     assert!(band.data()[45 * 80 + 45].is_finite(), "inside pixel nan");
@@ -556,6 +557,7 @@ async fn multi_band_window_outside_the_file_pads_every_band() {
     let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
     assert_eq!(chunk.bands.band_count(), BANDS);
     for (bi, band) in chunk.bands.bands().iter().enumerate() {
+        let band = band.to_raster();
         assert_eq!(band.width(), 80);
         assert!(band.data()[0].is_nan(), "band {bi} outside pixel not nan");
         let got = band.data()[45 * 80 + 45];
@@ -624,8 +626,10 @@ async fn reproject_keeps_every_band() {
     };
     let chunk = engine.pull(rp, req).await.unwrap().into_raster().unwrap();
     assert_eq!(chunk.bands.band_count(), BANDS);
-    let b0 = chunk.bands.band(0).unwrap().data();
+    let b0 = chunk.bands.band(0).unwrap().to_raster();
+    let b0 = b0.data();
     for (bi, band) in chunk.bands.bands().iter().enumerate().skip(1) {
+        let band = band.to_raster();
         let mut compared = 0;
         for (a, b) in b0.iter().zip(band.data()) {
             if a.is_finite() && b.is_finite() {

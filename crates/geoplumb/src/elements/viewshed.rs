@@ -1,11 +1,12 @@
-use crate::caps::{BandKinds, Caps, Constraint, ValueKind};
+use crate::bands::RasterBands;
+use crate::caps::{BandKinds, Caps, Constraint, Dtype, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::elements::raster_vector::one_band;
 use crate::error::{Error, Result};
 use crate::resample::resample_to_grid;
 use crate::window::{Bbox, WindowReq};
-use terrano_core::{BandedRaster, viewshed};
+use terrano_core::viewshed;
 
 pub struct Viewshed {
     pub observer_x: f64,
@@ -23,7 +24,11 @@ impl Transform for Viewshed {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::pinned_value_kind(one_band(ValueKind::Continuous), ValueKind::Categorical)
+        Constraint::pinned_value_kind_and_dtype(
+            one_band(ValueKind::Continuous),
+            ValueKind::Categorical,
+            Dtype::F64,
+        )
     }
 
     fn configure(&mut self, _input: &Caps, _output: &Caps) -> Result<()> {
@@ -60,14 +65,15 @@ impl Transform for Viewshed {
         let dem = input
             .bands
             .band(0)
-            .ok_or(Error::Source("empty input chunk".into()))?;
+            .ok_or(Error::Source("empty input chunk".into()))?
+            .to_raster();
         let columns = (out.bbox.width() / out.resolution).round() as usize;
         let rows = (out.bbox.height() / out.resolution).round() as usize;
         let column = ((self.observer_x - input.bbox.min_x) / input.resolution).floor() as usize;
         let row = ((input.bbox.max_y - self.observer_y) / input.resolution).floor() as usize;
-        let seen = viewshed(dem, row, column, self.observer_height, self.radius);
+        let seen = viewshed(&dem, row, column, self.observer_height, self.radius);
         let disc = RasterChunk {
-            bands: BandedRaster::new(vec![seen]).expect("one band"),
+            bands: RasterBands::from_rasters(vec![seen]).expect("one band"),
             bbox: input.bbox,
             resolution: input.resolution,
             crs: input.crs,

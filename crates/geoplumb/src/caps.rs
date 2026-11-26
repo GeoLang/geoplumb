@@ -4,6 +4,8 @@
 
 use std::fmt;
 
+use terrano_core::{SampleFormat, TypedBand};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub struct Crs(pub u32);
 
@@ -24,7 +26,72 @@ impl fmt::Display for Crs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub enum Dtype {
+    U8 { nodata: Option<u8> },
+    I8 { nodata: Option<i8> },
+    U16 { nodata: Option<u16> },
+    I16 { nodata: Option<i16> },
+    U32 { nodata: Option<u32> },
+    I32 { nodata: Option<i32> },
+    F32,
     F64,
+}
+
+impl Dtype {
+    pub fn of(band: &TypedBand) -> Dtype {
+        match band {
+            TypedBand::U8 { nodata, .. } => Dtype::U8 { nodata: *nodata },
+            TypedBand::I8 { nodata, .. } => Dtype::I8 { nodata: *nodata },
+            TypedBand::U16 { nodata, .. } => Dtype::U16 { nodata: *nodata },
+            TypedBand::I16 { nodata, .. } => Dtype::I16 { nodata: *nodata },
+            TypedBand::U32 { nodata, .. } => Dtype::U32 { nodata: *nodata },
+            TypedBand::I32 { nodata, .. } => Dtype::I32 { nodata: *nodata },
+            TypedBand::F32(_) => Dtype::F32,
+            TypedBand::F64(_) => Dtype::F64,
+        }
+    }
+
+    pub fn format(&self) -> SampleFormat {
+        match self {
+            Dtype::U8 { .. } => SampleFormat::U8,
+            Dtype::I8 { .. } => SampleFormat::I8,
+            Dtype::U16 { .. } => SampleFormat::U16,
+            Dtype::I16 { .. } => SampleFormat::I16,
+            Dtype::U32 { .. } => SampleFormat::U32,
+            Dtype::I32 { .. } => SampleFormat::I32,
+            Dtype::F32 => SampleFormat::F32,
+            Dtype::F64 => SampleFormat::F64,
+        }
+    }
+
+    pub fn integer_nodata(&self) -> Option<f64> {
+        match *self {
+            Dtype::U8 { nodata } => nodata.map(f64::from),
+            Dtype::I8 { nodata } => nodata.map(f64::from),
+            Dtype::U16 { nodata } => nodata.map(f64::from),
+            Dtype::I16 { nodata } => nodata.map(f64::from),
+            Dtype::U32 { nodata } => nodata.map(f64::from),
+            Dtype::I32 { nodata } => nodata.map(f64::from),
+            Dtype::F32 | Dtype::F64 => None,
+        }
+    }
+
+    pub fn marks_absent_cells(&self) -> bool {
+        self.format().integer_range().is_none() || self.integer_nodata().is_some()
+    }
+
+    pub fn widens_losslessly_to(&self, wider: Dtype) -> bool {
+        use SampleFormat::*;
+        let formats = (self.format(), wider.format());
+        let integer_pair = matches!(
+            formats,
+            (U8, U16 | I16 | U32 | I32) | (I8, I16 | I32) | (U16, U32 | I32) | (I16, I32)
+        );
+        let float_target = matches!(
+            formats,
+            (U8 | I8 | U16 | I16, F32) | (U8 | I8 | U16 | I16 | U32 | I32 | F32, F64)
+        );
+        float_target || (integer_pair && self.integer_nodata() == wider.integer_nodata())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
@@ -34,27 +101,30 @@ pub enum ValueKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
-pub struct BandKinds(Vec<ValueKind>);
+pub struct PerBand<T>(Vec<T>);
 
-impl From<ValueKind> for BandKinds {
-    fn from(every_band: ValueKind) -> BandKinds {
-        BandKinds(vec![every_band])
+pub type BandKinds = PerBand<ValueKind>;
+pub type BandDtypes = PerBand<Dtype>;
+
+impl<T> From<T> for PerBand<T> {
+    fn from(every_band: T) -> PerBand<T> {
+        PerBand(vec![every_band])
     }
 }
 
-impl BandKinds {
-    pub fn per_band(kinds: Vec<ValueKind>) -> BandKinds {
-        let first = *kinds.first().expect("a raster has at least one band");
-        if kinds.iter().all(|kind| *kind == first) {
-            return BandKinds::from(first);
+impl<T: Copy + PartialEq> PerBand<T> {
+    pub fn from_bands(values: Vec<T>) -> PerBand<T> {
+        let first = *values.first().expect("a raster has at least one band");
+        if values.iter().all(|value| *value == first) {
+            return PerBand::from(first);
         }
-        BandKinds(kinds)
+        PerBand(values)
     }
 
-    pub fn band(&self, band: usize) -> ValueKind {
+    pub fn band(&self, band: usize) -> T {
         match self.0.as_slice() {
             [every_band] => *every_band,
-            kinds => kinds[band],
+            values => values[band],
         }
     }
 
@@ -157,10 +227,9 @@ impl ResRange {
     }
 }
 
-/// negotiation-time pattern over raster link caps
 #[derive(Debug, Clone, PartialEq)]
 pub struct RasterPattern {
-    pub dtype: SetField<Dtype>,
+    pub dtypes: SetField<BandDtypes>,
     pub bands: SetField<u16>,
     pub crs: SetField<Crs>,
     pub resolution: ResRange,
@@ -171,7 +240,7 @@ pub struct RasterPattern {
 impl Default for RasterPattern {
     fn default() -> Self {
         RasterPattern {
-            dtype: SetField::Any,
+            dtypes: SetField::Any,
             bands: SetField::Any,
             crs: SetField::Any,
             resolution: ResRange::ANY,
@@ -184,7 +253,7 @@ impl Default for RasterPattern {
 impl RasterPattern {
     pub fn intersect(&self, other: &Self) -> Self {
         RasterPattern {
-            dtype: self.dtype.intersect(&other.dtype),
+            dtypes: self.dtypes.intersect(&other.dtypes),
             bands: self.bands.intersect(&other.bands),
             crs: self.crs.intersect(&other.crs),
             resolution: self.resolution.intersect(&other.resolution),
@@ -194,7 +263,7 @@ impl RasterPattern {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.dtype.is_empty()
+        self.dtypes.is_empty()
             || self.bands.is_empty()
             || self.crs.is_empty()
             || self.resolution.is_empty()
@@ -374,7 +443,7 @@ impl CapsPattern {
     fn empty_fields(&self) -> Vec<&'static str> {
         let fields = match self {
             CapsPattern::Raster(r) => vec![
-                ("dtype", r.dtype.is_empty()),
+                ("dtypes", r.dtypes.is_empty()),
                 ("bands", r.bands.is_empty()),
                 ("crs", r.crs.is_empty()),
                 ("resolution", r.resolution.is_empty()),
@@ -553,7 +622,10 @@ impl CapsSet {
     pub fn fixate(&self) -> Option<Caps> {
         match self.alternatives.first()? {
             CapsPattern::Raster(first) => Some(Caps::Raster(RasterCaps {
-                dtype: first.dtype.fixate().unwrap_or(Dtype::F64),
+                dtypes: first
+                    .dtypes
+                    .fixate()
+                    .unwrap_or_else(|| BandDtypes::from(Dtype::F64)),
                 bands: first.bands.fixate().unwrap_or(1),
                 crs: first.crs.fixate()?,
                 resolution: first.resolution,
@@ -596,7 +668,7 @@ pub enum Caps {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RasterCaps {
-    pub dtype: Dtype,
+    pub dtypes: BandDtypes,
     pub bands: u16,
     pub crs: Crs,
     pub resolution: ResRange,
@@ -683,7 +755,7 @@ impl Caps {
     pub fn pattern(&self) -> CapsPattern {
         match self {
             Caps::Raster(r) => CapsPattern::Raster(RasterPattern {
-                dtype: SetField::one(r.dtype),
+                dtypes: SetField::one(r.dtypes.clone()),
                 bands: SetField::one(r.bands),
                 crs: SetField::one(r.crs),
                 resolution: r.resolution,
@@ -718,7 +790,7 @@ impl Caps {
         match self {
             Caps::Raster(r) => {
                 0u8.hash(&mut h);
-                r.dtype.hash(&mut h);
+                r.dtypes.hash(&mut h);
                 r.bands.hash(&mut h);
                 r.crs.hash(&mut h);
                 r.chunk_px.hash(&mut h);
@@ -755,15 +827,9 @@ impl Caps {
     }
 }
 
-/// fields a derived transform passes through unchanged, used for backward
-/// narrowing. dtype and value kind are raster fields and their bits are
-/// ignored when either side of a projection is another kind. bands is the
-/// plane count: across the raster and tensor kinds it couples bands to
-/// channels, and is ignored where a side has no plane count (points,
-/// vectors)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FieldMask {
-    pub dtype: bool,
+    pub dtypes: bool,
     pub bands: bool,
     pub crs: bool,
     pub resolution: bool,
@@ -773,7 +839,7 @@ pub struct FieldMask {
 
 impl FieldMask {
     pub const ALL: FieldMask = FieldMask {
-        dtype: true,
+        dtypes: true,
         bands: true,
         crs: true,
         resolution: true,
@@ -796,10 +862,10 @@ impl FieldMask {
 pub fn mask_project(from: &CapsPattern, onto: &CapsPattern, mask: FieldMask) -> CapsPattern {
     match (from, onto) {
         (CapsPattern::Raster(f), CapsPattern::Raster(o)) => CapsPattern::Raster(RasterPattern {
-            dtype: if mask.dtype {
-                o.dtype.intersect(&f.dtype)
+            dtypes: if mask.dtypes {
+                o.dtypes.intersect(&f.dtypes)
             } else {
-                o.dtype.clone()
+                o.dtypes.clone()
             },
             bands: if mask.bands {
                 o.bands.intersect(&f.bands)
@@ -896,15 +962,21 @@ fn union(sets: impl IntoIterator<Item = CapsSet>) -> CapsSet {
 }
 
 impl Constraint {
-    pub fn pinned_value_kind(input: CapsSet, value_kind: ValueKind) -> Constraint {
+    pub fn pinned_value_kind_and_dtype(
+        input: CapsSet,
+        value_kind: ValueKind,
+        dtype: Dtype,
+    ) -> Constraint {
         Constraint::Derived {
             input,
             passthrough: FieldMask {
                 value_kinds: false,
+                dtypes: false,
                 ..FieldMask::ALL
             },
             output: CapsPattern::Raster(RasterPattern {
                 value_kinds: SetField::one(BandKinds::from(value_kind)),
+                dtypes: SetField::one(BandDtypes::from(dtype)),
                 ..RasterPattern::default()
             }),
         }
@@ -919,7 +991,7 @@ impl Constraint {
                 |coupled, member| {
                     let member = member?;
                     Some(FieldMask {
-                        dtype: coupled.dtype || member.dtype,
+                        dtypes: coupled.dtypes || member.dtypes,
                         bands: coupled.bands || member.bands,
                         crs: coupled.crs || member.crs,
                         resolution: coupled.resolution || member.resolution,

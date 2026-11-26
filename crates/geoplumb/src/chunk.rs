@@ -5,13 +5,13 @@ use std::collections::HashMap;
 #[cfg(feature = "wgpu")]
 use std::sync::Arc;
 
+use crate::bands::{RasterBands, picked};
 use crate::caps::{Crs, Domain};
 use crate::error::{Error, Result};
 #[cfg(feature = "wgpu")]
 use crate::gpu::{GpuContext, WindowCopy};
 use crate::window::Bbox;
 use nubis_core::{Point3, PointCloud};
-use terrano_core::{BandedRaster, Raster};
 use topoi_core::geojson::FeatureGeometry;
 use topoi_core::{
     Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon, Ring,
@@ -20,7 +20,7 @@ use topoi_core::{
 
 #[derive(Debug, Clone)]
 pub struct RasterChunk {
-    pub bands: BandedRaster,
+    pub bands: RasterBands,
     pub bbox: Bbox,
     pub resolution: f64,
     pub crs: Crs,
@@ -590,10 +590,9 @@ impl RasterChunk {
     }
 
     pub fn byte_size(&self) -> usize {
-        self.bands.band_count() * self.width() * self.height() * size_of::<f64>()
+        self.bands.byte_size()
     }
 
-    /// crop to a bbox that must lie on this chunk's pixel grid
     pub fn crop_to(&self, bbox: &Bbox) -> RasterChunk {
         let res = self.resolution;
         let col0 = ((bbox.min_x - self.bbox.min_x) / res).round().max(0.0) as usize;
@@ -602,21 +601,19 @@ impl RasterChunk {
         let rows = (bbox.height() / res).round() as usize;
         let cols = cols.min(self.width().saturating_sub(col0));
         let rows = rows.min(self.height().saturating_sub(row0));
+        let width = self.width();
         let bands = self
             .bands
             .bands()
             .iter()
-            .map(|b| {
-                let mut out = Vec::with_capacity(cols * rows);
-                for r in 0..rows {
-                    let src = (row0 + r) * self.width() + col0;
-                    out.extend_from_slice(&b.data()[src..src + cols]);
-                }
-                Raster::from_vec(cols, rows, out, res, b.nodata).expect("crop dims consistent")
+            .map(|band| {
+                picked(band, cols, rows, res, |index| {
+                    Some((row0 + index / cols) * width + col0 + index % cols)
+                })
             })
             .collect();
         RasterChunk {
-            bands: BandedRaster::new(bands).expect("uniform crop"),
+            bands: RasterBands::new(bands).expect("uniform crop"),
             bbox: Bbox {
                 min_x: self.bbox.min_x + col0 as f64 * res,
                 max_y: self.bbox.max_y - row0 as f64 * res,

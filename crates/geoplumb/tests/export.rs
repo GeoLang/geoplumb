@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::future::BoxFuture;
 use geoplumb::caps::{
-    BandKinds, CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField,
-    ValueKind,
+    BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange,
+    SetField, ValueKind,
 };
 use geoplumb::element::Source;
 use geoplumb::elements::{RasterSrc, Slope};
@@ -190,7 +190,7 @@ async fn the_base_level_is_the_engine_pull_resampled_onto_the_grid() {
     let expected = engine_at(&engine, node, export_grid(), ValueKind::Continuous).await;
     assert_same_pixels(
         &written_level(&bytes, 0).bands()[0],
-        &expected.bands.bands()[0],
+        &expected.bands.bands()[0].to_raster(),
         "base level",
     );
 }
@@ -214,7 +214,7 @@ async fn every_overview_is_pulled_from_the_engine_at_its_own_resolution() {
         .await;
         assert_same_pixels(
             &written_level(&bytes, level).bands()[0],
-            &expected.bands.bands()[0],
+            &expected.bands.bands()[0].to_raster(),
             &format!("level {level}"),
         );
     }
@@ -265,7 +265,7 @@ async fn a_categorical_export_holds_only_codes_at_every_level() {
         .await;
         assert_same_pixels(
             &written.bands()[0],
-            &expected.bands.bands()[0],
+            &expected.bands.bands()[0].to_raster(),
             &format!("level {level}"),
         );
     }
@@ -374,7 +374,7 @@ async fn a_grid_off_the_tile_size_keeps_the_pixels_of_its_edge_tiles() {
     let expected = engine_at(&engine, node, corner, ValueKind::Categorical).await;
     assert_same_pixels(
         &written.bands()[0],
-        &expected.bands.bands()[0],
+        &expected.bands.bands()[0].to_raster(),
         "corner tile",
     );
 }
@@ -393,7 +393,7 @@ impl Source for GatedSrc {
 
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
-            dtype: SetField::one(Dtype::F64),
+            dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
             bands: SetField::one(1),
             crs: SetField::one(UTM_32N),
             resolution: ResRange::at_least(CELL),

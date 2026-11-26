@@ -76,7 +76,7 @@ async fn pull_aspect(source: RasterSrc) -> Vec<f64> {
         .unwrap()
         .into_raster()
         .unwrap();
-    let band = chunk.bands.band(0).unwrap();
+    let band = chunk.bands.band(0).unwrap().to_raster();
     assert_eq!((band.width(), band.height()), (COLS, ROWS));
     band.data().to_vec()
 }

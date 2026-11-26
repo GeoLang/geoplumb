@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use crate::bands::{RasterBands, decoded_band, encoded_band};
 use crate::caps::Crs;
 use crate::chunk::{
     Chunk, PointChunk, RasterChunk, TensorChunk, TensorData, VectorChunk, VectorFeature,
@@ -15,14 +16,14 @@ use crate::chunk::{
 use crate::error::{Error, Result};
 use crate::window::{Bbox, ChunkKey, TimeInterval};
 use nubis_core::{Classification, Point3, PointCloud};
-use terrano_core::{BandedRaster, Raster};
+use terrano_core::SampleFormat;
 use topoi_core::geojson::FeatureGeometry;
 use topoi_core::{
     Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon, Ring,
 };
 
 const MAGIC: u32 = 0x47504C43;
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const KIND_RASTER: u8 = 0;
 const KIND_POINTS: u8 = 1;
 const KIND_VECTOR: u8 = 2;
@@ -184,10 +185,8 @@ fn write_chunk_file(path: &Path, chunk: &Chunk) -> Result<()> {
             f.write_all(&rows.to_le_bytes()).map_err(io)?;
             write_geo(&mut f, chunk.resolution, &chunk.bbox, chunk.crs).map_err(io)?;
             for band in chunk.bands.bands() {
-                f.write_all(&band.nodata.to_le_bytes()).map_err(io)?;
-                for v in band.data() {
-                    f.write_all(&v.to_le_bytes()).map_err(io)?;
-                }
+                f.write_all(&[format_tag(band.format())]).map_err(io)?;
+                f.write_all(&encoded_band(band)).map_err(io)?;
             }
         }
         Chunk::PointCloud(chunk) => {
@@ -306,6 +305,11 @@ pub(crate) fn write_geometry(
     }
 }
 
+fn format_tag(format: SampleFormat) -> u8 {
+    let position = SampleFormat::ALL.iter().position(|known| *known == format);
+    position.expect("SampleFormat::ALL lists every format") as u8
+}
+
 fn write_geo(f: &mut impl Write, resolution: f64, bbox: &Bbox, crs: Crs) -> std::io::Result<()> {
     f.write_all(&resolution.to_le_bytes())?;
     for v in [bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y] {
@@ -362,22 +366,27 @@ pub(crate) fn read_chunk(path: &Path) -> Result<Chunk> {
             }
             let mut bands = Vec::with_capacity(band_count);
             for _ in 0..band_count {
-                let nodata = rd_f64(&mut f).map_err(io)?;
-                let mut raw = vec![0u8; cols * rows * 8];
-                f.read_exact(&mut raw).map_err(io)?;
-                let data: Vec<f64> = raw
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|c| f64::from_le_bytes(*c))
-                    .collect();
-                bands.push(
-                    Raster::from_vec(cols, rows, data, resolution, nodata)
-                        .map_err(Error::Terrano)?,
-                );
+                let tag = rd::<1>(&mut f).map_err(io)?[0];
+                let format = *SampleFormat::ALL
+                    .get(usize::from(tag))
+                    .ok_or(bad("sample format"))?;
+                let sample_bytes = format.bytes() as usize;
+                let has_nodata = rd::<1>(&mut f).map_err(io)?[0] != 0;
+                let mut nodata = vec![0u8; sample_bytes];
+                f.read_exact(&mut nodata).map_err(io)?;
+                let mut samples = vec![0u8; cols * rows * sample_bytes];
+                f.read_exact(&mut samples).map_err(io)?;
+                bands.push(decoded_band(
+                    format,
+                    has_nodata.then_some(nodata.as_slice()),
+                    &samples,
+                    cols,
+                    rows,
+                    resolution,
+                ));
             }
             Ok(Chunk::Raster(RasterChunk {
-                bands: BandedRaster::new(bands).map_err(Error::Terrano)?,
+                bands: RasterBands::new(bands)?,
                 bbox,
                 resolution,
                 crs,
@@ -540,6 +549,8 @@ fn read_geometry(f: &mut impl Read) -> std::io::Result<Option<FeatureGeometry>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::caps::Dtype;
+    use terrano_core::TypedBand;
 
     #[test]
     fn fnv1a_matches_the_reference_vectors() {
@@ -559,5 +570,78 @@ mod tests {
         assert_eq!(parse_chunk_file_name(&name), Some((4, key)));
         assert_eq!(parse_chunk_file_name("04_3_-2_7.bin"), None);
         assert_eq!(parse_chunk_file_name("4_3_-2_7.123-0.tmp"), None);
+    }
+
+    fn grid<T>(values: Vec<T>) -> terrano_core::SampleGrid<T> {
+        terrano_core::SampleGrid::new(3, 2, 0.5, values).unwrap()
+    }
+
+    fn typed_chunk() -> RasterChunk {
+        let bands = vec![
+            TypedBand::U8 {
+                samples: grid(vec![0u8, 1, 2, 3, 4, 255]),
+                nodata: Some(0),
+            },
+            TypedBand::I16 {
+                samples: grid(vec![-32768i16, -1, 0, 1, 32767, 7]),
+                nodata: None,
+            },
+            TypedBand::F32(grid(vec![1.5f32, f32::NAN, -0.25, 0.0, 3.0, 1e-3])),
+            TypedBand::F64(
+                terrano_core::Raster::from_vec(
+                    3,
+                    2,
+                    vec![2.5, -9999.0, f64::NAN, 0.0, 1.0, 2.0],
+                    0.5,
+                    -9999.0,
+                )
+                .unwrap(),
+            ),
+        ];
+        RasterChunk {
+            bands: RasterBands::new(bands).unwrap(),
+            bbox: Bbox::new(10.0, 20.0, 11.5, 21.0),
+            resolution: 0.5,
+            crs: Crs(32632),
+        }
+    }
+
+    #[test]
+    fn typed_raster_chunks_round_trip_through_a_spill_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0_0_0_0.bin");
+        let chunk = typed_chunk();
+        write_chunk(&path, &Chunk::Raster(chunk.clone())).unwrap();
+        let back = read_chunk(&path).unwrap().into_raster().unwrap();
+
+        assert_eq!(
+            (back.bbox, back.resolution, back.crs),
+            (chunk.bbox, 0.5, chunk.crs)
+        );
+        assert_eq!(back.byte_size(), chunk.byte_size());
+        for (written, read) in chunk.bands.bands().iter().zip(back.bands.bands()) {
+            assert_eq!(Dtype::of(read), Dtype::of(written));
+            let (written, read) = (written.to_raster(), read.to_raster());
+            assert_eq!(read.nodata.to_bits(), written.nodata.to_bits());
+            for (got, want) in read.data().iter().zip(written.data()) {
+                assert!(got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()));
+            }
+        }
+        let TypedBand::U8 { samples, .. } = back.bands.band(0).unwrap() else {
+            panic!("the u8 band came back as another format");
+        };
+        assert_eq!(samples.values(), &[0, 1, 2, 3, 4, 255]);
+    }
+
+    #[test]
+    fn a_version_two_spill_file_fails_the_version_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0_0_0_0.bin");
+        let mut bytes = MAGIC.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.push(KIND_RASTER);
+        std::fs::write(&path, bytes).unwrap();
+        let error = read_chunk(&path).expect_err("an old file");
+        assert!(error.to_string().contains("version"), "{error}");
     }
 }

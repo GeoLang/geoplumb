@@ -86,11 +86,11 @@ async fn pull(engine: &Engine, node: NodeId, bbox: Bbox, resolution: f64) -> Ras
         .unwrap()
 }
 
-fn band(chunk: &RasterChunk, index: usize) -> &[f64] {
-    chunk.bands.band(index).unwrap().data()
+fn band(chunk: &RasterChunk, index: usize) -> Vec<f64> {
+    chunk.bands.band(index).unwrap().to_raster().data().to_vec()
 }
 
-fn values(chunk: &RasterChunk) -> &[f64] {
+fn values(chunk: &RasterChunk) -> Vec<f64> {
     band(chunk, 0)
 }
 
@@ -103,7 +103,7 @@ fn off_code_in(values: &[f64], codes: &[f64]) -> Vec<f64> {
 }
 
 fn off_code(chunk: &RasterChunk, codes: &[f64]) -> Vec<f64> {
-    off_code_in(values(chunk), codes)
+    off_code_in(&values(chunk), codes)
 }
 
 fn tile_of(z: u8, lon: f64, lat: f64) -> XyzTile {
@@ -210,7 +210,7 @@ async fn cog_src_decimates_categories_by_mode() {
     let reference = pull(&engine, node, bbox, resolution).await;
     for (i, (a, b)) in values(&categorical)
         .iter()
-        .zip(values(&reference))
+        .zip(&values(&reference))
         .enumerate()
     {
         assert!(
@@ -442,7 +442,7 @@ fn banded_src(bands: Vec<Raster>, shift: f64, value_kinds: BandKinds) -> RasterS
 }
 
 fn reflectance_and_classes() -> BandKinds {
-    BandKinds::per_band(vec![ValueKind::Continuous, ValueKind::Categorical])
+    BandKinds::from_bands(vec![ValueKind::Continuous, ValueKind::Categorical])
 }
 
 fn two_band_src(value_kinds: BandKinds) -> RasterSrc {
@@ -467,7 +467,7 @@ fn bits(values: &[f64]) -> Vec<u64> {
 
 #[test]
 fn band_kinds_shared_by_every_band_equal_the_single_kind() {
-    let both_categorical = BandKinds::per_band(vec![ValueKind::Categorical; 2]);
+    let both_categorical = BandKinds::from_bands(vec![ValueKind::Categorical; 2]);
     assert_eq!(both_categorical, BandKinds::from(ValueKind::Categorical));
     assert_eq!(both_categorical.band(1), ValueKind::Categorical);
     let mixed = reflectance_and_classes();
@@ -488,22 +488,22 @@ async fn a_two_band_source_decimates_each_band_by_its_own_kind() {
 
     let (kinds, mixed) = decimated(two_band_src(reflectance_and_classes())).await;
     assert_eq!(kinds, reflectance_and_classes());
-    assert_eq!(off_code_in(band(&mixed, 1), &CODES), Vec::<f64>::new());
+    assert_eq!(off_code_in(&band(&mixed, 1), &CODES), Vec::<f64>::new());
     assert!(band(&mixed, 1).iter().any(|v| !v.is_nan()));
     let (_, reference) = decimated(reflectance_src()).await;
-    assert_eq!(bits(band(&mixed, 0)), bits(band(&reference, 0)));
+    assert_eq!(bits(&band(&mixed, 0)), bits(&band(&reference, 0)));
 
     let (_, every_band_continuous) =
         decimated(two_band_src(BandKinds::from(ValueKind::Continuous))).await;
     assert!(
-        !off_code_in(band(&every_band_continuous, 1), &CODES).is_empty(),
+        !off_code_in(&band(&every_band_continuous, 1), &CODES).is_empty(),
         "no block of the fixture mixes codes"
     );
     let (_, every_band_categorical) =
         decimated(two_band_src(BandKinds::from(ValueKind::Categorical))).await;
     assert_ne!(
-        bits(band(&every_band_categorical, 0)),
-        bits(band(&reference, 0))
+        bits(&band(&every_band_categorical, 0)),
+        bits(&band(&reference, 0))
     );
 }
 
@@ -527,23 +527,26 @@ async fn a_two_band_warp_samples_each_band_by_its_own_kind() {
     let (warped, rendered) = render(two_band_src(reflectance_and_classes())).await;
     let (warped_reference, rendered_reference) = render(reflectance_src()).await;
     for chunk in [&warped, &rendered] {
-        assert_eq!(off_code_in(band(chunk, 1), &CODES), Vec::<f64>::new());
+        assert_eq!(off_code_in(&band(chunk, 1), &CODES), Vec::<f64>::new());
         assert!(
             band(chunk, 1).iter().any(|v| !v.is_nan()),
             "the tile missed the class map"
         );
     }
-    assert_eq!(bits(band(&warped, 0)), bits(band(&warped_reference, 0)));
-    assert_eq!(bits(band(&rendered, 0)), bits(band(&rendered_reference, 0)));
+    assert_eq!(bits(&band(&warped, 0)), bits(&band(&warped_reference, 0)));
+    assert_eq!(
+        bits(&band(&rendered, 0)),
+        bits(&band(&rendered_reference, 0))
+    );
 
     let (warped, rendered) = render(two_band_src(BandKinds::from(ValueKind::Continuous))).await;
     assert!(
-        !off_code_in(band(&warped, 1), &CODES).is_empty(),
+        !off_code_in(&band(&warped, 1), &CODES).is_empty(),
         "the tile crosses no class boundary"
     );
-    assert!(!off_code_in(band(&rendered, 1), &CODES).is_empty());
+    assert!(!off_code_in(&band(&rendered, 1), &CODES).is_empty());
     let (warped, _) = render(two_band_src(BandKinds::from(ValueKind::Categorical))).await;
-    assert_ne!(bits(band(&warped, 0)), bits(band(&warped_reference, 0)));
+    assert_ne!(bits(&band(&warped, 0)), bits(&band(&warped_reference, 0)));
 }
 
 #[tokio::test]
@@ -560,24 +563,24 @@ async fn a_two_band_mosaic_samples_each_band_by_its_own_kind() {
     let both = || vec![reflectance_map(W, H), class_map(W, H)];
 
     let mixed = mosaic(both(), reflectance_and_classes()).await;
-    assert_eq!(off_code_in(band(&mixed, 1), &CODES), Vec::<f64>::new());
+    assert_eq!(off_code_in(&band(&mixed, 1), &CODES), Vec::<f64>::new());
     assert!(band(&mixed, 1).iter().any(|v| !v.is_nan()));
     let reference = mosaic(
         vec![reflectance_map(W, H)],
         BandKinds::from(ValueKind::Continuous),
     )
     .await;
-    assert_eq!(bits(band(&mixed, 0)), bits(band(&reference, 0)));
+    assert_eq!(bits(&band(&mixed, 0)), bits(&band(&reference, 0)));
 
     let every_band_continuous = mosaic(both(), BandKinds::from(ValueKind::Continuous)).await;
     assert!(
-        !off_code_in(band(&every_band_continuous, 1), &CODES).is_empty(),
+        !off_code_in(&band(&every_band_continuous, 1), &CODES).is_empty(),
         "the half-cell shift blends no codes"
     );
     let every_band_categorical = mosaic(both(), BandKinds::from(ValueKind::Categorical)).await;
     assert_ne!(
-        bits(band(&every_band_categorical, 0)),
-        bits(band(&reference, 0))
+        bits(&band(&every_band_categorical, 0)),
+        bits(&band(&reference, 0))
     );
 }
 
@@ -633,7 +636,7 @@ mod gdal {
         let reference = read(&memory, &req).await;
         for (i, (a, b)) in values(&categorical)
             .iter()
-            .zip(values(&reference))
+            .zip(&values(&reference))
             .enumerate()
         {
             assert!(

@@ -963,7 +963,7 @@ async fn one_reproject_element_takes_a_raster_and_a_vector_chain() {
         .into_raster()
         .unwrap();
     assert_eq!(pulled.crs, Crs::WEB_MERCATOR);
-    let values: Vec<f64> = pulled.bands.band(0).unwrap().data().to_vec();
+    let values: Vec<f64> = pulled.bands.band(0).unwrap().to_raster().data().to_vec();
     let finite: Vec<f64> = values.into_iter().filter(|v| v.is_finite()).collect();
     assert!(finite.len() > 100, "only {} pixels warped", finite.len());
     assert!(finite.iter().all(|v| (v - LONLAT_VALUE).abs() < 1e-9));

@@ -415,7 +415,7 @@ const SEAM: WindowReq = WindowReq {
 /// every pixel is the 2024 value except in the left item's hole, where the
 /// shifted 2020 value shows through
 fn assert_seam_mosaic(chunk: &RasterChunk) {
-    let band = chunk.bands.band(0).unwrap();
+    let band = chunk.bands.band(0).unwrap().to_raster();
     let res = chunk.resolution;
     for row in 0..band.height() {
         for col in 0..band.width() {
@@ -495,7 +495,7 @@ async fn pull_time_picks_the_items_and_keys_the_block_cache() {
 /// the seam window with a per-pixel shift over the scene, `None` where the
 /// pixel should have no value at all
 fn assert_seam_at(chunk: &RasterChunk, shift: impl Fn(bool) -> f64) {
-    let band = chunk.bands.band(0).unwrap();
+    let band = chunk.bands.band(0).unwrap().to_raster();
     let res = chunk.resolution;
     for row in 0..band.height() {
         for col in 0..band.width() {
@@ -545,7 +545,7 @@ async fn pulls_past_the_open_bbox_search_lazily_and_cache_blocks() {
     assert_eq!(src.item_count(), 3, "the right item was not discovered");
     assert_eq!(mock.searches.load(Ordering::SeqCst), 2);
 
-    let band = chunk.bands.band(0).unwrap();
+    let band = chunk.bands.band(0).unwrap().to_raster();
     for row in 0..band.height() {
         for col in 0..band.width() {
             let x = req.bbox.min_x + (col as f64 + 0.5) * CELL;
@@ -684,6 +684,7 @@ async fn multi_band_mosaic_fills_holes_per_band() {
     let res = chunk.resolution;
     let mut holes_hit = 0;
     for (bi, band) in chunk.bands.bands().iter().enumerate() {
+        let band = band.to_raster();
         for row in 0..band.height() {
             for col in 0..band.width() {
                 let x = chunk.bbox.min_x + (col as f64 + 0.5) * res;
@@ -959,6 +960,7 @@ async fn open_composite(base: &str, composite: Composite) -> StacSrc {
 fn each_pixel(chunk: &RasterChunk, mut f: impl FnMut(usize, f64, f64, f64)) {
     let res = chunk.resolution;
     for (bi, band) in chunk.bands.bands().iter().enumerate() {
+        let band = band.to_raster();
         for row in 0..band.height() {
             for col in 0..band.width() {
                 let x = chunk.bbox.min_x + (col as f64 + 0.5) * res;
@@ -1346,7 +1348,8 @@ async fn a_reduction_in_strips_matches_one_in_a_single_piece() {
                 },
             ),
         ];
-        let want = whole.bands.band(0).unwrap().data();
+        let want = whole.bands.band(0).unwrap().to_raster();
+        let want = want.data();
         for (from, bbox) in halves {
             let part = src
                 .read(&WindowReq { bbox, ..WIDE })
@@ -1354,7 +1357,7 @@ async fn a_reduction_in_strips_matches_one_in_a_single_piece() {
                 .unwrap()
                 .into_raster()
                 .unwrap();
-            let band = part.bands.band(0).unwrap();
+            let band = part.bands.band(0).unwrap().to_raster();
             assert_eq!(band.height(), WIDE_HALF);
             let at = from * WIDE_COLS;
             assert_eq!(
@@ -2094,8 +2097,10 @@ async fn chunked_pull_equals_the_whole_window_across_crss() {
     });
     assert_eq!(holed, 20 * 512, "the pull missed the holed rows");
 
-    let one = whole.bands.band(0).unwrap().data();
-    let many = chunked.bands.band(0).unwrap().data();
+    let one = whole.bands.band(0).unwrap().to_raster();
+    let one = one.data();
+    let many = chunked.bands.band(0).unwrap().to_raster();
+    let many = many.data();
     assert_eq!(one.len(), many.len());
     for (i, (a, b)) in one.iter().zip(many).enumerate() {
         assert!(
@@ -2260,6 +2265,7 @@ fn class_off_codes(chunk: &RasterChunk) -> Vec<f64> {
         .bands
         .band(0)
         .unwrap()
+        .to_raster()
         .data()
         .iter()
         .copied()
@@ -2346,6 +2352,7 @@ async fn a_categorical_search_decimates_its_items_by_mode() {
             .bands
             .band(0)
             .unwrap()
+            .to_raster()
             .data()
             .iter()
             .all(|v| !v.is_nan()),
@@ -2400,7 +2407,8 @@ async fn a_categorical_item_in_another_crs_warps_to_class_codes() {
 
     let categorical = read(ValueKind::Categorical).await;
     assert_eq!(class_off_codes(&categorical), Vec::<f64>::new());
-    let warped = &categorical.bands.band(0).unwrap().data()[50 * 100..70 * 100];
+    let warped = categorical.bands.band(0).unwrap().to_raster();
+    let warped = &warped.data()[50 * 100..70 * 100];
     assert!(
         warped.iter().all(|v| !v.is_nan()),
         "the zone 33 item did not fill the anchor's hole"
@@ -2545,7 +2553,9 @@ async fn a_search_reads_each_asset_by_its_own_kind() {
             (kinds, chunk)
         }
     };
-    let band = |chunk: &RasterChunk, index: usize| chunk.bands.band(index).unwrap().data().to_vec();
+    let band = |chunk: &RasterChunk, index: usize| {
+        chunk.bands.band(index).unwrap().to_raster().data().to_vec()
+    };
     let off_codes = |values: Vec<f64>| -> Vec<f64> {
         values
             .into_iter()
@@ -2556,7 +2566,7 @@ async fn a_search_reads_each_asset_by_its_own_kind() {
     let (kinds, mixed) = read(&["data", "classes"], &["classes"]).await;
     assert_eq!(
         kinds,
-        BandKinds::per_band(vec![ValueKind::Continuous, ValueKind::Categorical])
+        BandKinds::from_bands(vec![ValueKind::Continuous, ValueKind::Categorical])
     );
     assert_eq!(off_codes(band(&mixed, 1)), Vec::<f64>::new());
     assert!(
@@ -2732,8 +2742,8 @@ async fn a_coarser_categorical_asset_takes_the_code_of_its_pixel_under_each_fine
 
     let (_, red_only) = read_assets(&base, &["red"], req).await;
     assert_eq!(
-        bits(mixed.bands.band(0).unwrap().data()),
-        bits(red_only.bands.band(0).unwrap().data())
+        bits(mixed.bands.band(0).unwrap().to_raster().data()),
+        bits(red_only.bands.band(0).unwrap().to_raster().data())
     );
 }
 
@@ -2753,8 +2763,8 @@ async fn a_coarser_categorical_asset_off_the_fine_grid_keeps_its_codes_at_every_
 
         let (_, red_only) = read_assets(&base, &["red"], req).await;
         assert_eq!(
-            bits(mixed.bands.band(1).unwrap().data()),
-            bits(red_only.bands.band(0).unwrap().data()),
+            bits(mixed.bands.band(1).unwrap().to_raster().data()),
+            bits(red_only.bands.band(0).unwrap().to_raster().data()),
             "red pulled at {resolution}"
         );
     }

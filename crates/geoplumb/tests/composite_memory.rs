@@ -197,7 +197,7 @@ async fn pull(items: usize, composite: Composite) -> (usize, f64) {
     ALLOC.mark();
     let chunk = src.read(&WINDOW).await.unwrap().into_raster().unwrap();
     let growth = ALLOC.growth();
-    let band = chunk.bands.band(0).unwrap();
+    let band = chunk.bands.band(0).unwrap().to_raster();
     assert_eq!(band.width() * band.height(), SIDE * SIDE);
     let got = band.data()[0];
     assert!(
