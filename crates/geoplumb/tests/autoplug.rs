@@ -1,7 +1,9 @@
 //! reproject auto-plug: a link empty only because of crs gets a reproject
 //! spliced in during the solve instead of failing negotiation
 
-use geoplumb::caps::{CapsPattern, CapsSet, Constraint, FieldMask, RasterPattern, SetField};
+use geoplumb::caps::{
+    CapsPattern, CapsSet, Constraint, FieldMask, RasterPattern, SetField, ValueKind,
+};
 use geoplumb::element::{Adapter, Transform};
 use geoplumb::elements::{Hillshade, Mosaic, RasterSrc};
 use geoplumb::{Bbox, Chunk, Crs, Engine, Graph, RasterChunk, Result, WindowReq};
@@ -35,6 +37,7 @@ fn wgs84_src(cols: usize) -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 
@@ -66,6 +69,7 @@ fn mercator_src() -> RasterSrc {
         x0,
         y0,
         Crs::WEB_MERCATOR,
+        ValueKind::Continuous,
     )
 }
 
@@ -105,7 +109,7 @@ async fn mixed_crs_fanin_autoplugs_a_reproject() {
     let mut g = Graph::new();
     let a = g.add_source(Box::new(wgs84_src(300)));
     let b = g.add_source(Box::new(mercator_src()));
-    let m = g.add_fanin(&[a, b], Box::new(Mosaic));
+    let m = g.add_fanin(&[a, b], Box::new(Mosaic::default()));
     let engine = Engine::new(g, 64 << 20).unwrap();
 
     // the fanin lands on the first parent's crs, sources keep their own
@@ -260,6 +264,7 @@ fn two_band_graph() -> (Graph, geoplumb::NodeId) {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     );
     let mut g = Graph::new();
     let s = g.add_source(Box::new(src));
@@ -294,6 +299,7 @@ async fn registered_adapter_bridges_a_bands_mismatch() {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )));
     let rhs = rg.add_transform(rs, Box::new(Hillshade::new(315.0, 45.0)));
     let reference = Engine::new(rg, 64 << 20).unwrap();
@@ -326,7 +332,7 @@ async fn invalidation_crosses_the_spliced_plug() {
     let mut g = Graph::new();
     let a = g.add_source(Box::new(wgs84_src(300)));
     let b = g.add_source(Box::new(mercator_src()));
-    let m = g.add_fanin(&[a, b], Box::new(Mosaic));
+    let m = g.add_fanin(&[a, b], Box::new(Mosaic::default()));
     let engine = Engine::new(g, 64 << 20).unwrap();
     let mut events = engine.subscribe();
 

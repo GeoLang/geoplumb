@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use geoplumb::caps::{
     Caps, CapsPattern, CapsSet, Constraint, Dtype, RasterCaps, RasterPattern, ResRange, SetField,
+    ValueKind,
 };
 use geoplumb::element::{Source, Transform};
 use geoplumb::elements::stac::{format_rfc3339, parse_rfc3339};
@@ -63,6 +64,7 @@ impl Source for ClockSrc {
             crs: SetField::one(Crs::WGS84),
             resolution: ResRange::at_least(CELL),
             chunk_px: SetField::Any,
+            value_kind: SetField::Any,
         })))
     }
 
@@ -286,6 +288,7 @@ fn raster_caps(crs: Crs) -> Caps {
         crs,
         resolution: ResRange::at_least(CELL),
         chunk_px: 256,
+        value_kind: ValueKind::Continuous,
     })
 }
 

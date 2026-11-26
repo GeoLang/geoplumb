@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::future::BoxFuture;
-use geoplumb::caps::Constraint;
+use geoplumb::caps::{Constraint, ValueKind};
 use geoplumb::element::{Fanin, Source, Transform};
 use geoplumb::elements::{
     Aspect, BandMath, Focal, FocalOp, Hillshade, IdwGrid, Mosaic, QualityMask, RasterSrc,
@@ -40,6 +40,7 @@ fn dem_src(base_height: f64) -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 
@@ -432,7 +433,7 @@ fn element_identities_tell_parameters_apart() {
         Slope.identity(),
         Aspect.identity(),
         ToRaster.identity(),
-        Mosaic.identity(),
+        Mosaic::default().identity(),
     ];
     for identity in singles {
         assert!(!identity.is_empty());

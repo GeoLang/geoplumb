@@ -6,7 +6,7 @@
 
 use crate::caps::{
     Caps, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField, TensorDtype,
-    TensorPattern,
+    TensorPattern, ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk, TensorChunk, TensorData};
 use crate::element::Transform;
@@ -24,6 +24,7 @@ fn cross_kind_passthrough() -> FieldMask {
         bands: true,
         dtype: false,
         resolution: false,
+        value_kind: false,
     }
 }
 
@@ -149,11 +150,11 @@ impl Transform for TensorConv {
                         continue;
                     }
                     let mut sum = 0.0f32;
-                    for ky in 0..3 {
-                        for kx in 0..3 {
+                    for (ky, kernel_row) in self.kernel.iter().enumerate() {
+                        for (kx, weight) in kernel_row.iter().enumerate() {
                             let v = tap(r + ky as isize - 1, cl + kx as isize - 1);
                             if !v.is_nan() {
-                                sum += v * self.kernel[ky][kx];
+                                sum += v * weight;
                             }
                         }
                     }
@@ -208,6 +209,7 @@ impl Transform for ToRaster {
             passthrough: cross_kind_passthrough(),
             output: CapsPattern::Raster(RasterPattern {
                 dtype: SetField::one(Dtype::F64),
+                value_kind: SetField::one(ValueKind::Continuous),
                 ..RasterPattern::default()
             }),
         }

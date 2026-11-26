@@ -1,12 +1,16 @@
 //! in-memory raster source. the whole dataset is held resident (a geotiff is
-//! fetched or read once at open) and windows are served by block-averaged
-//! decimation per ladder level. for tiled cogs use CogSrc, which reads
-//! windows without holding the file
+//! fetched or read once at open) and windows are served by block decimation
+//! per ladder level, the block mean for continuous values and its mode for
+//! categorical ones. for tiled cogs use CogSrc, which reads windows without
+//! holding the file
 
-use crate::caps::{CapsPattern, CapsSet, Constraint, Crs, RasterPattern, ResRange, SetField};
+use crate::caps::{
+    CapsPattern, CapsSet, Constraint, Crs, RasterPattern, ResRange, SetField, ValueKind,
+};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::error::Result;
+use crate::resample::reduce_block;
 use crate::spill::Fnv1a;
 use crate::window::{GridSpec, WindowReq};
 use futures::future::BoxFuture;
@@ -18,10 +22,17 @@ pub struct RasterSrc {
     origin_y: f64,
     base_resolution: f64,
     crs: Crs,
+    value_kind: ValueKind,
 }
 
 impl RasterSrc {
-    pub fn new(data: BandedRaster, origin_x: f64, origin_y: f64, crs: Crs) -> Self {
+    pub fn new(
+        data: BandedRaster,
+        origin_x: f64,
+        origin_y: f64,
+        crs: Crs,
+        value_kind: ValueKind,
+    ) -> Self {
         let base_resolution = data.cell_size();
         RasterSrc {
             data,
@@ -29,16 +40,18 @@ impl RasterSrc {
             origin_y,
             base_resolution,
             crs,
+            value_kind,
         }
     }
 
-    pub fn from_geotiff(bytes: &[u8]) -> Result<Self> {
+    pub fn from_geotiff(bytes: &[u8], value_kind: ValueKind) -> Result<Self> {
         let (data, meta): (BandedRaster, GeoTiffMetadata) = read_geotiff_bands(bytes)?;
         Ok(RasterSrc::new(
             data,
             meta.origin_x,
             meta.origin_y,
             Crs(u32::from(meta.epsg)),
+            value_kind,
         ))
     }
 
@@ -54,30 +67,30 @@ impl RasterSrc {
             .map(|band| {
                 let nodata = band.nodata;
                 let mut out = vec![nodata; cols * rows];
+                let mut block = Vec::with_capacity(factor * factor);
                 for row in 0..rows {
                     for col in 0..cols {
                         let x0 = req.bbox.min_x + col as f64 * res;
                         let y0 = req.bbox.max_y - row as f64 * res;
                         let src_col = ((x0 - self.origin_x) / self.base_resolution).round() as i64;
                         let src_row = ((self.origin_y - y0) / self.base_resolution).round() as i64;
-                        // clamp the averaging block to the raster up front so
-                        // far-outside windows cost nothing
+                        // clamp the block to the raster up front so far-outside
+                        // windows cost nothing
                         let r0 = src_row.max(0) as usize;
                         let r1 = (src_row + factor as i64).clamp(0, band.height() as i64) as usize;
                         let c0 = src_col.max(0) as usize;
                         let c1 = (src_col + factor as i64).clamp(0, band.width() as i64) as usize;
-                        let mut sum = 0.0;
-                        let mut n = 0usize;
+                        block.clear();
                         for rr in r0..r1 {
                             for cc in c0..c1 {
                                 let v = band.data()[rr * band.width() + cc];
                                 if !band.is_nodata(v) && v.is_finite() {
-                                    sum += v;
-                                    n += 1;
+                                    block.push(v);
                                 }
                             }
                         }
-                        out[row * cols + col] = if n > 0 { sum / n as f64 } else { nodata };
+                        out[row * cols + col] =
+                            reduce_block(self.value_kind, &mut block).unwrap_or(nodata);
                     }
                 }
                 Raster::from_vec(cols, rows, out, res, nodata).expect("level dims")
@@ -104,12 +117,13 @@ impl Source for RasterSrc {
             }
         }
         format!(
-            "RasterSrc bands={} origin_x={:?} origin_y={:?} base_resolution={:?} crs={} content={:016x}",
+            "RasterSrc bands={} origin_x={:?} origin_y={:?} base_resolution={:?} crs={} value_kind={:?} content={:016x}",
             self.data.band_count(),
             self.origin_x,
             self.origin_y,
             self.base_resolution,
             self.crs,
+            self.value_kind,
             digest.finish()
         )
     }
@@ -121,6 +135,7 @@ impl Source for RasterSrc {
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.base_resolution),
             chunk_px: SetField::Any,
+            value_kind: SetField::one(self.value_kind),
         })))
     }
 

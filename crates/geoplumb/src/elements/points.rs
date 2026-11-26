@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::caps::{
     CapsPattern, CapsSet, Constraint, Crs, Dtype, FieldMask, PointPattern, RasterPattern, ResRange,
-    SetField,
+    SetField, ValueKind,
 };
 use crate::chunk::{Chunk, PointChunk, RasterChunk, tile_contains};
 use crate::element::{Source, Transform};
@@ -217,10 +217,12 @@ impl Transform for IdwGrid {
                 dtype: false,
                 bands: false,
                 resolution: false,
+                value_kind: false,
             },
             output: CapsPattern::Raster(RasterPattern {
                 dtype: SetField::one(Dtype::F64),
                 bands: SetField::one(1),
+                value_kind: SetField::one(ValueKind::Continuous),
                 ..RasterPattern::default()
             }),
         }

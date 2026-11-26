@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 
 use crate::caps::{
-    CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
+    CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField, ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
@@ -242,6 +242,23 @@ pub enum Composite {
     Count,
 }
 
+impl Composite {
+    pub fn output_value_kind(self, input: ValueKind) -> Option<ValueKind> {
+        match (self, input) {
+            (Composite::Count, _) => Some(ValueKind::Continuous),
+            (Composite::Latest | Composite::Min | Composite::Max, _) => Some(input),
+            (
+                Composite::Mean | Composite::Median | Composite::Percentile(_) | Composite::StdDev,
+                ValueKind::Continuous,
+            ) => Some(ValueKind::Continuous),
+            (
+                Composite::Mean | Composite::Median | Composite::Percentile(_) | Composite::StdDev,
+                ValueKind::Categorical,
+            ) => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StacSearch {
     /// stac api root, e.g. `https://earth-search.aws.element84.com/v1`
@@ -261,6 +278,7 @@ pub struct StacSearch {
     pub limit: u32,
     /// what a pull does with the items covering one window
     pub composite: Composite,
+    pub value_kind: ValueKind,
 }
 
 impl StacSearch {
@@ -273,6 +291,7 @@ impl StacSearch {
             datetime: None,
             limit: 100,
             composite: Composite::default(),
+            value_kind: ValueKind::Continuous,
         }
     }
 }
@@ -419,6 +438,7 @@ pub struct StacSrc {
     base_resolution: f64,
     bands: u16,
     crs: Crs,
+    value_kind: ValueKind,
 }
 
 /// stac asset hrefs on aws are often `s3://bucket/key`, publicly readable
@@ -546,6 +566,16 @@ impl StacSrc {
         if search.assets.is_empty() {
             return Err(Error::Source("stac search names no assets".into()));
         }
+        let value_kind = search
+            .composite
+            .output_value_kind(search.value_kind)
+            .ok_or_else(|| {
+                let composite = format!("{:?}", search.composite).to_lowercase();
+                Error::Source(format!(
+                    "the {composite} composite blends values, so a categorical stac search \
+                     takes latest, min, max or count"
+                ))
+            })?;
         let client = reqwest::blocking::Client::new();
         let mut found = search_page(&client, search, search.bbox, None)?;
         if found.is_empty() {
@@ -635,6 +665,7 @@ impl StacSrc {
             base_resolution: meta.pixel_width,
             bands,
             crs,
+            value_kind,
         })
     }
 
@@ -843,16 +874,23 @@ impl Inner {
                 item.hrefs[k], self.asset_bands[k]
             )));
         }
+        let value_kind = self.search.value_kind;
         match &item.reprojection {
-            None => read_chunk(reader, req, meta.origin_x, meta.origin_y, self.crs),
-            Some(reprojection) => read_warped(
+            None => read_chunk(
                 reader,
                 req,
                 meta.origin_x,
                 meta.origin_y,
+                self.crs,
+                value_kind,
+            ),
+            Some(reprojection) => read_warped(
+                reader,
+                req,
                 reprojection,
                 self.crs,
                 scale_window,
+                value_kind,
             ),
         }
     }
@@ -914,12 +952,12 @@ impl Inner {
 fn read_warped(
     reader: &CogReader<HttpRange>,
     req: &WindowReq,
-    origin_x: f64,
-    origin_y: f64,
     reprojection: &Reprojection,
     anchor: Crs,
     scale_window: &Bbox,
+    value_kind: ValueKind,
 ) -> Result<RasterChunk> {
+    let (origin_x, origin_y) = (reader.meta().origin_x, reader.meta().origin_y);
     let (region, _) = inverse_window(&reprojection.from_anchor, &req.bbox, req.resolution);
     // the source resolution comes from the whole pull window, so a strip of
     // a chunked read picks the overview the whole window picks and two
@@ -942,8 +980,15 @@ fn read_warped(
         resolution,
     );
     let source = req.with_window(region, resolution);
-    let chunk = read_chunk(reader, &source, origin_x, origin_y, reprojection.crs)?;
-    warp_to_grid(&chunk, req, &reprojection.from_anchor, anchor)
+    let chunk = read_chunk(
+        reader,
+        &source,
+        origin_x,
+        origin_y,
+        reprojection.crs,
+        value_kind,
+    )?;
+    warp_to_grid(&chunk, req, &reprojection.from_anchor, anchor, value_kind)
 }
 
 /// one item's window across every asset, the assets read in parallel and
@@ -1417,13 +1462,14 @@ impl Source for StacSrc {
         // there is to name
         let search = &self.inner.search;
         format!(
-            "StacSrc api={:?} collection={:?} assets={:?} bbox={:?} datetime={:?} composite={:?} crs={} bands={}",
+            "StacSrc api={:?} collection={:?} assets={:?} bbox={:?} datetime={:?} composite={:?} value_kind={:?} crs={} bands={}",
             search.api,
             search.collection,
             search.assets,
             search.bbox,
             search.datetime,
             search.composite,
+            search.value_kind,
             self.crs,
             self.bands
         )
@@ -1436,6 +1482,7 @@ impl Source for StacSrc {
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.base_resolution),
             chunk_px: SetField::Any,
+            value_kind: SetField::one(self.value_kind),
         })))
     }
 

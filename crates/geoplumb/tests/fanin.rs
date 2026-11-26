@@ -2,7 +2,9 @@
 //! fixation across a diamond, and invalidation through a fanin node
 
 use futures::future::BoxFuture;
-use geoplumb::caps::{CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField};
+use geoplumb::caps::{
+    CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField, ValueKind,
+};
 use geoplumb::element::Source;
 use geoplumb::elements::{Combine, Hillshade, Mosaic, RasterSrc, Slope};
 use geoplumb::window::GridSpec;
@@ -37,6 +39,7 @@ fn patch_src(x0: usize, cols: usize) -> RasterSrc {
         ORIGIN_X + x0 as f64 * CELL,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 
@@ -65,7 +68,7 @@ async fn mosaic_stitches_sources_with_offset_origins() {
     let mut g = Graph::new();
     let left = g.add_source(Box::new(patch_src(0, 300)));
     let right = g.add_source(Box::new(patch_src(300, 300)));
-    let m = g.add_fanin(&[left, right], Box::new(Mosaic));
+    let m = g.add_fanin(&[left, right], Box::new(Mosaic::default()));
     let engine = Engine::new(g, 64 << 20).unwrap();
 
     let req = WindowReq {
@@ -151,6 +154,7 @@ impl Source for PrefSrc {
                         crs: SetField::one(crs),
                         resolution: ResRange::at_least(CELL),
                         chunk_px: SetField::Any,
+                        value_kind: SetField::Any,
                     })
                 })
                 .collect(),
@@ -195,7 +199,7 @@ fn fanin_fixation_backtracks_across_disagreeing_preferences() {
     let b = g.add_source(Box::new(PrefSrc {
         crss: vec![Crs::WEB_MERCATOR, Crs::WGS84],
     }));
-    let m = g.add_fanin(&[a, b], Box::new(Mosaic));
+    let m = g.add_fanin(&[a, b], Box::new(Mosaic::default()));
     let engine = Engine::new(g, 64 << 20).unwrap();
     let crs = engine.caps(m).raster().crs;
     assert_eq!(engine.caps(a).raster().crs, crs);
@@ -218,7 +222,7 @@ async fn invalidation_crosses_the_fanin() {
     let mut g = Graph::new();
     let left = g.add_source(Box::new(patch_src(0, 300)));
     let right = g.add_source(Box::new(patch_src(300, 300)));
-    let m = g.add_fanin(&[left, right], Box::new(Mosaic));
+    let m = g.add_fanin(&[left, right], Box::new(Mosaic::default()));
     let engine = Engine::new(g, 64 << 20).unwrap();
     let mut events = engine.subscribe();
 

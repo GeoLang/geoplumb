@@ -28,6 +28,12 @@ pub enum Dtype {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
+pub enum ValueKind {
+    Continuous,
+    Categorical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub enum TensorDtype {
     F32,
 }
@@ -129,6 +135,7 @@ pub struct RasterPattern {
     pub crs: SetField<Crs>,
     pub resolution: ResRange,
     pub chunk_px: SetField<u32>,
+    pub value_kind: SetField<ValueKind>,
 }
 
 impl Default for RasterPattern {
@@ -139,6 +146,7 @@ impl Default for RasterPattern {
             crs: SetField::Any,
             resolution: ResRange::ANY,
             chunk_px: SetField::Any,
+            value_kind: SetField::Any,
         }
     }
 }
@@ -151,6 +159,7 @@ impl RasterPattern {
             crs: self.crs.intersect(&other.crs),
             resolution: self.resolution.intersect(&other.resolution),
             chunk_px: self.chunk_px.intersect(&other.chunk_px),
+            value_kind: self.value_kind.intersect(&other.value_kind),
         }
     }
 
@@ -160,6 +169,7 @@ impl RasterPattern {
             || self.crs.is_empty()
             || self.resolution.is_empty()
             || self.chunk_px.is_empty()
+            || self.value_kind.is_empty()
     }
 }
 
@@ -331,6 +341,42 @@ impl CapsPattern {
         }
     }
 
+    fn empty_fields(&self) -> Vec<&'static str> {
+        let fields = match self {
+            CapsPattern::Raster(r) => vec![
+                ("dtype", r.dtype.is_empty()),
+                ("bands", r.bands.is_empty()),
+                ("crs", r.crs.is_empty()),
+                ("resolution", r.resolution.is_empty()),
+                ("chunk_px", r.chunk_px.is_empty()),
+                ("value_kind", r.value_kind.is_empty()),
+            ],
+            CapsPattern::PointCloud(p) => vec![
+                ("crs", p.crs.is_empty()),
+                ("resolution", p.resolution.is_empty()),
+                ("chunk_px", p.chunk_px.is_empty()),
+            ],
+            CapsPattern::Vector(v) => vec![
+                ("crs", v.crs.is_empty()),
+                ("resolution", v.resolution.is_empty()),
+                ("chunk_px", v.chunk_px.is_empty()),
+            ],
+            CapsPattern::Tensor(t) => vec![
+                ("dtype", t.dtype.is_empty()),
+                ("channels", t.channels.is_empty()),
+                ("crs", t.crs.is_empty()),
+                ("resolution", t.resolution.is_empty()),
+                ("chunk_px", t.chunk_px.is_empty()),
+                ("domain", t.domain.is_empty()),
+            ],
+        };
+        fields
+            .into_iter()
+            .filter(|(_, empty)| *empty)
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     fn common(&self) -> CommonFields {
         match self {
             CapsPattern::Raster(r) => CommonFields {
@@ -477,7 +523,7 @@ impl CapsSet {
     /// fixate the first alternative to concrete link caps, resolution stays
     /// ranged. dtype defaults to the kind's only choice, bands, channels and
     /// chunk size left `Any` by every constraint on the link fall back to one
-    /// band or channel and 256 px
+    /// band or channel and 256 px, an open value kind to continuous
     pub fn fixate(&self) -> Option<Caps> {
         match self.alternatives.first()? {
             CapsPattern::Raster(first) => Some(Caps::Raster(RasterCaps {
@@ -486,6 +532,7 @@ impl CapsSet {
                 crs: first.crs.fixate()?,
                 resolution: first.resolution,
                 chunk_px: first.chunk_px.fixate().unwrap_or(256),
+                value_kind: first.value_kind.fixate().unwrap_or(ValueKind::Continuous),
             })),
             CapsPattern::PointCloud(first) => Some(Caps::PointCloud(PointCaps {
                 crs: first.crs.fixate()?,
@@ -525,6 +572,7 @@ pub struct RasterCaps {
     pub crs: Crs,
     pub resolution: ResRange,
     pub chunk_px: u32,
+    pub value_kind: ValueKind,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -611,6 +659,7 @@ impl Caps {
                 crs: SetField::one(r.crs),
                 resolution: r.resolution,
                 chunk_px: SetField::one(r.chunk_px),
+                value_kind: SetField::one(r.value_kind),
             }),
             Caps::PointCloud(p) => CapsPattern::PointCloud(PointPattern {
                 crs: SetField::one(p.crs),
@@ -646,6 +695,7 @@ impl Caps {
                 r.chunk_px.hash(&mut h);
                 r.resolution.min.to_bits().hash(&mut h);
                 r.resolution.max.to_bits().hash(&mut h);
+                r.value_kind.hash(&mut h);
             }
             Caps::PointCloud(p) => {
                 1u8.hash(&mut h);
@@ -677,10 +727,11 @@ impl Caps {
 }
 
 /// fields a derived transform passes through unchanged, used for backward
-/// narrowing. dtype is a raster field and its bit is ignored when either
-/// side of a projection is another kind. bands is the plane count: across
-/// the raster and tensor kinds it couples bands to channels, and is ignored
-/// where a side has no plane count (points, vectors)
+/// narrowing. dtype and value kind are raster fields and their bits are
+/// ignored when either side of a projection is another kind. bands is the
+/// plane count: across the raster and tensor kinds it couples bands to
+/// channels, and is ignored where a side has no plane count (points,
+/// vectors)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FieldMask {
     pub dtype: bool,
@@ -688,6 +739,7 @@ pub struct FieldMask {
     pub crs: bool,
     pub resolution: bool,
     pub chunk_px: bool,
+    pub value_kind: bool,
 }
 
 impl FieldMask {
@@ -697,6 +749,7 @@ impl FieldMask {
         crs: true,
         resolution: true,
         chunk_px: true,
+        value_kind: true,
     };
 
     pub fn without_crs_resolution() -> Self {
@@ -739,9 +792,50 @@ pub fn mask_project(from: &CapsPattern, onto: &CapsPattern, mask: FieldMask) -> 
             } else {
                 o.chunk_px.clone()
             },
+            value_kind: if mask.value_kind {
+                o.value_kind.intersect(&f.value_kind)
+            } else {
+                o.value_kind.clone()
+            },
         }),
         (from, onto) => onto.project_common(&from.common(), mask),
     }
+}
+
+pub fn meet(onto: &CapsSet, from: &CapsSet, coupling: Option<FieldMask>) -> CapsSet {
+    let Some(mask) = coupling else {
+        return onto.intersect(from);
+    };
+    let mut alternatives = Vec::new();
+    for o in &onto.alternatives {
+        for f in &from.alternatives {
+            let met = mask_project(f, o, mask);
+            if !met.is_empty() && !alternatives.contains(&met) {
+                alternatives.push(met);
+            }
+        }
+    }
+    CapsSet { alternatives }
+}
+
+pub fn conflicting_fields(
+    onto: &CapsSet,
+    from: &CapsSet,
+    coupling: Option<FieldMask>,
+) -> Vec<&'static str> {
+    let mask = coupling.unwrap_or(FieldMask::ALL);
+    onto.alternatives
+        .iter()
+        .flat_map(move |o| {
+            from.alternatives.iter().map(move |f| {
+                if coupling.is_none() && std::mem::discriminant(o) != std::mem::discriminant(f) {
+                    return vec!["kind"];
+                }
+                mask_project(f, o, mask).empty_fields()
+            })
+        })
+        .min_by_key(Vec::len)
+        .unwrap_or_default()
 }
 
 /// element-declared constraint over its input and output link caps
@@ -762,6 +856,27 @@ pub enum Constraint {
 }
 
 impl Constraint {
+    pub fn pinned_value_kind(input: CapsSet, value_kind: ValueKind) -> Constraint {
+        Constraint::Derived {
+            input,
+            passthrough: FieldMask {
+                value_kind: false,
+                ..FieldMask::ALL
+            },
+            output: CapsPattern::Raster(RasterPattern {
+                value_kind: SetField::one(value_kind),
+                ..RasterPattern::default()
+            }),
+        }
+    }
+
+    pub fn coupled_fields(&self) -> Option<FieldMask> {
+        match self {
+            Constraint::Derived { passthrough, .. } => Some(*passthrough),
+            Constraint::Produces(_) | Constraint::Identity(_) => None,
+        }
+    }
+
     /// the set this constraint accepts on its input link
     pub fn input_set(&self) -> CapsSet {
         match self {

@@ -5,7 +5,7 @@
 //! grid, so the engine's outward alignment adds nothing and radius cells of
 //! halo is exactly enough
 
-use crate::caps::{CapsSet, Constraint};
+use crate::caps::{CapsSet, Constraint, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::error::{Error, Result};
@@ -56,7 +56,7 @@ impl Transform for Focal {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::Identity(CapsSet::any_raster())
+        Constraint::pinned_value_kind(CapsSet::any_raster(), ValueKind::Continuous)
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {

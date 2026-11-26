@@ -3,7 +3,7 @@
 //! propagation, parse failures and the band count the expression demands of
 //! its input link
 
-use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
+use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField, ValueKind};
 use geoplumb::element::Transform;
 use geoplumb::elements::{BandMath, RasterSrc};
 use geoplumb::{Bbox, Chunk, Crs, Engine, Error, Graph, RasterChunk, WindowReq};
@@ -57,6 +57,7 @@ fn src_with(hole: impl Fn(usize, usize, usize) -> bool) -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 
@@ -299,6 +300,7 @@ fn extra_source_bands_are_fine() {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )));
     let bm = g.add_transform(s, Box::new(BandMath::new("b0 + b1").unwrap()));
     let engine = Engine::new(g, 64 << 20).unwrap();

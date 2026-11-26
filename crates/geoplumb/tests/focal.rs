@@ -2,7 +2,7 @@
 //! kept, nodata neighbours excluded and nodata centres held, and a chunked
 //! pull equal to the whole-window pull so the halo is proven to cross seams
 
-use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
+use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField, ValueKind};
 use geoplumb::element::Transform;
 use geoplumb::elements::{Focal, FocalOp, RasterSrc};
 use geoplumb::{Bbox, Chunk, Crs, Engine, Graph, RasterChunk, WindowReq};
@@ -50,6 +50,7 @@ fn src_with(hole: impl Fn(usize, usize, usize) -> bool) -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 

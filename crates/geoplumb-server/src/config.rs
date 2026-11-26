@@ -3,9 +3,11 @@
 //! ends reprojected to web mercator and encoded as grayscale png, so the
 //! file says what varies and nothing else
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use geoplumb::TimeInterval;
+use geoplumb::caps::ValueKind;
 use geoplumb::elements::{Burn, Composite, FocalOp, StacSearch};
 use serde::Deserialize;
 use serde_json::Value;
@@ -110,21 +112,25 @@ pub enum SourceConfig {
         /// the interval every pull takes when it names none
         datetime: Option<String>,
         composite: Option<CompositeConfig>,
+        #[serde(default)]
+        value_kind: ValueKindConfig,
     },
     Cog {
         path: PathBuf,
+        #[serde(default)]
+        value_kind: ValueKindConfig,
     },
     /// any raster gdal opens, in a server built with the `gdal` feature
     Gdal {
         path: PathBuf,
         /// the one 1-based band served, every band when absent
         band: Option<u16>,
+        #[serde(default)]
+        value_kind: ValueKindConfig,
     },
     /// a feature collection read whole at startup, lon/lat per rfc 7946.
     /// features are not pixels, so the chain over it needs a `rasterize`
-    Geojson {
-        path: PathBuf,
-    },
+    Geojson { path: PathBuf },
     // table defaults to the first feature table, crs to the table's epsg srs
     Gpkg {
         path: PathBuf,
@@ -146,6 +152,33 @@ pub enum SourceConfig {
         url: Option<String>,
         crs: u32,
     },
+    // one variable of a netcdf classic or 64-bit offset file, its last two
+    // dimensions y and x
+    Netcdf {
+        path: PathBuf,
+        variable: String,
+        crs: Option<u32>,
+        datetime: Option<String>,
+        #[serde(default)]
+        select: BTreeMap<String, usize>,
+        #[serde(default)]
+        value_kind: ValueKindConfig,
+    },
+    // one field of a grib2 file, 1-based
+    Grib {
+        path: PathBuf,
+        message: usize,
+        #[serde(default)]
+        value_kind: ValueKindConfig,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ValueKindConfig {
+    #[default]
+    Continuous,
+    Categorical,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -338,6 +371,15 @@ impl From<&BurnConfig> for Burn {
     }
 }
 
+impl From<ValueKindConfig> for ValueKind {
+    fn from(kind: ValueKindConfig) -> ValueKind {
+        match kind {
+            ValueKindConfig::Continuous => ValueKind::Continuous,
+            ValueKindConfig::Categorical => ValueKind::Categorical,
+        }
+    }
+}
+
 impl From<CompositeConfig> for Composite {
     fn from(c: CompositeConfig) -> Composite {
         match c {
@@ -404,6 +446,20 @@ fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
         SourceConfig::Stac { assets, .. } if assets.is_empty() => {
             return Err("stac source names no assets".into());
         }
+        SourceConfig::Stac {
+            composite: Some(composite),
+            value_kind,
+            ..
+        } if Composite::from(*composite)
+            .output_value_kind((*value_kind).into())
+            .is_none() =>
+        {
+            let composite = format!("{composite:?}").to_lowercase();
+            return Err(format!(
+                "the {composite} composite blends values, so a categorical stac source \
+                 takes latest, min, max or count"
+            ));
+        }
         SourceConfig::Geojson { .. }
             if !ops
                 .iter()
@@ -437,6 +493,15 @@ fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
         }
         SourceConfig::Gdal { .. } if cfg!(not(feature = "gdal")) => {
             return Err(GDAL_NOT_BUILT.into());
+        }
+        SourceConfig::Netcdf {
+            datetime: Some(datetime),
+            ..
+        } => {
+            TimeInterval::parse(datetime).map_err(|e| format!("netcdf datetime: {e}"))?;
+        }
+        SourceConfig::Grib { message: 0, .. } => {
+            return Err("grib messages count from 1".into());
         }
         _ => {}
     }
@@ -596,7 +661,9 @@ impl SourceConfig {
             | SourceConfig::Geojson { .. }
             | SourceConfig::Gpkg { .. }
             | SourceConfig::Las { .. }
-            | SourceConfig::Copc { .. } => None,
+            | SourceConfig::Copc { .. }
+            | SourceConfig::Netcdf { .. }
+            | SourceConfig::Grib { .. } => None,
             SourceConfig::Stac {
                 api,
                 collection,
@@ -604,11 +671,13 @@ impl SourceConfig {
                 bbox,
                 datetime,
                 composite,
+                value_kind,
             } => {
                 let mut search = StacSearch::new(api, collection, &assets[0], *bbox);
                 search.assets = assets.clone();
                 search.datetime = datetime.clone();
                 search.composite = composite.map(Composite::from).unwrap_or_default();
+                search.value_kind = (*value_kind).into();
                 Some(search)
             }
         }

@@ -2,7 +2,7 @@
 //! so the upstream plan widens the window by one cell of halo and compute
 //! crops it back off, which is what keeps chunk borders seam-free
 
-use crate::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField};
+use crate::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::error::{Error, Result};
@@ -59,7 +59,7 @@ impl Transform for Hillshade {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::Identity(single_band())
+        Constraint::pinned_value_kind(single_band(), ValueKind::Continuous)
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
@@ -85,7 +85,7 @@ impl Transform for Slope {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::Identity(single_band())
+        Constraint::pinned_value_kind(single_band(), ValueKind::Continuous)
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
@@ -113,7 +113,7 @@ impl Transform for Aspect {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::Identity(single_band())
+        Constraint::pinned_value_kind(single_band(), ValueKind::Continuous)
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {

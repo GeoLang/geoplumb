@@ -1,10 +1,10 @@
 //! per-cell map algebra and reclassification over terrano ops
 
-use crate::caps::{Caps, CapsSet, Constraint};
+use crate::caps::{Caps, CapsSet, Constraint, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::{Fanin, Transform};
 use crate::error::{Error, Result};
-use crate::resample::sample_bilinear;
+use crate::resample::sample_point;
 use crate::window::WindowReq;
 use terrano_core::{BandedRaster, BinaryOp, Raster, UnaryOp, reclassify};
 
@@ -38,7 +38,11 @@ impl Transform for MapAlgebra {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::Identity(CapsSet::any_raster())
+        let value_kind = match self.op {
+            AlgebraOp::Unary(_) => ValueKind::Continuous,
+            AlgebraOp::Reclassify(_) => ValueKind::Categorical,
+        };
+        Constraint::pinned_value_kind(CapsSet::any_raster(), value_kind)
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
@@ -67,14 +71,19 @@ impl Transform for MapAlgebra {
 }
 
 /// two-input per-cell algebra: both inputs are sampled onto the output
-/// grid, then terrano's binary op runs band by band
+/// grid, each by its own value kind, then terrano's binary op runs band by
+/// band. the inputs may differ in value kind and the output is continuous
 pub struct Combine {
     op: BinaryOp,
+    input_value_kinds: Option<[ValueKind; 2]>,
 }
 
 impl Combine {
     pub fn new(op: BinaryOp) -> Self {
-        Combine { op }
+        Combine {
+            op,
+            input_value_kinds: None,
+        }
     }
 }
 
@@ -92,40 +101,42 @@ impl Fanin for Combine {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::Identity(CapsSet::any_raster())
+        Constraint::pinned_value_kind(CapsSet::any_raster(), ValueKind::Continuous)
     }
 
     fn configure(&mut self, inputs: &[Caps], _output: &Caps) -> Result<()> {
-        if inputs.len() != 2 {
+        let [first, second] = inputs else {
             return Err(Error::InvalidGraph(format!(
                 "combine needs exactly two inputs, wired with {}",
                 inputs.len()
             )));
-        }
+        };
+        self.input_value_kinds = Some([first.raster().value_kind, second.raster().value_kind]);
         Ok(())
     }
 
     fn compute(&self, out: &WindowReq, inputs: &[Chunk]) -> Result<Chunk> {
         let inputs: Vec<&RasterChunk> = inputs.iter().map(Chunk::raster).collect::<Result<_>>()?;
+        let [first_kind, second_kind] = self.input_value_kinds.expect("configured");
         let res = out.resolution;
         let cols = (out.bbox.width() / res).round() as usize;
         let rows = (out.bbox.height() / res).round() as usize;
-        let on_grid = |chunk: &RasterChunk, bi: usize| -> Raster {
+        let on_grid = |chunk: &RasterChunk, value_kind: ValueKind, bi: usize| -> Raster {
             let band = chunk.bands.band(bi).expect("negotiated bands");
             let mut data = Vec::with_capacity(cols * rows);
             for row in 0..rows {
                 let y = out.bbox.max_y - (row as f64 + 0.5) * res;
                 for col in 0..cols {
                     let x = out.bbox.min_x + (col as f64 + 0.5) * res;
-                    data.push(sample_bilinear(band, chunk, x, y).unwrap_or(band.nodata));
+                    data.push(sample_point(value_kind, band, chunk, x, y).unwrap_or(band.nodata));
                 }
             }
             Raster::from_vec(cols, rows, data, res, band.nodata).expect("combine dims")
         };
         let bands: Vec<Raster> = (0..inputs[0].bands.band_count())
             .map(|bi| {
-                on_grid(inputs[0], bi)
-                    .apply_binary(&on_grid(inputs[1], bi), &self.op)
+                on_grid(inputs[0], first_kind, bi)
+                    .apply_binary(&on_grid(inputs[1], second_kind, bi), &self.op)
                     .expect("equal dims by construction")
             })
             .collect();

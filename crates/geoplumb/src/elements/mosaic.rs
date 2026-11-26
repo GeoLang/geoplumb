@@ -1,16 +1,20 @@
 //! first-wins mosaic: each output pixel takes the first input, wiring
-//! order, that has a value there. inputs are sampled bilinearly onto the
-//! output grid, exact when an input shares the output alignment
+//! order, that has a value there. inputs are sampled onto the output grid,
+//! bilinearly for continuous values and from the containing pixel for
+//! categorical ones, exact when an input shares the output alignment
 
-use crate::caps::{CapsSet, Constraint};
+use crate::caps::{Caps, CapsSet, Constraint, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Fanin;
 use crate::error::Result;
-use crate::resample::sample_bilinear;
+use crate::resample::sample_point;
 use crate::window::WindowReq;
 use terrano_core::{BandedRaster, Raster};
 
-pub struct Mosaic;
+#[derive(Default)]
+pub struct Mosaic {
+    value_kind: Option<ValueKind>,
+}
 
 impl Fanin for Mosaic {
     fn identity(&self) -> String {
@@ -21,8 +25,14 @@ impl Fanin for Mosaic {
         Constraint::Identity(CapsSet::any_raster())
     }
 
+    fn configure(&mut self, _inputs: &[Caps], output: &Caps) -> Result<()> {
+        self.value_kind = Some(output.raster().value_kind);
+        Ok(())
+    }
+
     fn compute(&self, out: &WindowReq, inputs: &[Chunk]) -> Result<Chunk> {
         let inputs: Vec<&RasterChunk> = inputs.iter().map(Chunk::raster).collect::<Result<_>>()?;
+        let value_kind = self.value_kind.expect("configured");
         let res = out.resolution;
         let cols = (out.bbox.width() / res).round() as usize;
         let rows = (out.bbox.height() / res).round() as usize;
@@ -38,7 +48,8 @@ impl Fanin for Mosaic {
                         let v = inputs
                             .iter()
                             .find_map(|c| {
-                                sample_bilinear(
+                                sample_point(
+                                    value_kind,
                                     c.bands.band(bi).expect("negotiated bands"),
                                     c,
                                     x,

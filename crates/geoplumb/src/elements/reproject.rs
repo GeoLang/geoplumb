@@ -1,10 +1,12 @@
 //! crs change via projicio. the request plan inverse-projects the output
 //! window into the source crs, compute inverse-maps each output pixel
-//! center and samples the input bilinearly. `VecReproject` is the vector
-//! twin: it forward-projects the fragments themselves
+//! center and samples the input there, bilinearly for continuous values
+//! and from the containing pixel for categorical ones. `VecReproject` is
+//! the vector twin: it forward-projects the fragments themselves
 
 use crate::caps::{
-    Caps, CapsPattern, CapsSet, Constraint, Crs, FieldMask, RasterPattern, SetField, VectorPattern,
+    Caps, CapsPattern, CapsSet, Constraint, Crs, FieldMask, RasterPattern, SetField, ValueKind,
+    VectorPattern,
 };
 use crate::chunk::{Chunk, RasterChunk, VectorChunk, VectorFeature, clip_geometry};
 use crate::element::Transform;
@@ -20,6 +22,7 @@ pub struct Reproject {
     to: Crs,
     forward: Option<projicio_core::Transform>,
     inverse: Option<projicio_core::Transform>,
+    value_kind: Option<ValueKind>,
 }
 
 impl Reproject {
@@ -28,6 +31,7 @@ impl Reproject {
             to,
             forward: None,
             inverse: None,
+            value_kind: None,
         }
     }
 
@@ -126,6 +130,7 @@ pub(crate) fn warp_to_grid(
     out: &WindowReq,
     inverse: &projicio_core::Transform,
     to: Crs,
+    value_kind: ValueKind,
 ) -> Result<RasterChunk> {
     let res = out.resolution;
     let cols = (out.bbox.width() / res).round() as usize;
@@ -151,7 +156,7 @@ pub(crate) fn warp_to_grid(
             let data = src_pts
                 .iter()
                 .map(|&(sx, sy)| {
-                    crate::resample::sample_bilinear(band, input, sx, sy).unwrap_or(nodata)
+                    crate::resample::sample_point(value_kind, band, input, sx, sy).unwrap_or(nodata)
                 })
                 .collect();
             Raster::from_vec(cols, rows, data, res, nodata).expect("reproject dims")
@@ -200,6 +205,7 @@ impl Transform for Reproject {
         };
         self.forward = Some(mk(from, to)?);
         self.inverse = Some(mk(to, from)?);
+        self.value_kind = Some(input.raster().value_kind);
         Ok(())
     }
 
@@ -232,7 +238,8 @@ impl Transform for Reproject {
     }
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
-        warp_to_grid(input.raster()?, out, self.inv(), self.to).map(Chunk::Raster)
+        let value_kind = self.value_kind.expect("configured");
+        warp_to_grid(input.raster()?, out, self.inv(), self.to, value_kind).map(Chunk::Raster)
     }
 }
 

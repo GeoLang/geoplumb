@@ -1,6 +1,7 @@
 //! aspect: the angle a known plane comes back with, flat ground coming back
 //! as nodata, and seam equality against the whole-window reference
 
+use geoplumb::caps::ValueKind;
 use geoplumb::elements::{Aspect, RasterSrc};
 use geoplumb::{Bbox, Crs, Engine, Graph, WindowReq};
 use terrano_core::{BandedRaster, Raster};
@@ -37,6 +38,7 @@ fn src_from(elevation: impl Fn(usize, usize) -> f64) -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 

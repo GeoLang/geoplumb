@@ -3,9 +3,10 @@
 //!
 //! forward sweeps narrow every node's output link through its constraint,
 //! backward sweeps intersect each link with what all consumers can still
-//! accept. fanin couples siblings through their shared consumer, so the
-//! sweeps repeat until the links stop changing. fixation then assigns
-//! concrete caps source-first by backtracking search: a diamond can leave
+//! accept. fanin couples siblings through their shared consumer, on the
+//! fields its constraint couples, so the sweeps repeat until the links stop
+//! changing. fixation then assigns concrete caps source-first by
+//! backtracking search: a diamond can leave
 //! preference orders that disagree between branches, where greedy per-link
 //! fixation picks a jointly impossible combination. the greedy choice is
 //! tried first, so chains and plain fan-out fixate as before.
@@ -16,7 +17,7 @@
 //! demand is spliced in before re-solving. the solver never knows which
 //! caps field an adapter fixes, the element's constraint declares it
 
-use crate::caps::{Caps, CapsSet, Constraint};
+use crate::caps::{Caps, CapsSet, Constraint, FieldMask, conflicting_fields, meet};
 use crate::element::Adapter;
 use crate::error::{Error, Result};
 use crate::graph::{Graph, Node, NodeId};
@@ -101,11 +102,19 @@ fn try_solve(graph: &Graph) -> Result<Outcome> {
             let set = match parents[i].as_slice() {
                 [] => constraints[i].output_set(&CapsSet::any()),
                 ps => {
+                    let coupling = constraints[i].coupled_fields();
                     let mut upstream = links[ps[0]].clone();
                     for &p in &ps[1..] {
-                        let joined = upstream.intersect(&links[p]);
+                        let joined = meet(&upstream, &links[p], coupling);
                         if joined.is_empty() {
-                            return plug_or_fail(&graph.adapters, &upstream, &links[p], p, i);
+                            return plug_or_fail(
+                                &graph.adapters,
+                                &upstream,
+                                &links[p],
+                                coupling,
+                                p,
+                                i,
+                            );
                         }
                         upstream = joined;
                     }
@@ -115,6 +124,7 @@ fn try_solve(graph: &Graph) -> Result<Outcome> {
                             &graph.adapters,
                             &constraints[i].input_set(),
                             &upstream,
+                            None,
                             ps[0],
                             i,
                         );
@@ -125,34 +135,64 @@ fn try_solve(graph: &Graph) -> Result<Outcome> {
             let narrowed = links[i].intersect(&set);
             if narrowed.is_empty() {
                 let up = parents[i].first().copied().unwrap_or(i);
-                return Err(Error::EmptyLink {
-                    upstream: NodeId(up),
-                    downstream: NodeId(i),
-                    detail: "constraint derives no producible output".into(),
-                });
+                return Err(empty_link(
+                    up,
+                    i,
+                    "constraint derives no producible output",
+                    &links[i],
+                    &set,
+                    None,
+                ));
             }
             links[i] = narrowed;
         }
 
         // backward: every consumer narrows each of its parents' links. a
-        // fanin pin also carries the sibling links, coupling the branches
+        // fanin also meets each parent link with its siblings on the
+        // fields its constraint couples
         for &i in topo.iter().rev() {
             for child in graph.children(NodeId(i)) {
                 let c = child.0;
-                let mut pin = links[c].clone();
-                for &q in &parents[c] {
-                    if q != i {
-                        pin = pin.intersect(&links[q]);
-                    }
+                let input_set = constraints[c].input_set();
+                let accepted = links[i].intersect(&input_set);
+                if accepted.is_empty() {
+                    return Err(empty_link(
+                        i,
+                        c,
+                        "the consumer accepts none of the producer's caps",
+                        &links[i],
+                        &input_set,
+                        None,
+                    ));
                 }
-                let narrowed = constraints[c]
-                    .narrow_input(&links[i].intersect(&constraints[c].input_set()), &pin);
+                let coupling = constraints[c].coupled_fields();
+                let mut narrowed = constraints[c].narrow_input(&accepted, &links[c]);
                 if narrowed.is_empty() {
-                    return Err(Error::EmptyLink {
-                        upstream: NodeId(i),
-                        downstream: child,
-                        detail: "backward narrowing left no common caps".into(),
-                    });
+                    return Err(empty_link(
+                        i,
+                        c,
+                        "backward narrowing left no common caps",
+                        &accepted,
+                        &links[c],
+                        coupling,
+                    ));
+                }
+                for &q in &parents[c] {
+                    if q == i {
+                        continue;
+                    }
+                    let joined = meet(&narrowed, &links[q], coupling);
+                    if joined.is_empty() {
+                        return Err(empty_link(
+                            i,
+                            c,
+                            "fan-in inputs share no caps",
+                            &narrowed,
+                            &links[q],
+                            coupling,
+                        ));
+                    }
+                    narrowed = joined;
                 }
                 links[i] = narrowed;
             }
@@ -192,6 +232,31 @@ fn try_solve(graph: &Graph) -> Result<Outcome> {
     ))
 }
 
+fn empty_link(
+    upstream: usize,
+    downstream: usize,
+    what: &str,
+    onto: &CapsSet,
+    from: &CapsSet,
+    coupling: Option<FieldMask>,
+) -> Error {
+    Error::EmptyLink {
+        upstream: NodeId(upstream),
+        downstream: NodeId(downstream),
+        detail: format!(
+            "{what}{}",
+            no_common_value(&conflicting_fields(onto, from, coupling))
+        ),
+    }
+}
+
+fn no_common_value(fields: &[&str]) -> String {
+    match fields {
+        [] => String::new(),
+        fields => format!(", no common value for {}", fields.join(", ")),
+    }
+}
+
 /// try each registered adapter against the failing link: one whose bridged
 /// output meets the demand gets spliced, in registration order, taking the
 /// bridged set's first pattern. otherwise the link fails as before
@@ -199,11 +264,12 @@ fn plug_or_fail(
     adapters: &[Adapter],
     demand: &CapsSet,
     offer: &CapsSet,
+    coupling: Option<FieldMask>,
     parent: usize,
     child: usize,
 ) -> Result<Outcome> {
     for adapter in adapters {
-        let bridged = adapter.template.output_set(offer).intersect(demand);
+        let bridged = meet(&adapter.template.output_set(offer), demand, coupling);
         for alt in &bridged.alternatives {
             if let Some(element) = (adapter.build)(alt) {
                 return Ok(Outcome::NeedsPlug {
@@ -218,8 +284,10 @@ fn plug_or_fail(
         upstream: NodeId(parent),
         downstream: NodeId(child),
         detail: format!(
-            "producer offers {:?}, consumer side needs {:?}, no adapter bridges it",
-            offer.alternatives, demand.alternatives
+            "producer offers {:?}, consumer side needs {:?}, no adapter bridges it{}",
+            offer.alternatives,
+            demand.alternatives,
+            no_common_value(&conflicting_fields(demand, offer, coupling))
         ),
     })
 }
@@ -272,21 +340,17 @@ fn candidates_of(
     let set = match parents[i].as_slice() {
         [] => links[i].clone(),
         ps => {
-            let mut pat = fixed[ps[0]]
-                .as_ref()
-                .expect("parents fixed first")
-                .pattern();
+            let fixed_pattern =
+                |p: usize| CapsSet::one(fixed[p].as_ref().expect("parents fixed first").pattern());
+            let coupling = constraints[i].coupled_fields();
+            let mut joined = fixed_pattern(ps[0]);
             for &q in &ps[1..] {
-                let joined =
-                    pat.intersect(&fixed[q].as_ref().expect("parents fixed first").pattern());
-                match joined {
-                    Some(p) => pat = p,
-                    None => return Vec::new(),
+                joined = meet(&joined, &fixed_pattern(q), coupling);
+                if joined.is_empty() {
+                    return Vec::new();
                 }
             }
-            constraints[i]
-                .output_set(&CapsSet::one(pat))
-                .intersect(&links[i])
+            constraints[i].output_set(&joined).intersect(&links[i])
         }
     };
     let mut out: Vec<Caps> = Vec::new();

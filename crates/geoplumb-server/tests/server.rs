@@ -13,7 +13,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use geoplumb_server::config::{
     BinaryOpConfig, BurnConfig, Config, FaninConfig, FocalOpConfig, LayerConfig, OpConfig,
-    SourceConfig, UnaryOpConfig,
+    SourceConfig, UnaryOpConfig, ValueKindConfig,
 };
 use geoplumb_server::{Layer, parse_time, router};
 use nubis_core::{Point3, PointCloud, write_las};
@@ -716,12 +716,133 @@ fn config_parses_sources_ops_and_their_order() {
     let dem = &config.layers[1];
     assert!(source_of(dem).stac_search().is_none());
     match source_of(dem) {
-        SourceConfig::Cog { path } => assert_eq!(path.to_str(), Some("/data/dem.tif")),
+        SourceConfig::Cog { path, value_kind } => {
+            assert_eq!(path.to_str(), Some("/data/dem.tif"));
+            assert!(matches!(value_kind, ValueKindConfig::Continuous));
+        }
         other => panic!("unexpected source: {other:?}"),
     }
     assert!(matches!(dem.ops[..], [OpConfig::Hillshade { .. }]));
     assert!(matches!(config.layers[2].ops[..], [OpConfig::Slope]));
     assert!(matches!(config.layers[3].ops[..], [OpConfig::Aspect]));
+}
+
+const CATEGORICAL: &str = r#"
+[[layer]]
+name = "landcover"
+source = { kind = "cog", path = "/data/landcover.tif", value_kind = "categorical" }
+gray = { min = 0.0, max = 100.0 }
+
+[[layer]]
+name = "scenes"
+source = { kind = "stac", api = "https://example.test", collection = "landcover", assets = ["map"], bbox = [7.0, 46.3, 8.0, 46.9], value_kind = "categorical" }
+gray = { min = 0.0, max = 100.0 }
+"#;
+
+#[test]
+fn config_parses_a_categorical_value_kind() {
+    let config = Config::parse(CATEGORICAL).unwrap();
+    assert!(matches!(
+        source_of(&config.layers[0]),
+        SourceConfig::Cog {
+            value_kind: ValueKindConfig::Categorical,
+            ..
+        }
+    ));
+    let search = source_of(&config.layers[1])
+        .stac_search()
+        .expect("a stac source");
+    assert_eq!(search.value_kind, geoplumb::caps::ValueKind::Categorical);
+
+    let err = Config::parse(&CATEGORICAL.replacen("\"categorical\"", "\"ordinal\"", 1))
+        .expect_err("an unknown value kind parsed");
+    assert!(err.contains("ordinal"), "{err}");
+}
+
+const CATEGORICAL_STAC: &str = r#"
+[[layer]]
+name = "scenes"
+source = { kind = "stac", api = "https://example.test", collection = "landcover", assets = ["map"], bbox = [7.0, 46.3, 8.0, 46.9], value_kind = "categorical", composite = COMPOSITE }
+gray = { min = 0.0, max = 100.0 }
+"#;
+
+#[test]
+fn a_categorical_stac_layer_refuses_the_composites_that_blend_values() {
+    for (composite, name) in [
+        ("\"mean\"", "mean"),
+        ("\"median\"", "median"),
+        ("{ percentile = 90.0 }", "percentile"),
+        ("\"stddev\"", "stddev"),
+    ] {
+        let err = Config::parse(&CATEGORICAL_STAC.replace("COMPOSITE", composite))
+            .expect_err("a blending composite parsed over categorical values");
+        assert!(err.contains(name), "{err}");
+        assert!(err.contains("layer scenes"), "{err}");
+    }
+    for composite in ["\"latest\"", "\"min\"", "\"max\"", "\"count\""] {
+        Config::parse(&CATEGORICAL_STAC.replace("COMPOSITE", composite))
+            .unwrap_or_else(|e| panic!("{composite}: {e}"));
+    }
+}
+
+fn write_classes(dir: &Path) -> String {
+    let mut data = Vec::with_capacity(W * H);
+    for row in 0..H {
+        for col in 0..W {
+            data.push(1.0 + ((col / 7 + row / 5) % 2) as f64);
+        }
+    }
+    let raster = Raster::from_vec(W, H, data, CELL, f64::NAN).unwrap();
+    let params = CogParams {
+        // terrano averages the overviews it writes
+        overview_levels: 0,
+        ..cog_params()
+    };
+    let path = dir.join("classes.tif");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write_cog(&raster, &params, &mut file).unwrap();
+    path.display().to_string().replace('\\', "/")
+}
+
+const CLASS_LAYERS: &str = r#"
+[[layer]]
+name = "classes"
+source = { kind = "cog", path = "CLASS_PATH", value_kind = "categorical" }
+gray = { min = 0.0, max = 3.0 }
+
+[[layer]]
+name = "blended"
+source = { kind = "cog", path = "CLASS_PATH" }
+gray = { min = 0.0, max = 3.0 }
+"#;
+
+#[tokio::test]
+async fn a_categorical_cog_layer_serves_only_its_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&CLASS_LAYERS.replace("CLASS_PATH", &write_classes(dir.path())));
+    let off_class = |grays: &[u8]| {
+        grays
+            .iter()
+            .filter(|g| **g != CLASS_ONE_GRAY && **g != CLASS_TWO_GRAY)
+            .count()
+    };
+
+    for z in [9, 12] {
+        let (x, y) = tile_of(z, 7.3, 46.8);
+        let (status, png) = get(&app, &format!("/tiles/classes/{z}/{x}/{y}.png")).await;
+        assert_eq!(status, StatusCode::OK);
+        let grays = opaque_grays(&png);
+        assert!(!grays.is_empty(), "z{z} rendered nothing but nodata");
+        assert_eq!(off_class(&grays), 0, "z{z} holds a blended value");
+    }
+
+    let (x, y) = tile_of(12, 7.3, 46.8);
+    let (status, png) = get(&app, &format!("/tiles/blended/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        off_class(&opaque_grays(&png)) > 0,
+        "the continuous layer blends no classes"
+    );
 }
 
 #[test]
@@ -1351,8 +1472,8 @@ async fn every_op_renders_a_tile_and_the_pixels_show_it_ran() {
         distinct("plain")
     );
 
-    // reclassify collapses that ramp onto its two class values, and only
-    // the bilinear reprojection across a class boundary lands between them
+    // reclassify collapses that ramp onto its two class values, and its
+    // categorical output reprojects and resamples without blending them
     let classed = grays["reclassified"]
         .iter()
         .filter(|g| **g == CLASS_ONE_GRAY || **g == CLASS_TWO_GRAY)
@@ -1362,10 +1483,10 @@ async fn every_op_renders_a_tile_and_the_pixels_show_it_ran() {
             && grays["reclassified"].contains(&CLASS_TWO_GRAY),
         "both classes should reach the tile"
     );
-    assert!(
-        classed * 10 > grays["reclassified"].len() * 9,
-        "only class boundaries should sit off a class value, {classed} of {} did not",
-        grays["reclassified"].len()
+    assert_eq!(
+        classed,
+        grays["reclassified"].len(),
+        "a pixel sits off a class value"
     );
 
     // the mask keeps class one and drops class two, so it renders a strict
@@ -1438,17 +1559,13 @@ async fn a_geojson_layer_burns_its_features_into_the_tile() {
     assert!(grays.len() > 60_000, "only {} pixels burned", grays.len());
     assert!(grays.contains(&SHALLOW_GRAY), "the 1.0 parcel is missing");
     assert!(grays.contains(&DEEP_GRAY), "the 3.0 parcel is missing");
-    // only the seam between them, where the reprojection samples across
-    // both, lands off a burned value
+    // rasterize output is categorical, so the seam between them reprojects
+    // without blending the two depths
     let burned = grays
         .iter()
         .filter(|g| **g == SHALLOW_GRAY || **g == DEEP_GRAY)
         .count();
-    assert!(
-        burned * 10 > grays.len() * 9,
-        "{burned} of {} pixels hold a parcel depth",
-        grays.len()
-    );
+    assert_eq!(burned, grays.len(), "a pixel sits off a parcel depth");
 }
 
 #[tokio::test]
@@ -1467,11 +1584,7 @@ async fn a_gpkg_layer_burns_its_features_into_the_tile() {
         .iter()
         .filter(|g| **g == SHALLOW_GRAY || **g == DEEP_GRAY)
         .count();
-    assert!(
-        burned * 10 > grays.len() * 9,
-        "{burned} of {} pixels hold a parcel depth",
-        grays.len()
-    );
+    assert_eq!(burned, grays.len(), "a pixel sits off a parcel depth");
 
     let (status, body) = get(&app, "/layers").await;
     assert_eq!(status, StatusCode::OK);
@@ -1843,12 +1956,35 @@ altitude = 45.0
 fn config_parses_a_gdal_layer_and_its_band() {
     let config = Config::parse(GDAL_BESIDE_COG).unwrap();
     match source_of(&config.layers[1]) {
-        SourceConfig::Gdal { path, band } => {
+        SourceConfig::Gdal { path, band, .. } => {
             assert_eq!(path, Path::new("GDAL_PATH"));
             assert_eq!(*band, Some(1));
         }
         other => panic!("expected a gdal source, got {other:?}"),
     }
+}
+
+#[cfg(feature = "gdal")]
+#[test]
+fn config_parses_a_gdal_layers_value_kind() {
+    let config =
+        Config::parse(&GDAL_BESIDE_COG.replace("band = 1", "value_kind = \"categorical\""))
+            .unwrap();
+    assert!(matches!(
+        source_of(&config.layers[1]),
+        SourceConfig::Gdal {
+            band: None,
+            value_kind: ValueKindConfig::Categorical,
+            ..
+        }
+    ));
+    assert!(matches!(
+        source_of(&Config::parse(GDAL_BESIDE_COG).unwrap().layers[1]),
+        SourceConfig::Gdal {
+            value_kind: ValueKindConfig::Continuous,
+            ..
+        }
+    ));
 }
 
 #[cfg(not(feature = "gdal"))]
@@ -2013,4 +2149,44 @@ async fn malformed_tile_requests_are_rejected_not_rendered() {
         let (status, _) = get(&app, uri).await;
         assert_eq!(status, expected, "{uri}");
     }
+}
+
+const NETCDF_AND_GRIB: &str = r#"
+[[layer]]
+name = "sst"
+source = { kind = "netcdf", path = "/data/sst.nc", variable = "sst", datetime = "2024-01-01T00:00:00Z/2024-01-02T00:00:00Z", select = { zlev = 0 } }
+
+[[layer]]
+name = "t2m"
+source = { kind = "grib", path = "/data/gsm.grib2", message = 5 }
+"#;
+
+#[test]
+fn config_parses_netcdf_and_grib_layers() {
+    let config = Config::parse(NETCDF_AND_GRIB).unwrap();
+    match source_of(&config.layers[0]) {
+        SourceConfig::Netcdf {
+            variable, select, ..
+        } => {
+            assert_eq!(variable, "sst");
+            assert_eq!(select.get("zlev"), Some(&0));
+        }
+        other => panic!("expected a netcdf source, got {other:?}"),
+    }
+    match source_of(&config.layers[1]) {
+        SourceConfig::Grib { message, .. } => assert_eq!(*message, 5),
+        other => panic!("expected a grib source, got {other:?}"),
+    }
+}
+
+#[test]
+fn netcdf_and_grib_layers_refuse_a_bad_datetime_and_message_zero() {
+    let bad_datetime = NETCDF_AND_GRIB.replace("2024-01-02T00:00:00Z", "tomorrow");
+    let message = Config::parse(&bad_datetime).unwrap_err();
+    assert!(message.contains("layer sst"), "{message}");
+    assert!(message.contains("datetime"), "{message}");
+    let zero = NETCDF_AND_GRIB.replace("message = 5", "message = 0");
+    let message = Config::parse(&zero).unwrap_err();
+    assert!(message.contains("layer t2m"), "{message}");
+    assert!(message.contains("count from 1"), "{message}");
 }

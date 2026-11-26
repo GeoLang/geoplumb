@@ -3,7 +3,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use geoplumb::caps::{CapsPattern, CapsSet, Constraint, Domain, SetField, TensorPattern};
+use geoplumb::caps::{
+    CapsPattern, CapsSet, Constraint, Domain, SetField, TensorPattern, ValueKind,
+};
 use geoplumb::element::Transform;
 use geoplumb::elements::{RasterSrc, TensorConv, ToRaster, ToTensor, WgpuConvolve};
 use geoplumb::gpu::{DISPATCHES_PER_SUBMIT, GpuContext};
@@ -59,6 +61,7 @@ fn src() -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 
@@ -84,6 +87,7 @@ fn holed_src() -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 

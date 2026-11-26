@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::caps::{
     CapsPattern, CapsSet, Constraint, Crs, Dtype, FieldMask, RasterPattern, ResRange, SetField,
-    VectorPattern,
+    ValueKind, VectorPattern,
 };
 use crate::chunk::{Chunk, RasterChunk, VectorChunk, VectorFeature, clip_geometry};
 use crate::element::{Source, Transform};
@@ -360,10 +360,12 @@ impl Transform for Rasterize {
                 dtype: false,
                 bands: false,
                 resolution: false,
+                value_kind: false,
             },
             output: CapsPattern::Raster(RasterPattern {
                 dtype: SetField::one(Dtype::F64),
                 bands: SetField::one(1),
+                value_kind: SetField::one(ValueKind::Categorical),
                 ..RasterPattern::default()
             }),
         }

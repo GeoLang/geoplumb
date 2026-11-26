@@ -2,7 +2,9 @@
 //! bands through an expression parsed at construction. window-local on an
 //! identity plan, so chunked output equals whole-window output
 
-use crate::caps::{CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField};
+use crate::caps::{
+    CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField, ValueKind,
+};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::error::{Error, Result};
@@ -409,10 +411,12 @@ impl Transform for BandMath {
                 crs: true,
                 resolution: true,
                 chunk_px: true,
+                value_kind: false,
             },
             output: CapsPattern::Raster(RasterPattern {
                 dtype: SetField::one(Dtype::F64),
                 bands: SetField::one(1),
+                value_kind: SetField::one(ValueKind::Continuous),
                 ..RasterPattern::default()
             }),
         }

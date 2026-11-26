@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use gdal::raster::Buffer;
 use gdal::spatial_ref::SpatialRef;
 use gdal::{Dataset, DatasetOptions, DriverManager, GdalOpenFlags};
+use geoplumb::caps::ValueKind;
 use geoplumb::element::Source;
 use geoplumb::elements::{GdalSrc, RasterSrc};
 use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, WindowReq};
@@ -175,8 +176,8 @@ fn assert_matches_memory(gdal: &RasterChunk, memory: &RasterChunk, relative_tole
 async fn base_level_matches_in_memory_source_exactly() {
     let dir = tempfile::tempdir().unwrap();
     let (path, bytes) = fixture(dir.path());
-    let src = GdalSrc::open(&path).unwrap();
-    let memory = RasterSrc::from_geotiff(&bytes).unwrap();
+    let src = GdalSrc::open(&path, ValueKind::Continuous).unwrap();
+    let memory = RasterSrc::from_geotiff(&bytes, ValueKind::Continuous).unwrap();
     assert_eq!(src.driver(), "GTiff");
 
     // 16 px past every edge, so the clamped read and the nan padding run
@@ -191,8 +192,8 @@ async fn base_level_matches_in_memory_source_exactly() {
 async fn overview_level_matches_block_average() {
     let dir = tempfile::tempdir().unwrap();
     let (path, bytes) = fixture(dir.path());
-    let src = GdalSrc::open(&path).unwrap();
-    let memory = RasterSrc::from_geotiff(&bytes).unwrap();
+    let src = GdalSrc::open(&path, ValueKind::Continuous).unwrap();
+    let memory = RasterSrc::from_geotiff(&bytes, ValueKind::Continuous).unwrap();
 
     let req = request(window(-16, -16, W as i64 + 16, H as i64 + 16), CELL * 2.0);
     let a = read(&src, &req).await;
@@ -204,8 +205,8 @@ async fn overview_level_matches_block_average() {
 async fn coarser_than_the_pyramid_decimates_the_coarsest_overview() {
     let dir = tempfile::tempdir().unwrap();
     let (path, bytes) = fixture(dir.path());
-    let src = GdalSrc::open(&path).unwrap();
-    let memory = RasterSrc::from_geotiff(&bytes).unwrap();
+    let src = GdalSrc::open(&path, ValueKind::Continuous).unwrap();
+    let memory = RasterSrc::from_geotiff(&bytes, ValueKind::Continuous).unwrap();
 
     // 8 cells is 2x past the 4x overview. the window stops at the last
     // whole block above the single pixel holes, where an average of
@@ -222,8 +223,8 @@ async fn coarser_than_the_pyramid_decimates_the_coarsest_overview() {
 async fn one_band_serves_alone() {
     let dir = tempfile::tempdir().unwrap();
     let (path, bytes) = fixture(dir.path());
-    let src = GdalSrc::open_band(&path, 3).unwrap();
-    let memory = RasterSrc::from_geotiff(&bytes).unwrap();
+    let src = GdalSrc::open_band(&path, 3, ValueKind::Continuous).unwrap();
+    let memory = RasterSrc::from_geotiff(&bytes, ValueKind::Continuous).unwrap();
 
     let req = request(window(0, 0, W as i64, H as i64), CELL);
     let a = read(&src, &req).await;
@@ -235,7 +236,7 @@ async fn one_band_serves_alone() {
     };
     assert_matches_memory(&a, &only_third, 0.0);
 
-    let err = GdalSrc::open_band(&path, 4)
+    let err = GdalSrc::open_band(&path, 4, ValueKind::Continuous)
         .err()
         .expect("band 4 of 3 opened");
     assert!(err.to_string().contains("3 bands"), "{err}");
@@ -277,7 +278,7 @@ async fn nodata_value_reads_as_nan() {
         band.write((0, 0), (SMALL, SMALL), &mut buffer).unwrap();
     }
 
-    let src = GdalSrc::open(&path).unwrap();
+    let src = GdalSrc::open(&path, ValueKind::Continuous).unwrap();
     let req = request(window(0, 0, SMALL as i64, SMALL as i64), CELL);
     let chunk = read(&src, &req).await;
     for (i, (&got, &written)) in chunk
@@ -303,7 +304,9 @@ fn rotated_geotransform_fails_at_open() {
     let path = dir.path().join("rotated.tif");
     let rotated = [ORIGIN_X, CELL, CELL / 4.0, ORIGIN_Y, 0.0, -CELL];
     drop(gdal_tiff(&path, rotated, Some(4326)));
-    let err = GdalSrc::open(&path).err().expect("rotated file opened");
+    let err = GdalSrc::open(&path, ValueKind::Continuous)
+        .err()
+        .expect("rotated file opened");
     let message = err.to_string();
     assert!(message.contains("rotated.tif"), "{message}");
     assert!(message.contains("rotated"), "{message}");
@@ -314,7 +317,9 @@ fn dataset_without_an_epsg_authority_fails_at_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unreferenced.tif");
     drop(gdal_tiff(&path, NORTH_UP, None));
-    let err = GdalSrc::open(&path).err().expect("file with no crs opened");
+    let err = GdalSrc::open(&path, ValueKind::Continuous)
+        .err()
+        .expect("file with no crs opened");
     assert!(err.to_string().contains("unreferenced.tif"), "{err}");
 }
 
@@ -323,13 +328,15 @@ async fn concurrent_chunks_match_one_read() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = fixture(dir.path());
     let mut graph = Graph::new();
-    let node = graph.add_source(Box::new(GdalSrc::open(&path).unwrap()));
+    let node = graph.add_source(Box::new(
+        GdalSrc::open(&path, ValueKind::Continuous).unwrap(),
+    ));
     let engine = Engine::new(graph, 64 << 20).unwrap();
 
     // 600 by 400 at chunk_px 256 is six chunks, read on blocking tasks
     let req = request(window(0, 0, W as i64, H as i64), CELL);
     let pulled = engine.pull(node, req).await.unwrap().into_raster().unwrap();
-    let whole = read(&GdalSrc::open(&path).unwrap(), &req).await;
+    let whole = read(&GdalSrc::open(&path, ValueKind::Continuous).unwrap(), &req).await;
     assert_eq!(pulled.width(), W);
     for (a, b) in pulled.bands.bands().iter().zip(whole.bands.bands()) {
         for (x, y) in a.data().iter().zip(b.data()) {

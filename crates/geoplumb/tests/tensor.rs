@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::future::BoxFuture;
-use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField, TensorPattern};
+use geoplumb::caps::{
+    CapsPattern, CapsSet, Constraint, RasterPattern, SetField, TensorPattern, ValueKind,
+};
 use geoplumb::element::{Source, Transform};
 use geoplumb::elements::{Hillshade, RasterSrc, TensorConv, ToRaster, ToTensor};
 use geoplumb::{Bbox, Chunk, Crs, Engine, Error, Graph, WindowReq};
@@ -51,6 +53,7 @@ fn src() -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 
@@ -67,6 +70,7 @@ fn one_band_src() -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 

@@ -3,6 +3,7 @@
 //!
 //! usage: pyramid [max_z] [out_dir], defaults 12 and ./tiles
 
+use geoplumb::caps::ValueKind;
 use geoplumb::elements::{Hillshade, RasterSrc, Reproject};
 use geoplumb::tile::XyzTile;
 use geoplumb::{Crs, Engine, Graph};
@@ -28,6 +29,7 @@ fn synthetic_dem() -> RasterSrc {
         ORIGIN.0,
         ORIGIN.1,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 

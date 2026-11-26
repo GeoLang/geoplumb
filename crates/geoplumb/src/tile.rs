@@ -59,5 +59,9 @@ pub async fn render_tile_at(
             },
         )
         .await?;
-    Ok(resample_to_grid(pulled.raster()?, &bbox, TILE_PX, TILE_PX))
+    let raster = pulled.raster()?;
+    let value_kind = engine.caps(node).raster().value_kind;
+    Ok(resample_to_grid(
+        raster, &bbox, TILE_PX, TILE_PX, value_kind,
+    ))
 }

@@ -262,6 +262,114 @@ against GDAL would bound. The honest end state is the one the owner
 decision already names: pure Rust for every format that has a user, GDAL
 behind a feature for the rest, and the feature off in every default build.
 
+## 8. Output, correctness and algorithm gaps
+
+Sections 1 to 6 are about reading. These are about what comes out, checked
+2026-11-26 against every repo in the org. Where another repo already does the
+job, geoplumb takes it over and that repo calls geoplumb, so there is one
+code path (owner decision 2026-11-26).
+
+Waves run in parallel worktrees under `/home/aaron/src/GeoLang/.worktrees/`,
+each with its own `CARGO_TARGET_DIR`. Agents write code and run `cargo fmt`
+only. A scripted gate builds and tests each settled tree, and a box is ticked
+only after a proof script passes on real input, recorded in
+`/home/aaron/tmp/geolang-fix/proof-ledger.tsv`.
+
+### Wave 1
+
+- [x] 8.0 terrano-core lock bump, 357778f to 62842f8. The locked `CogReader`
+      reads a GDAL-written overview's pixel width as a denormal (about
+      4e-321 on ESA WorldCover), so `select_level` never picks an overview
+      and a z6 tile reads the full-resolution level: geoplumb-server went
+      past 4 GB and was killed. terrano master reads the widths right and
+      tiletopia already locks it. The bump also brings `write_cog_tiles`
+      for 8.4. Lands alone, before the wave 1 merges, together with the
+      `needless_range_loop` fix in `TensorConv::compute` that Rust 1.100
+      clippy (stable since 2026-11-09) flags, which fails master's next CI
+      run otherwise. Both sit in the `geoplumb-baseline` worktree.
+- [x] 8.1 Categorical rasters. Every resampling path is bilinear or block
+      average, so land cover, `reclassify` and `rasterize` output blend class
+      codes at coarse levels and across a reprojection. Raster caps gain a
+      `value_kind` field, `Continuous` or `Categorical`, negotiated like dtype
+      and covered by a new `FieldMask` bit. Sources declare it, `cog`, `gdal`
+      and `stac` taking `value_kind = "categorical"` in a layer file.
+      `reclassify` and `rasterize` pin `Categorical` on their output, the
+      terrain, focal, bandmath, unary, convolve and idw elements pin
+      `Continuous`, everything else passes it through. Categorical data
+      decimates by mode (ties to the smaller code) and warps and resamples by
+      nearest neighbour, in `RasterSrc`, `cog::decimate` (`CogSrc`,
+      `GdalSrc`), `warp_to_grid` (`Reproject`, cross-crs `StacSrc` items),
+      `resample_to_grid`, `Mosaic` and `Combine`. Continuous output stays
+      byte-identical. Proof: an ESA WorldCover COG served categorical, every
+      tile value at z6 to z12 and in EPSG:4326 and 3857 a WorldCover class
+      code or nodata.
+- [x] 8.2 One MVT encoder. `fenestra-core/src/mvt.rs` holds the org's only
+      MVT encoder. Its format-only part (`MvtFeature`, `MvtGeometry`,
+      `MvtValue`, `MvtLayer`, `encode_tile`) moves to `jung-mvt` beside the
+      decoder, fenestra calls it there, and the GeoJSON conversions stay in
+      fenestra. Proof: fenestra's tile route output byte-identical before and
+      after, and a jung-mvt round trip test.
+- [x] 8.3 NetCDF and GRIB2 sources. terrano reads NetCDF classic and 64-bit
+      offset and simple-packed GRIB2, and no repo calls either reader. A
+      `NetcdfSrc` (one variable, georeferenced from its lat/lon or x/y
+      coordinate variables, a time dimension resolved per pull time) and a
+      `GribSrc` (one message, regular lat/lon grid template), both layer
+      file source kinds. Proof: a public NOAA or Copernicus file served as
+      tiles whose values match the reader's own decode at sampled pixels.
+      terrano's readers fail on real files (GRIB2 section 3 read three
+      octets off, sign-magnitude integers read as two's complement, no
+      bitmap or multi-field messages; NetCDF record variables and 1-D
+      coordinate variables unreadable, NC_BYTE unsigned), so they are fixed
+      in terrano (worktree `terrano-grib-netcdf`) and geoplumb holds no
+      format parsing. Real data: NOAA OISST v2.1 NetCDF classic from
+      CoastWatch ERDDAP, JMA GSM GRIB2 (simple packing, 103 fields).
+
+- [ ] 8.1b Value kind per band. `value_kind` is a link field, so a STAC
+      source naming `["red", "scl"]` resamples its SCL quality codes like
+      reflectance. Below native zoom the codes blend (4.5) and `QualityMask`'s
+      exact match drops the pixel, which the `s2-red-clear` example layer
+      hits. Needs a kind per band in raster caps and chunks, not per link.
+
+### Wave 2
+
+- [ ] 8.4 Export. tiletopia's `/api/v1/analysis/export/{op}` pulls three
+      fixed ops whole into memory as a web mercator COG under a 4096x4096
+      cap. geoplumb gets `export::write_cog`: a grid in the node's own crs,
+      streamed through terrano's `write_cog_tiles` one tile at a time, the
+      overviews pulled from the engine at coarser resolutions rather than
+      averaged, resampling per `value_kind`. `geoplumb-server` gets
+      `GET /export/{layer}?bbox&crs&resolution&t`, bbox in the target crs as
+      gdalwarp's `-te`, building an engine for the layer ending in that crs.
+      tiletopia's export route then calls `export::write_cog` and its own
+      grid and encode code is deleted. Proof: an export in EPSG:32632 passes
+      GDAL's `validate_cloud_optimized_geotiff.py --full-check`, and its
+      pixels match the same window pulled from the engine.
+- [ ] 8.5 Vector layers. A layer whose chain ends in vector features is
+      served as `/tiles/{layer}/{z}/{x}/{y}.mvt` through jung-mvt, with the
+      `rasterize` requirement on `geojson` and `gpkg` dropped for it. Proof:
+      `ogrinfo` reads a served tile, features match the source in a bbox.
+- [ ] 8.6 Raster to vector elements. `Contours` and `Polygonize` over
+      terrano's kernels as cross-kind transforms, seam-consistent across
+      tiles, servable through 8.5. `Viewshed` as a transform whose plan is
+      the observer's radius, not the output window.
+
+### Wave 3
+
+- [ ] 8.7 Global operations. Flow accumulation, watershed and stream order
+      depend on a whole upstream basin, so no fixed halo works. tiletopia
+      runs them over one bounded window in memory. Design before building:
+      a transform over a declared region computed once per ladder level and
+      pull time, under a pixel cap. Then tiletopia's
+      `/api/v1/analysis/terrain` and `/viewshed` call geoplumb and its
+      copies go.
+- [ ] 8.8 Zarr source over `zarrs`, after checking the crate is still the
+      current choice.
+- [ ] 8.9 Native dtype. Every source serves f64. terrano's `Raster` is f64
+      only, so this starts as a design: where a typed sample buffer lives
+      (terrano or a geoplumb chunk), and what compute does with it.
+- [ ] 8.10 Colour ramps on png tiles, dogfooding `jung-core`'s `ColorRamp`,
+      and CRS input beyond EPSG codes in projicio.
+
 ## Order
 
 1. Section 1, the `gdal` source: the coverage, and the driver name that

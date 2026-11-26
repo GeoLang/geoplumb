@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use geoplumb::caps::{CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField};
+use geoplumb::caps::{
+    CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField, ValueKind,
+};
 use geoplumb::element::Source;
 use geoplumb::elements::RasterSrc;
 use geoplumb::window::GridSpec;
@@ -59,6 +61,7 @@ fn dem(sample: impl Fn(usize, usize) -> f64) -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 
@@ -186,6 +189,7 @@ impl Source for ClockSrc {
             crs: SetField::one(Crs::WGS84),
             resolution: ResRange::at_least(CELL),
             chunk_px: SetField::Any,
+            value_kind: SetField::Any,
         })))
     }
 

@@ -28,10 +28,11 @@ use tokio::sync::Semaphore;
 #[cfg(feature = "gdal")]
 use geoplumb::elements::GdalSrc;
 use geoplumb::elements::algebra::AlgebraOp;
+use geoplumb::elements::stac::format_rfc3339;
 use geoplumb::elements::{
     Aspect, BandMath, CogSrc, Combine, CopcSrc, Focal, GpkgSrc, Hillshade, IdwGrid, LasSrc,
-    MapAlgebra, Mosaic, QualityMask, Rasterize, Reproject, Slope, StacSrc, TensorConv, ToRaster,
-    ToTensor, VecClip, VecFilter, VecSchema, VecSrc,
+    MapAlgebra, Mosaic, NetcdfSrc, QualityMask, RasterSrc, Rasterize, Reproject, Slope, StacSrc,
+    TensorConv, ToRaster, ToTensor, VecClip, VecFilter, VecSchema, VecSrc,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Crs, Engine, Graph, NodeId, Source, TimeInterval};
@@ -59,8 +60,8 @@ pub struct Layer {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerInfo {
     pub name: String,
-    /// `stac`, `cog`, `gdal`, `geojson`, `gpkg`, `las`, `copc`, or `composite` for a fan-in
-    /// layer
+    /// `stac`, `cog`, `gdal`, `geojson`, `gpkg`, `las`, `copc`, `netcdf`, `grib`, or
+    /// `composite` for a fan-in layer
     pub source: &'static str,
     pub collection: Option<String>,
     /// the interval pulls take when they name none
@@ -145,7 +146,7 @@ pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
                 infos.push(info);
             }
             let joined = match fanin {
-                FaninConfig::Mosaic => graph.add_fanin(&tips, Box::new(Mosaic)),
+                FaninConfig::Mosaic => graph.add_fanin(&tips, Box::new(Mosaic::default())),
                 FaninConfig::Combine { op } => {
                     graph.add_fanin(&tips, Box::new(Combine::new((*op).into())))
                 }
@@ -240,24 +241,26 @@ fn add_ops(graph: &mut Graph, node: NodeId, ops: &[OpConfig]) -> Result<NodeId, 
 }
 
 /// what `/layers` publishes about a fan-in layer: no collection of its
-/// own, and the time fields of the first stac input where it has one
+/// own, and the time fields of the first input that has any
 fn composite_info(name: &str, inputs: Vec<LayerInfo>) -> LayerInfo {
-    let stac = inputs.into_iter().find(|i| i.source == "stac");
+    let timed = inputs
+        .into_iter()
+        .find(|i| i.default_datetime.is_some() || i.temporal_extent.is_some());
     LayerInfo {
         name: name.to_string(),
         source: "composite",
         collection: None,
-        default_datetime: stac.as_ref().and_then(|i| i.default_datetime.clone()),
-        temporal_extent: stac.and_then(|i| i.temporal_extent),
+        default_datetime: timed.as_ref().and_then(|i| i.default_datetime.clone()),
+        temporal_extent: timed.and_then(|i| i.temporal_extent),
     }
 }
 
 fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, LayerInfo), String> {
     let name = layer.to_string();
     match source {
-        SourceConfig::Cog { path } => {
+        SourceConfig::Cog { path, value_kind } => {
             let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let src = CogSrc::open(file).map_err(|e| e.to_string())?;
+            let src = CogSrc::open(file, (*value_kind).into()).map_err(|e| e.to_string())?;
             Ok((
                 Box::new(src),
                 LayerInfo {
@@ -270,10 +273,14 @@ fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, L
             ))
         }
         #[cfg(feature = "gdal")]
-        SourceConfig::Gdal { path, band } => {
+        SourceConfig::Gdal {
+            path,
+            band,
+            value_kind,
+        } => {
             let src = match band {
-                None => GdalSrc::open(path),
-                Some(band) => GdalSrc::open_band(path, *band),
+                None => GdalSrc::open(path, (*value_kind).into()),
+                Some(band) => GdalSrc::open_band(path, *band, (*value_kind).into()),
             }
             .map_err(|e| e.to_string())?;
             println!("layer {layer}: gdal driver {}", src.driver());
@@ -350,6 +357,66 @@ fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, L
                 LayerInfo {
                     name,
                     source: "copc",
+                    collection: None,
+                    default_datetime: None,
+                    temporal_extent: None,
+                },
+            ))
+        }
+        SourceConfig::Netcdf {
+            path,
+            variable,
+            crs,
+            datetime,
+            select,
+            value_kind,
+        } => {
+            let interval = datetime
+                .as_deref()
+                .map(TimeInterval::parse)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let src = NetcdfSrc::open(
+                path,
+                variable,
+                select,
+                crs.map(Crs),
+                interval,
+                (*value_kind).into(),
+            )
+            .map_err(|e| e.to_string())?;
+            let steps = src.step_instants_ms();
+            let temporal_extent = steps
+                .iter()
+                .min()
+                .zip(steps.iter().max())
+                .map(|(start, end)| TemporalExtent {
+                    start: Some(format_rfc3339(*start)),
+                    end: Some(format_rfc3339(*end)),
+                });
+            Ok((
+                Box::new(src),
+                LayerInfo {
+                    name,
+                    source: "netcdf",
+                    collection: None,
+                    default_datetime: datetime.clone(),
+                    temporal_extent,
+                },
+            ))
+        }
+        SourceConfig::Grib {
+            path,
+            message,
+            value_kind,
+        } => {
+            let src = RasterSrc::from_grib(path, *message, (*value_kind).into())
+                .map_err(|e| e.to_string())?;
+            Ok((
+                Box::new(src),
+                LayerInfo {
+                    name,
+                    source: "grib",
                     collection: None,
                     default_datetime: None,
                     temporal_extent: None,

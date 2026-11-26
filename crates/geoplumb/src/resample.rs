@@ -1,12 +1,20 @@
-//! driver-side bilinear resample onto an exact output grid. the engine
-//! returns chunk-aligned windows at ladder resolutions, a tile wants an
-//! exact 256 px grid, this bridges the two
+//! driver-side resample onto an exact output grid, bilinear for continuous
+//! values and nearest for categorical ones. the engine returns
+//! chunk-aligned windows at ladder resolutions, a tile wants an exact
+//! 256 px grid, this bridges the two
 
+use crate::caps::ValueKind;
 use crate::chunk::RasterChunk;
 use crate::window::Bbox;
 use terrano_core::{BandedRaster, Raster};
 
-pub fn resample_to_grid(src: &RasterChunk, bbox: &Bbox, cols: usize, rows: usize) -> RasterChunk {
+pub fn resample_to_grid(
+    src: &RasterChunk,
+    bbox: &Bbox,
+    cols: usize,
+    rows: usize,
+    value_kind: ValueKind,
+) -> RasterChunk {
     let out_res_x = bbox.width() / cols as f64;
     let out_res_y = bbox.height() / rows as f64;
     let bands: Vec<Raster> = src
@@ -20,7 +28,7 @@ pub fn resample_to_grid(src: &RasterChunk, bbox: &Bbox, cols: usize, rows: usize
                 let y = bbox.max_y - (row as f64 + 0.5) * out_res_y;
                 for col in 0..cols {
                     let x = bbox.min_x + (col as f64 + 0.5) * out_res_x;
-                    data.push(sample_bilinear(band, src, x, y).unwrap_or(nodata));
+                    data.push(sample_point(value_kind, band, src, x, y).unwrap_or(nodata));
                 }
             }
             Raster::from_vec(cols, rows, data, out_res_x, nodata).expect("resample dims")
@@ -34,7 +42,20 @@ pub fn resample_to_grid(src: &RasterChunk, bbox: &Bbox, cols: usize, rows: usize
     }
 }
 
-pub(crate) fn sample_bilinear(band: &Raster, chunk: &RasterChunk, x: f64, y: f64) -> Option<f64> {
+pub(crate) fn sample_point(
+    value_kind: ValueKind,
+    band: &Raster,
+    chunk: &RasterChunk,
+    x: f64,
+    y: f64,
+) -> Option<f64> {
+    match value_kind {
+        ValueKind::Continuous => sample_bilinear(band, chunk, x, y),
+        ValueKind::Categorical => sample_nearest(band, chunk, x, y),
+    }
+}
+
+fn sample_bilinear(band: &Raster, chunk: &RasterChunk, x: f64, y: f64) -> Option<f64> {
     let res = chunk.resolution;
     let fx = (x - chunk.bbox.min_x) / res - 0.5;
     let fy = (chunk.bbox.max_y - y) / res - 0.5;
@@ -75,5 +96,41 @@ pub(crate) fn sample_bilinear(band: &Raster, chunk: &RasterChunk, x: f64, y: f64
             .filter_map(|(v, w)| v.map(|v| (w, v)))
             .max_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, v)| v),
+    }
+}
+
+fn sample_nearest(band: &Raster, chunk: &RasterChunk, x: f64, y: f64) -> Option<f64> {
+    let col = ((x - chunk.bbox.min_x) / chunk.resolution).floor();
+    let row = ((chunk.bbox.max_y - y) / chunk.resolution).floor();
+    if col.is_nan() || row.is_nan() || col < 0.0 || row < 0.0 {
+        return None;
+    }
+    let (row, col) = (row as usize, col as usize);
+    if row >= band.height() || col >= band.width() {
+        return None;
+    }
+    let v = band.data()[row * band.width() + col];
+    (!band.is_nodata(v) && v.is_finite()).then_some(v)
+}
+
+pub(crate) fn reduce_block(value_kind: ValueKind, values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    match value_kind {
+        // std's f64 sum starts from negative zero
+        ValueKind::Continuous => {
+            Some(values.iter().fold(0.0, |sum, v| sum + v) / values.len() as f64)
+        }
+        ValueKind::Categorical => {
+            values.sort_by(f64::total_cmp);
+            let (mut mode, mut mode_count) = (values[0], 0);
+            for run in values.chunk_by(|a, b| a == b) {
+                if run.len() > mode_count {
+                    (mode, mode_count) = (run[0], run.len());
+                }
+            }
+            Some(mode)
+        }
     }
 }

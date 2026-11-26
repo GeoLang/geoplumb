@@ -3,6 +3,7 @@
 //! the quality band treated as invalid, and the band count the mask demands
 //! of its input link
 
+use geoplumb::caps::ValueKind;
 use geoplumb::elements::{QualityMask, RasterSrc};
 use geoplumb::{Bbox, Crs, Engine, Error, Graph, RasterChunk, WindowReq};
 use terrano_core::{BandedRaster, Raster};
@@ -57,6 +58,7 @@ fn src_with(hole: impl Fn(usize, usize, usize) -> bool) -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 

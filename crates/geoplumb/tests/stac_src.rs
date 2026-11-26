@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
+use geoplumb::caps::ValueKind;
 use geoplumb::element::Source;
 use geoplumb::elements::{
     Composite, StacSearch, StacSrc,
@@ -1747,6 +1748,39 @@ impl UtmGrid {
     fn row_at(&self, y: f64) -> usize {
         ((self.origin_y - y) / UTM_CELL - 0.5).round() as usize
     }
+
+    fn class_cog(&self, hole: bool) -> Vec<u8> {
+        let mut centers = Vec::with_capacity(self.cols * self.rows);
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                centers.push(self.pixel_center(col, row));
+            }
+        }
+        let data = to_lonlat(self.epsg)
+            .convert_batch(&centers)
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(
+                |(i, &(lon, lat))| match hole && (100..120).contains(&(i / self.cols)) {
+                    true => f64::NAN,
+                    false => class_at(lon, lat),
+                },
+            )
+            .collect();
+        let raster = Raster::from_vec(self.cols, self.rows, data, UTM_CELL, f64::NAN).unwrap();
+        let params = CogParams {
+            epsg: self.epsg,
+            origin_x: self.origin_x,
+            origin_y: self.origin_y,
+            pixel_width: UTM_CELL,
+            pixel_height: UTM_CELL,
+            ..class_params()
+        };
+        let mut buf = std::io::Cursor::new(Vec::new());
+        write_cog(&raster, &params, &mut buf).unwrap();
+        buf.into_inner()
+    }
 }
 
 /// zone 32 and zone 33 items over the same ground: the newest item anchors
@@ -2247,4 +2281,245 @@ async fn count_reports_how_many_items_had_a_value() {
         }
     });
     assert!(bare > 1000, "window missed the uncovered half");
+}
+
+const CLASS_CODES: [f64; 4] = [10.0, 20.0, 30.0, 80.0];
+
+fn class_at(lon: f64, lat: f64) -> f64 {
+    let stripe = (lon * 300.0).floor() as i64 + (lat * 200.0).floor() as i64;
+    CLASS_CODES[stripe.rem_euclid(CLASS_CODES.len() as i64) as usize]
+}
+
+fn class_params() -> CogParams {
+    CogParams {
+        // terrano averages the overviews it writes
+        overview_levels: 0,
+        ..params(0)
+    }
+}
+
+fn class_off_codes(chunk: &RasterChunk) -> Vec<f64> {
+    chunk
+        .bands
+        .band(0)
+        .unwrap()
+        .data()
+        .iter()
+        .copied()
+        .filter(|v| !v.is_nan() && !CLASS_CODES.contains(v))
+        .collect()
+}
+
+const CLASS_COLS: usize = 200;
+const CLASS_ROWS: usize = 200;
+const CLASS_BBOX: [f64; 4] = [
+    ORIGIN_X,
+    ORIGIN_Y - CLASS_ROWS as f64 * CELL,
+    ORIGIN_X + CLASS_COLS as f64 * CELL,
+    ORIGIN_Y,
+];
+
+async fn start_class_mock() -> (String, Arc<Mock>) {
+    start_mock_with(|base| {
+        let mut data = Vec::with_capacity(CLASS_COLS * CLASS_ROWS);
+        for row in 0..CLASS_ROWS {
+            for col in 0..CLASS_COLS {
+                let lon = ORIGIN_X + (col as f64 + 0.5) * CELL;
+                let lat = ORIGIN_Y - (row as f64 + 0.5) * CELL;
+                data.push(class_at(lon, lat));
+            }
+        }
+        let raster = Raster::from_vec(CLASS_COLS, CLASS_ROWS, data, CELL, f64::NAN).unwrap();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        write_cog(&raster, &class_params(), &mut buf).unwrap();
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert("classes.tif".into(), buf.into_inner());
+        let features = vec![item(
+            "classes",
+            "2024-06-01T00:00:00Z",
+            &format!("{base}/cog/classes.tif"),
+            CLASS_BBOX,
+            4326,
+        )];
+        (cogs, features)
+    })
+    .await
+}
+
+fn class_search(
+    base: &str,
+    bbox: [f64; 4],
+    value_kind: ValueKind,
+    composite: Composite,
+) -> StacSearch {
+    let mut search = StacSearch::new(base, "landcover", "data", bbox);
+    search.value_kind = value_kind;
+    search.composite = composite;
+    search
+}
+
+async fn open_search(search: StacSearch) -> StacSrc {
+    tokio::task::spawn_blocking(move || StacSrc::open(&search))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_categorical_search_decimates_its_items_by_mode() {
+    let (base, _mock) = start_class_mock().await;
+    let req = WindowReq {
+        bbox: Bbox::new(CLASS_BBOX[0], CLASS_BBOX[1], CLASS_BBOX[2], CLASS_BBOX[3]),
+        resolution: 4.0 * CELL,
+        time: None,
+    };
+    let read = |value_kind| {
+        let base = base.clone();
+        async move {
+            let search = class_search(&base, CLASS_BBOX, value_kind, Composite::Latest);
+            let src = open_search(search).await;
+            src.read(&req).await.unwrap().into_raster().unwrap()
+        }
+    };
+
+    let categorical = read(ValueKind::Categorical).await;
+    assert_eq!(class_off_codes(&categorical), Vec::<f64>::new());
+    assert!(
+        categorical
+            .bands
+            .band(0)
+            .unwrap()
+            .data()
+            .iter()
+            .all(|v| !v.is_nan()),
+        "the item did not cover the window"
+    );
+
+    let continuous = read(ValueKind::Continuous).await;
+    assert!(
+        !class_off_codes(&continuous).is_empty(),
+        "no block of the fixture mixes codes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_categorical_item_in_another_crs_warps_to_class_codes() {
+    let anchor = UtmGrid::at(ZONE_32, MIXED_LON, MIXED_LAT, MIXED_COLS, MIXED_ROWS);
+    let other = anchor.covering(ZONE_33, MIXED_MARGIN);
+    let (base, _mock) = start_mock_with(|base| {
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert("class32.tif".into(), anchor.class_cog(true));
+        cogs.insert("class33.tif".into(), other.class_cog(false));
+        let features = vec![
+            item(
+                "class32",
+                "2024-06-01T00:00:00Z",
+                &format!("{base}/cog/class32.tif"),
+                anchor.footprint(),
+                u32::from(ZONE_32),
+            ),
+            item(
+                "class33",
+                "2020-01-01T00:00:00Z",
+                &format!("{base}/cog/class33.tif"),
+                other.footprint(),
+                u32::from(ZONE_33),
+            ),
+        ];
+        (cogs, features)
+    })
+    .await;
+    // the anchor's holed rows 100..120 are rows 50..70 of this window
+    let req = anchor.window(100, 50, 100, 100);
+    let read = |value_kind| {
+        let base = base.clone();
+        async move {
+            let search = class_search(&base, MIXED_SEARCH_BBOX, value_kind, Composite::Latest);
+            let src = open_search(search).await;
+            assert_eq!(src.item_count(), 2, "the zone 33 item was dropped");
+            src.read(&req).await.unwrap().into_raster().unwrap()
+        }
+    };
+
+    let categorical = read(ValueKind::Categorical).await;
+    assert_eq!(class_off_codes(&categorical), Vec::<f64>::new());
+    let warped = &categorical.bands.band(0).unwrap().data()[50 * 100..70 * 100];
+    assert!(
+        warped.iter().all(|v| !v.is_nan()),
+        "the zone 33 item did not fill the anchor's hole"
+    );
+
+    let continuous = read(ValueKind::Continuous).await;
+    assert!(
+        !class_off_codes(&continuous).is_empty(),
+        "the warp blends no codes"
+    );
+}
+
+#[test]
+fn a_categorical_search_refuses_the_composites_that_blend_values() {
+    for (composite, name) in [
+        (Composite::Mean, "mean"),
+        (Composite::Median, "median"),
+        (Composite::Percentile(90.0), "percentile"),
+        (Composite::StdDev, "stddev"),
+    ] {
+        let search = class_search(
+            "http://127.0.0.1:9",
+            CLASS_BBOX,
+            ValueKind::Categorical,
+            composite,
+        );
+        let Err(err) = StacSrc::open(&search) else {
+            panic!("a categorical {name} search opened");
+        };
+        assert!(err.to_string().contains(name), "{err}");
+    }
+}
+
+#[test]
+fn composites_keep_refuse_or_replace_the_value_kind() {
+    use ValueKind::{Categorical, Continuous};
+    for composite in [Composite::Latest, Composite::Min, Composite::Max] {
+        assert_eq!(composite.output_value_kind(Categorical), Some(Categorical));
+        assert_eq!(composite.output_value_kind(Continuous), Some(Continuous));
+    }
+    for composite in [
+        Composite::Mean,
+        Composite::Median,
+        Composite::Percentile(90.0),
+        Composite::StdDev,
+    ] {
+        assert_eq!(composite.output_value_kind(Categorical), None);
+        assert_eq!(composite.output_value_kind(Continuous), Some(Continuous));
+    }
+    assert_eq!(
+        Composite::Count.output_value_kind(Categorical),
+        Some(Continuous)
+    );
+    assert_eq!(
+        Composite::Count.output_value_kind(Continuous),
+        Some(Continuous)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_categorical_search_negotiates_its_composites_kind() {
+    let (base, _mock) = start_class_mock().await;
+    for (composite, expected) in [
+        (Composite::Latest, ValueKind::Categorical),
+        (Composite::Min, ValueKind::Categorical),
+        (Composite::Max, ValueKind::Categorical),
+        (Composite::Count, ValueKind::Continuous),
+    ] {
+        let search = class_search(&base, CLASS_BBOX, ValueKind::Categorical, composite);
+        let mut g = Graph::new();
+        let node = g.add_source(Box::new(open_search(search).await));
+        let engine = Engine::new(g, 64 << 20).unwrap();
+        assert_eq!(
+            engine.caps(node).raster().value_kind,
+            expected,
+            "{composite:?}"
+        );
+    }
 }

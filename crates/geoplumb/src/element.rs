@@ -92,8 +92,10 @@ pub trait Transform: Send + Sync {
 }
 
 pub trait Fanin: Send + Sync {
-    /// applies to every input link and the output link alike, so all pins
-    /// negotiate to matching caps. `Identity` is the usual choice
+    /// applies to every input link, and the input links agree with each
+    /// other on the fields it couples: every field under `Identity`, the
+    /// passthrough fields under `Derived`, whose output pattern pins the
+    /// rest the way a transform's does. `Identity` is the usual choice
     fn constraint(&self) -> Constraint;
 
     /// like `Source::identity`, the element's parameters

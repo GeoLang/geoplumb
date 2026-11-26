@@ -10,6 +10,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
+use geoplumb::caps::ValueKind;
 use geoplumb::element::Source;
 use geoplumb::elements::{CogSrc, Hillshade, HttpRange, RasterSrc, Reproject};
 use geoplumb::{Bbox, Crs, Engine, Graph, WindowReq};
@@ -135,11 +136,18 @@ fn mem_src() -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 
 fn mem_src3() -> RasterSrc {
-    RasterSrc::new(banded(), ORIGIN_X, ORIGIN_Y, Crs::WGS84)
+    RasterSrc::new(
+        banded(),
+        ORIGIN_X,
+        ORIGIN_Y,
+        Crs::WGS84,
+        ValueKind::Continuous,
+    )
 }
 
 fn window(px0: usize, py0: usize, px1: usize, py1: usize) -> Bbox {
@@ -176,7 +184,8 @@ fn assert_bands_close(a: &geoplumb::RasterChunk, b: &geoplumb::RasterChunk, tol:
 
 #[tokio::test]
 async fn base_level_matches_in_memory_source() {
-    let (cog, cn) = engine_of(CogSrc::open(MemRange::new(cog_bytes(2))).unwrap());
+    let (cog, cn) =
+        engine_of(CogSrc::open(MemRange::new(cog_bytes(2)), ValueKind::Continuous).unwrap());
     let (mem, mn) = engine_of(mem_src());
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
@@ -190,7 +199,7 @@ async fn base_level_matches_in_memory_source() {
 
 #[tokio::test]
 async fn overview_pull_matches_and_fetches_less() {
-    let src = CogSrc::open(MemRange::new(cog_bytes(2))).unwrap();
+    let src = CogSrc::open(MemRange::new(cog_bytes(2)), ValueKind::Continuous).unwrap();
     let (mem, mn) = engine_of(mem_src());
     let full = window(0, 0, W, H);
 
@@ -221,7 +230,7 @@ async fn overview_pull_matches_and_fetches_less() {
 async fn tile_bytes_fetched(req: WindowReq) -> usize {
     let mem_range = MemRange::new(cog_bytes(2));
     let fetched = mem_range.fetched.clone();
-    let src = CogSrc::open(mem_range).unwrap();
+    let src = CogSrc::open(mem_range, ValueKind::Continuous).unwrap();
     let before = fetched.load(Ordering::SeqCst);
     src.read(&req).await.unwrap().into_raster().unwrap();
     fetched.load(Ordering::SeqCst) - before
@@ -231,10 +240,13 @@ async fn tile_bytes_fetched(req: WindowReq) -> usize {
 async fn concurrent_chunks_of_one_cog_interleave_their_reads() {
     let log = Arc::new(ReadLog::default());
     let src = Arc::new(
-        CogSrc::open(GatedRange {
-            data: cog_bytes(0),
-            log: log.clone(),
-        })
+        CogSrc::open(
+            GatedRange {
+                data: cog_bytes(0),
+                log: log.clone(),
+            },
+            ValueKind::Continuous,
+        )
         .unwrap(),
     );
     log.armed.store(true, Ordering::SeqCst);
@@ -279,7 +291,7 @@ async fn concurrent_chunks_of_one_cog_interleave_their_reads() {
 #[tokio::test]
 async fn pull_coarser_than_pyramid_decimates() {
     // one overview (down to 2*CELL), request 4*CELL: read level 1, average 2x2
-    let src = CogSrc::open(MemRange::new(cog_bytes(1))).unwrap();
+    let src = CogSrc::open(MemRange::new(cog_bytes(1)), ValueKind::Continuous).unwrap();
     let (mem, mn) = engine_of(mem_src());
     let req = WindowReq {
         bbox: window(0, 0, 400, 400),
@@ -295,7 +307,7 @@ async fn pull_coarser_than_pyramid_decimates() {
 
 #[tokio::test]
 async fn window_outside_the_file_pads_nan() {
-    let src = CogSrc::open(MemRange::new(cog_bytes(0))).unwrap();
+    let src = CogSrc::open(MemRange::new(cog_bytes(0)), ValueKind::Continuous).unwrap();
     // 40 px west and north of the origin, 40 px inside
     let req = WindowReq {
         bbox: Bbox {
@@ -354,10 +366,11 @@ async fn identical_ranges_are_fetched_once_across_readers() {
 
     let url = format!("http://{addr}/dem.tif");
     let u = url.clone();
-    let src = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(u)))
-        .await
-        .unwrap()
-        .unwrap();
+    let src =
+        tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(u), ValueKind::Continuous))
+            .await
+            .unwrap()
+            .unwrap();
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
@@ -367,10 +380,12 @@ async fn identical_ranges_are_fetched_once_across_readers() {
     let after_first = hits.load(Ordering::SeqCst);
     assert!(after_first > 0, "nothing was fetched at all");
 
-    let src2 = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(url)))
-        .await
-        .unwrap()
-        .unwrap();
+    let src2 = tokio::task::spawn_blocking(move || {
+        CogSrc::open(HttpRange::new(url), ValueKind::Continuous)
+    })
+    .await
+    .unwrap()
+    .unwrap();
     let b = src2.read(&req).await.unwrap().into_raster().unwrap();
     assert_eq!(
         hits.load(Ordering::SeqCst),
@@ -401,10 +416,12 @@ async fn http_transport_retries_transient_faults() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let url = format!("http://{addr}/dem.tif");
-    let src = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(url)))
-        .await
-        .unwrap()
-        .unwrap();
+    let src = tokio::task::spawn_blocking(move || {
+        CogSrc::open(HttpRange::new(url), ValueKind::Continuous)
+    })
+    .await
+    .unwrap()
+    .unwrap();
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
         resolution: CELL,
@@ -433,9 +450,11 @@ async fn http_transport_does_not_retry_client_errors() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let url = format!("http://{addr}/dem.tif");
-    let opened = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(url)))
-        .await
-        .unwrap();
+    let opened = tokio::task::spawn_blocking(move || {
+        CogSrc::open(HttpRange::new(url), ValueKind::Continuous)
+    })
+    .await
+    .unwrap();
     assert!(opened.is_err());
     assert_eq!(hits.load(Ordering::SeqCst), 1, "404 must not retry");
 }
@@ -451,10 +470,12 @@ async fn http_transport_feeds_the_engine() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let url = format!("http://{addr}/dem.tif");
-    let src = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(url)))
-        .await
-        .unwrap()
-        .unwrap();
+    let src = tokio::task::spawn_blocking(move || {
+        CogSrc::open(HttpRange::new(url), ValueKind::Continuous)
+    })
+    .await
+    .unwrap()
+    .unwrap();
 
     let mut g = Graph::new();
     let s = g.add_source(Box::new(src));
@@ -478,7 +499,8 @@ async fn http_transport_feeds_the_engine() {
 
 #[tokio::test]
 async fn multi_band_matches_in_memory_at_base_and_overview() {
-    let (cog, cn) = engine_of(CogSrc::open(MemRange::new(cog3_bytes(2))).unwrap());
+    let (cog, cn) =
+        engine_of(CogSrc::open(MemRange::new(cog3_bytes(2)), ValueKind::Continuous).unwrap());
     let (mem, mn) = engine_of(mem_src3());
     for res in [CELL, CELL * 2.0] {
         let req = WindowReq {
@@ -495,7 +517,7 @@ async fn multi_band_matches_in_memory_at_base_and_overview() {
 
 #[test]
 fn multi_band_caps_advertise_the_file_band_count() {
-    let src = CogSrc::open(MemRange::new(cog3_bytes(2))).unwrap();
+    let src = CogSrc::open(MemRange::new(cog3_bytes(2)), ValueKind::Continuous).unwrap();
     assert_eq!(src.bands(), BANDS as u16);
     let (engine, n) = engine_of(src);
     assert_eq!(engine.caps(n).raster().bands, BANDS as u16);
@@ -504,7 +526,7 @@ fn multi_band_caps_advertise_the_file_band_count() {
 #[tokio::test]
 async fn multi_band_pull_coarser_than_pyramid_decimates_every_band() {
     // one overview (down to 2*CELL), request 4*CELL: read level 1, average 2x2
-    let src = CogSrc::open(MemRange::new(cog3_bytes(1))).unwrap();
+    let src = CogSrc::open(MemRange::new(cog3_bytes(1)), ValueKind::Continuous).unwrap();
     let (mem, mn) = engine_of(mem_src3());
     let req = WindowReq {
         bbox: window(0, 0, 400, 400),
@@ -520,7 +542,7 @@ async fn multi_band_pull_coarser_than_pyramid_decimates_every_band() {
 
 #[tokio::test]
 async fn multi_band_window_outside_the_file_pads_every_band() {
-    let src = CogSrc::open(MemRange::new(cog3_bytes(0))).unwrap();
+    let src = CogSrc::open(MemRange::new(cog3_bytes(0)), ValueKind::Continuous).unwrap();
     let req = WindowReq {
         bbox: Bbox {
             min_x: ORIGIN_X - 40.0 * CELL,
@@ -555,10 +577,12 @@ async fn multi_band_over_the_http_transport() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let url = format!("http://{addr}/rgb.tif");
-    let src = tokio::task::spawn_blocking(move || CogSrc::open(HttpRange::new(url)))
-        .await
-        .unwrap()
-        .unwrap();
+    let src = tokio::task::spawn_blocking(move || {
+        CogSrc::open(HttpRange::new(url), ValueKind::Continuous)
+    })
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(src.bands(), BANDS as u16);
     let req = WindowReq {
         bbox: window(20, 20, 340, 230),
@@ -577,7 +601,7 @@ async fn multi_band_over_the_http_transport() {
 async fn reproject_keeps_every_band() {
     let mut g = Graph::new();
     let s = g.add_source(Box::new(
-        CogSrc::open(MemRange::new(cog3_bytes(2))).unwrap(),
+        CogSrc::open(MemRange::new(cog3_bytes(2)), ValueKind::Continuous).unwrap(),
     ));
     let rp = g.add_transform(s, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
     let engine = Engine::new(g, 64 << 20).unwrap();

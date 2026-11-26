@@ -7,7 +7,7 @@ use gdal::raster::{RasterBand, ResampleAlg};
 use terrano_core::{BandedRaster, Raster};
 
 use crate::caps::{
-    CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
+    CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField, ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
@@ -37,22 +37,23 @@ struct GdalFile {
     origin_x: f64,
     origin_y: f64,
     crs: Crs,
+    value_kind: ValueKind,
     // a dataset is Send but not Sync, so each read takes one out
     pool: Mutex<Vec<Dataset>>,
 }
 
 impl GdalSrc {
     /// every band of the file, blocking, call it off the async runtime
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_bands(path.as_ref(), None)
+    pub fn open(path: impl AsRef<Path>, value_kind: ValueKind) -> Result<Self> {
+        Self::open_bands(path.as_ref(), None, value_kind)
     }
 
     /// one 1-based band of the file, blocking like `open`
-    pub fn open_band(path: impl AsRef<Path>, band: u16) -> Result<Self> {
-        Self::open_bands(path.as_ref(), Some(band))
+    pub fn open_band(path: impl AsRef<Path>, band: u16, value_kind: ValueKind) -> Result<Self> {
+        Self::open_bands(path.as_ref(), Some(band), value_kind)
     }
 
-    fn open_bands(path: &Path, band: Option<u16>) -> Result<Self> {
+    fn open_bands(path: &Path, band: Option<u16>, value_kind: ValueKind) -> Result<Self> {
         let named = |detail: String| Error::Source(format!("{}: {detail}", path.display()));
         let dataset = Dataset::open(path).map_err(|e| named(e.to_string()))?;
         let count = dataset.raster_count();
@@ -148,6 +149,7 @@ impl GdalSrc {
                 origin_x,
                 origin_y,
                 crs: Crs(code),
+                value_kind,
                 pool: Mutex::new(vec![dataset]),
             }),
         })
@@ -219,7 +221,7 @@ impl GdalFile {
                 let data = if factor == 1 {
                     plane
                 } else {
-                    decimate(&plane, cols, rows, factor)
+                    decimate(&plane, cols, rows, factor, self.value_kind)
                 };
                 Raster::from_vec(cols, rows, data, req.resolution, f64::NAN).expect("window dims")
             })
@@ -287,7 +289,7 @@ impl Source for GdalSrc {
     fn identity(&self) -> String {
         let file = &self.file;
         format!(
-            "GdalSrc path={:?} driver={:?} bands={:?} nodata={:?} level_resolutions={:?} origin_x={:?} origin_y={:?} crs={} {}",
+            "GdalSrc path={:?} driver={:?} bands={:?} nodata={:?} level_resolutions={:?} origin_x={:?} origin_y={:?} crs={} value_kind={:?} {}",
             file.path,
             file.driver,
             file.bands,
@@ -296,6 +298,7 @@ impl Source for GdalSrc {
             file.origin_x,
             file.origin_y,
             file.crs,
+            file.value_kind,
             file_stamp(&file.path)
         )
     }
@@ -307,6 +310,7 @@ impl Source for GdalSrc {
             crs: SetField::one(self.file.crs),
             resolution: ResRange::at_least(self.file.level_resolutions[0]),
             chunk_px: SetField::Any,
+            value_kind: SetField::one(self.file.value_kind),
         })))
     }
 

@@ -9,6 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use geoplumb::caps::ValueKind;
 use geoplumb::elements::{Hillshade, RasterSrc, Reproject};
 use geoplumb::tile::XyzTile;
 use geoplumb::{Crs, Engine, Graph, NodeId};
@@ -26,14 +27,20 @@ fn synthetic_dem() -> RasterSrc {
         }
     }
     let dem = Raster::from_vec(w, h, data, cell, f64::NAN).unwrap();
-    RasterSrc::new(BandedRaster::new(vec![dem]).unwrap(), ox, oy, Crs::WGS84)
+    RasterSrc::new(
+        BandedRaster::new(vec![dem]).unwrap(),
+        ox,
+        oy,
+        Crs::WGS84,
+        ValueKind::Continuous,
+    )
 }
 
 fn build_engine() -> (Engine, NodeId) {
     let src = match std::env::var("GEOPLUMB_DEM") {
         Ok(path) => {
             let bytes = std::fs::read(&path).expect("read GEOPLUMB_DEM");
-            RasterSrc::from_geotiff(&bytes).expect("parse geotiff")
+            RasterSrc::from_geotiff(&bytes, ValueKind::Continuous).expect("parse geotiff")
         }
         Err(_) => synthetic_dem(),
     };

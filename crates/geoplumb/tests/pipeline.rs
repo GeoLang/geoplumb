@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use geoplumb::caps::Constraint;
+use geoplumb::caps::{Constraint, ValueKind};
 use geoplumb::element::Source;
 use geoplumb::elements::{Hillshade, RasterSrc, Reproject};
 use geoplumb::window::GridSpec;
@@ -38,6 +38,7 @@ fn dem_src() -> RasterSrc {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )
 }
 
@@ -101,6 +102,7 @@ fn negotiation_failure_names_link() {
         ORIGIN_X,
         ORIGIN_Y,
         Crs::WGS84,
+        ValueKind::Continuous,
     )));
     let _hs = g.add_transform(src, Box::new(Hillshade::new(315.0, 45.0)));
     let err = Engine::new(g, 64 << 20)
@@ -344,7 +346,13 @@ async fn reprojected_tile_matches_source_values() {
 async fn an_absurd_pull_fails_instead_of_enumerating() {
     let cell = 1e-12;
     let px = Raster::from_vec(1, 1, vec![0.0], cell, f64::NAN).unwrap();
-    let src = RasterSrc::new(BandedRaster::new(vec![px]).unwrap(), 0.0, 1.0, Crs::WGS84);
+    let src = RasterSrc::new(
+        BandedRaster::new(vec![px]).unwrap(),
+        0.0,
+        1.0,
+        Crs::WGS84,
+        ValueKind::Continuous,
+    );
     let mut g = Graph::new();
     let s = g.add_source(Box::new(src));
     let engine = Engine::new(g, 16 << 20).unwrap();
