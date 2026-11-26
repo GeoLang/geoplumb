@@ -69,11 +69,9 @@ enum Entry {
         domain: Domain,
     },
     /// on disk only, reloaded through the pending machinery on a hit
-    Spilled {
-        bytes: usize,
-        last_used: u64,
-    },
+    Spilled { bytes: usize, last_used: u64 },
     Pending {
+        pending_id: u64,
         waiters: Vec<oneshot::Sender<()>>,
     },
 }
@@ -85,6 +83,21 @@ struct CacheState {
     disk_bytes: usize,
     gpu_bytes: usize,
     tick: u64,
+    last_pending_id: u64,
+}
+
+impl CacheState {
+    fn insert_pending(&mut self, key: (usize, ChunkKey)) -> u64 {
+        self.last_pending_id += 1;
+        self.entries.insert(
+            key,
+            Entry::Pending {
+                pending_id: self.last_pending_id,
+                waiters: Vec::new(),
+            },
+        );
+        self.last_pending_id
+    }
 }
 
 struct SpillState {
@@ -488,8 +501,8 @@ impl Engine {
     async fn chunk(&self, node: usize, key: ChunkKey) -> Result<Arc<Chunk>> {
         enum Action {
             Wait(oneshot::Receiver<()>),
-            Compute,
-            Load,
+            Compute { pending_id: u64 },
+            Load { pending_id: u64 },
         }
         loop {
             let action = {
@@ -503,45 +516,35 @@ impl Engine {
                         *last_used = tick;
                         return Ok(chunk.clone());
                     }
-                    Some(Entry::Pending { waiters }) => {
+                    Some(Entry::Pending { waiters, .. }) => {
                         let (tx, rx) = oneshot::channel();
                         waiters.push(tx);
                         Action::Wait(rx)
                     }
                     Some(Entry::Spilled { bytes, .. }) => {
                         let bytes = *bytes;
-                        state.entries.insert(
-                            (node, key),
-                            Entry::Pending {
-                                waiters: Vec::new(),
-                            },
-                        );
+                        let pending_id = state.insert_pending((node, key));
                         state_bytes_sub(&mut state.disk_bytes, bytes);
-                        Action::Load
+                        Action::Load { pending_id }
                     }
-                    None => {
-                        state.entries.insert(
-                            (node, key),
-                            Entry::Pending {
-                                waiters: Vec::new(),
-                            },
-                        );
-                        Action::Compute
-                    }
+                    None => Action::Compute {
+                        pending_id: state.insert_pending((node, key)),
+                    },
                 }
             };
-            let guard = |done| PendingGuard {
+            let guard = |pending_id| PendingGuard {
                 cache: Arc::clone(&self.cache),
                 key: (node, key),
-                done,
+                pending_id,
+                done: false,
             };
             match action {
                 Action::Wait(rx) => {
-                    // ok = computed, err = computer cancelled, retry either way
+                    // ok = computed, err = computer cancelled or entry invalidated, retry either way
                     let _ = rx.await;
                 }
-                Action::Load => {
-                    let guard = guard(false);
+                Action::Load { pending_id } => {
+                    let guard = guard(pending_id);
                     let store = &self
                         .cache
                         .spill
@@ -558,8 +561,8 @@ impl Engine {
                         }
                     };
                 }
-                Action::Compute => {
-                    return self.compute_and_cache(guard(false), node, key).await;
+                Action::Compute { pending_id } => {
+                    return self.compute_and_cache(guard(pending_id), node, key).await;
                 }
             }
         }
@@ -633,6 +636,14 @@ impl Engine {
 }
 
 impl ChunkCache {
+    fn is_cached(&self, node: usize, key: ChunkKey, chunk: &Arc<Chunk>) -> bool {
+        let state = self.state.lock().unwrap();
+        matches!(
+            state.entries.get(&(node, key)),
+            Some(Entry::Ready { chunk: ready, .. }) if Arc::ptr_eq(ready, chunk)
+        )
+    }
+
     /// cache a fresh chunk and write it through to the disk tier, marking
     /// the entry spilled only once the file is safely on disk
     async fn finish_and_spill(
@@ -645,6 +656,7 @@ impl ChunkCache {
         let chunk = self.finish_chunk(guard, result, false)?;
         if let Some(sp) = &self.spill
             && memory_domain(&chunk) == Domain::System
+            && self.is_cached(node, key, &chunk)
         {
             let path = sp.store.path(node, key);
             let c = chunk.clone();
@@ -654,7 +666,13 @@ impl ChunkCache {
                 .is_ok()
             {
                 let mut state = self.state.lock().unwrap();
-                if let Some(Entry::Ready { spilled, .. }) = state.entries.get_mut(&(node, key)) {
+                if let Some(Entry::Ready {
+                    chunk: ready,
+                    spilled,
+                    ..
+                }) = state.entries.get_mut(&(node, key))
+                    && Arc::ptr_eq(ready, &chunk)
+                {
                     *spilled = true;
                 } else {
                     // evicted or invalidated mid-write, and the next engine
@@ -678,9 +696,13 @@ impl ChunkCache {
         let bytes = chunk.byte_size();
         let domain = memory_domain(&chunk);
         let mut state = self.state.lock().unwrap();
+        // invalidate removed the entry during the compute, so the chunk can hold pre-edit data
+        if !guard.pending_entry_matches(&state) {
+            return Ok(chunk);
+        }
         state.tick += 1;
         let tick = state.tick;
-        if let Some(Entry::Pending { waiters }) = state.entries.insert(
+        if let Some(Entry::Pending { waiters, .. }) = state.entries.insert(
             guard.key,
             Entry::Ready {
                 chunk: chunk.clone(),
@@ -721,7 +743,17 @@ impl ChunkCache {
 struct PendingGuard {
     cache: Arc<ChunkCache>,
     key: (usize, ChunkKey),
+    pending_id: u64,
     done: bool,
+}
+
+impl PendingGuard {
+    fn pending_entry_matches(&self, state: &CacheState) -> bool {
+        matches!(
+            state.entries.get(&self.key),
+            Some(Entry::Pending { pending_id, .. }) if *pending_id == self.pending_id
+        )
+    }
 }
 
 impl Drop for PendingGuard {
@@ -730,7 +762,9 @@ impl Drop for PendingGuard {
             return;
         }
         let mut state = self.cache.state.lock().unwrap();
-        if let Some(Entry::Pending { waiters }) = state.entries.remove(&self.key) {
+        if self.pending_entry_matches(&state)
+            && let Some(Entry::Pending { waiters, .. }) = state.entries.remove(&self.key)
+        {
             drop(waiters);
         }
     }
