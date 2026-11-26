@@ -1,8 +1,11 @@
-//! crs change via projicio. the request plan inverse-projects the output
-//! window into the source crs, compute inverse-maps each output pixel
-//! center and samples the input there, bilinearly for continuous values
-//! and from the containing pixel for categorical ones. `VecReproject` is
-//! the vector twin: it forward-projects the fragments themselves
+//! crs change via projicio, for raster and vector links alike. the request
+//! plan inverse-projects the output window into the source crs. a raster
+//! compute inverse-maps each output pixel center and samples the input
+//! there, bilinearly for continuous values and from the containing pixel
+//! for categorical ones, a vector compute forward-projects the fragments
+//! themselves
+
+use std::borrow::Cow;
 
 use crate::caps::{
     Caps, CapsPattern, CapsSet, Constraint, Crs, FieldMask, RasterPattern, SetField, ValueKind,
@@ -20,18 +23,65 @@ use topoi_core::{
 
 pub struct Reproject {
     to: Crs,
-    forward: Option<projicio_core::Transform>,
-    inverse: Option<projicio_core::Transform>,
-    value_kind: Option<ValueKind>,
+    configured: Option<ConfiguredReprojection>,
+}
+
+struct ConfiguredReprojection {
+    kind: ReprojectedKind,
+    forward: projicio_core::Transform,
+    inverse: projicio_core::Transform,
+}
+
+enum ReprojectedKind {
+    Raster { value_kind: ValueKind },
+    Vector { latitude_band: Option<LatitudeBand> },
+}
+
+#[derive(Clone, Copy)]
+struct LatitudeBand {
+    south: f64,
+    north: f64,
+}
+
+// epsg 3857's area of use ends where web mercator y reaches the half width of its square
+const WEB_MERCATOR_MAX_LATITUDE: f64 = 85.051_128_779_806_59;
+
+fn latitude_band(from: Crs, to: Crs) -> Option<LatitudeBand> {
+    let geographic = projicio_core::epsg::proj4_definition(from.0)
+        .is_some_and(|definition| definition.contains("+proj=longlat"));
+    // projicio's web mercator refuses latitudes near the poles
+    (geographic && to == Crs::WEB_MERCATOR).then_some(LatitudeBand {
+        south: -WEB_MERCATOR_MAX_LATITUDE,
+        north: WEB_MERCATOR_MAX_LATITUDE,
+    })
+}
+
+fn reproject_constraint(crs: SetField<Crs>) -> Constraint {
+    Constraint::AnyOf(vec![
+        Constraint::Derived {
+            input: CapsSet::any_raster(),
+            passthrough: FieldMask::without_crs_resolution(),
+            output: CapsPattern::Raster(RasterPattern {
+                crs: crs.clone(),
+                ..RasterPattern::default()
+            }),
+        },
+        Constraint::Derived {
+            input: CapsSet::any_vector(),
+            passthrough: FieldMask::without_crs_resolution(),
+            output: CapsPattern::Vector(VectorPattern {
+                crs,
+                ..VectorPattern::default()
+            }),
+        },
+    ])
 }
 
 impl Reproject {
     pub fn new(to: Crs) -> Self {
         Reproject {
             to,
-            forward: None,
-            inverse: None,
-            value_kind: None,
+            configured: None,
         }
     }
 
@@ -39,16 +89,14 @@ impl Reproject {
     /// free, so the solver retargets it to whatever the demanding side needs
     pub fn adapter() -> crate::element::Adapter {
         crate::element::Adapter {
-            template: Constraint::Derived {
-                input: CapsSet::any_raster(),
-                passthrough: FieldMask::without_crs_resolution(),
-                output: CapsPattern::Raster(RasterPattern::default()),
-            },
+            template: reproject_constraint(SetField::Any),
             build: Box::new(|target| {
-                let CapsPattern::Raster(target) = target else {
-                    return None;
+                let crs = match target {
+                    CapsPattern::Raster(raster) => &raster.crs,
+                    CapsPattern::Vector(vector) => &vector.crs,
+                    CapsPattern::PointCloud(_) | CapsPattern::Tensor(_) => return None,
                 };
-                let SetField::OneOf(crss) = &target.crs else {
+                let SetField::OneOf(crss) = crs else {
                     return None;
                 };
                 Some(Box::new(Reproject::new(crss[0])))
@@ -56,12 +104,8 @@ impl Reproject {
         }
     }
 
-    fn inv(&self) -> &projicio_core::Transform {
-        self.inverse.as_ref().expect("configured")
-    }
-
-    fn fwd(&self) -> &projicio_core::Transform {
-        self.forward.as_ref().expect("configured")
+    fn configured(&self) -> &ConfiguredReprojection {
+        self.configured.as_ref().expect("configured")
     }
 }
 
@@ -186,200 +230,159 @@ impl Transform for Reproject {
     }
 
     fn constraint(&self) -> Constraint {
-        Constraint::Derived {
-            input: CapsSet::any_raster(),
-            passthrough: FieldMask::without_crs_resolution(),
-            output: CapsPattern::Raster(RasterPattern {
-                crs: SetField::one(self.to),
-                ..RasterPattern::default()
-            }),
-        }
+        reproject_constraint(SetField::one(self.to))
     }
 
     fn configure(&mut self, input: &Caps, output: &Caps) -> Result<()> {
-        let from = input.raster().crs;
-        let to = output.raster().crs;
-        let mk = |a: Crs, b: Crs| {
-            projicio_core::Transform::new(&a.authority(), &b.authority())
-                .map_err(|e| Error::Projection(e.to_string()))
-        };
-        self.forward = Some(mk(from, to)?);
-        self.inverse = Some(mk(to, from)?);
-        self.value_kind = Some(input.raster().value_kind);
-        Ok(())
-    }
-
-    fn output_grid(&self, input: &GridSpec) -> GridSpec {
-        let fwd = self.fwd();
-        let cx = input.origin_x + 1000.0 * input.base_resolution;
-        let cy = input.origin_y - 1000.0 * input.base_resolution;
-        let scale = local_scale(fwd, cx, cy, input.base_resolution);
-        let origin = fwd
-            .convert(input.origin_x, input.origin_y)
-            .unwrap_or((input.origin_x, input.origin_y));
-        let (origin_x, origin_y) = canonical_origin(self.to, origin);
-        GridSpec {
-            origin_x,
-            origin_y,
-            base_resolution: scale,
-            chunk_px: input.chunk_px,
-        }
-    }
-
-    fn plan(&self, out: &WindowReq) -> WindowReq {
-        let (bbox, resolution) = inverse_window(self.inv(), &out.bbox, out.resolution);
-        out.with_window(bbox, resolution)
-    }
-
-    fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {
-        envelope(self.fwd(), dirty)
-            .map(|e| e.expand(2.0 * resolution))
-            .unwrap_or(*dirty)
-    }
-
-    fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
-        let value_kind = self.value_kind.expect("configured");
-        warp_to_grid(input.raster()?, out, self.inv(), self.to, value_kind).map(Chunk::Raster)
-    }
-}
-
-/// vector twin of `Reproject`: every fragment vertex is forward-projected
-/// and the result re-clipped to the output tile. vertices only, no
-/// densification, so a long segment keeps its chord across the projection,
-/// the same trade geodukt's reproject makes
-pub struct VecReproject {
-    to: Crs,
-    forward: Option<projicio_core::Transform>,
-    inverse: Option<projicio_core::Transform>,
-}
-
-impl VecReproject {
-    pub fn new(to: Crs) -> Self {
-        VecReproject {
-            to,
-            forward: None,
-            inverse: None,
-        }
-    }
-
-    /// auto-plug template, the vector-side counterpart of
-    /// `Reproject::adapter`. it declines raster and other kinds, so the
-    /// solver picks whichever of the two fits the failing link
-    pub fn adapter() -> crate::element::Adapter {
-        crate::element::Adapter {
-            template: Constraint::Derived {
-                input: CapsSet::any_vector(),
-                passthrough: FieldMask::without_crs_resolution(),
-                output: CapsPattern::Vector(VectorPattern::default()),
+        let from = input.crs();
+        let to = output.crs();
+        let kind = match input {
+            Caps::Raster(raster) => ReprojectedKind::Raster {
+                value_kind: raster.value_kind,
             },
-            build: Box::new(|target| {
-                let CapsPattern::Vector(target) = target else {
-                    return None;
-                };
-                let SetField::OneOf(crss) = &target.crs else {
-                    return None;
-                };
-                Some(Box::new(VecReproject::new(crss[0])))
-            }),
-        }
-    }
-
-    fn inv(&self) -> &projicio_core::Transform {
-        self.inverse.as_ref().expect("configured")
-    }
-
-    fn fwd(&self) -> &projicio_core::Transform {
-        self.forward.as_ref().expect("configured")
-    }
-}
-
-impl Transform for VecReproject {
-    fn identity(&self) -> String {
-        format!("VecReproject to={}", self.to)
-    }
-
-    fn constraint(&self) -> Constraint {
-        Constraint::Derived {
-            input: CapsSet::any_vector(),
-            passthrough: FieldMask::without_crs_resolution(),
-            output: CapsPattern::Vector(VectorPattern {
-                crs: SetField::one(self.to),
-                ..VectorPattern::default()
-            }),
-        }
-    }
-
-    fn configure(&mut self, input: &Caps, output: &Caps) -> Result<()> {
-        let from = input.vector().crs;
-        let to = output.vector().crs;
+            Caps::Vector(_) => ReprojectedKind::Vector {
+                latitude_band: latitude_band(from, to),
+            },
+            other => {
+                unreachable!("negotiation hands a reproject raster or vector caps, got {other:?}")
+            }
+        };
         let mk = |a: Crs, b: Crs| {
             projicio_core::Transform::new(&a.authority(), &b.authority())
                 .map_err(|e| Error::Projection(e.to_string()))
         };
-        self.forward = Some(mk(from, to)?);
-        self.inverse = Some(mk(to, from)?);
+        self.configured = Some(ConfiguredReprojection {
+            kind,
+            forward: mk(from, to)?,
+            inverse: mk(to, from)?,
+        });
         Ok(())
     }
 
     fn output_grid(&self, input: &GridSpec) -> GridSpec {
-        let fwd = self.fwd();
-        // one cell in from the corner, not the thousand the raster twin
-        // uses: a vector base resolution is a segment length and can be
-        // degrees wide, so a long probe walks off the projection's domain
-        let cx = input.origin_x + input.base_resolution;
-        let cy = input.origin_y - input.base_resolution;
-        let origin = fwd
-            .convert(input.origin_x, input.origin_y)
-            .unwrap_or((input.origin_x, input.origin_y));
-        let (origin_x, origin_y) = canonical_origin(self.to, origin);
-        GridSpec {
-            origin_x,
-            origin_y,
-            base_resolution: local_scale(fwd, cx, cy, input.base_resolution),
-            chunk_px: input.chunk_px,
-        }
+        let configured = self.configured();
+        // a vector base resolution is a segment length and can be degrees
+        // wide, so a thousand-cell probe walks off the projection's domain
+        let probe_cells = match configured.kind {
+            ReprojectedKind::Raster { .. } => 1000.0,
+            ReprojectedKind::Vector { .. } => 1.0,
+        };
+        projected_grid(&configured.forward, self.to, input, probe_cells)
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
-        let (bbox, resolution) = inverse_window(self.inv(), &out.bbox, out.resolution);
+        let (bbox, resolution) =
+            inverse_window(&self.configured().inverse, &out.bbox, out.resolution);
         out.with_window(bbox, resolution)
     }
 
     fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {
-        envelope(self.fwd(), dirty)
+        envelope(&self.configured().forward, dirty)
             .map(|e| e.expand(2.0 * resolution))
             .unwrap_or(*dirty)
     }
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
-        let input = input.vector()?;
-        let mut coords = Vec::new();
-        for f in &input.features {
-            collect_coords(&f.geometry, &mut coords);
+        let configured = self.configured();
+        match configured.kind {
+            ReprojectedKind::Raster { value_kind } => warp_to_grid(
+                input.raster()?,
+                out,
+                &configured.inverse,
+                self.to,
+                value_kind,
+            )
+            .map(Chunk::Raster),
+            ReprojectedKind::Vector { latitude_band } => project_features(
+                input.vector()?,
+                out,
+                &configured.forward,
+                latitude_band,
+                self.to,
+            )
+            .map(Chunk::Vector),
         }
-        let projected = self
-            .fwd()
-            .convert_batch(&coords)
-            .map_err(|e| Error::Projection(e.to_string()))?;
-        let mut src = projected.into_iter().map(|(x, y)| Coord::new(x, y));
-        let mut features = Vec::new();
-        for f in &input.features {
-            let geometry = rebuild(&f.geometry, &mut src);
-            for geometry in clip_geometry(&geometry, &out.bbox) {
-                features.push(VectorFeature {
-                    id: f.id,
-                    geometry,
-                    properties: f.properties.clone(),
-                });
+    }
+}
+
+fn projected_grid(
+    forward: &projicio_core::Transform,
+    to: Crs,
+    input: &GridSpec,
+    probe_cells: f64,
+) -> GridSpec {
+    let cx = input.origin_x + probe_cells * input.base_resolution;
+    let cy = input.origin_y - probe_cells * input.base_resolution;
+    let origin = forward
+        .convert(input.origin_x, input.origin_y)
+        .unwrap_or((input.origin_x, input.origin_y));
+    let (origin_x, origin_y) = canonical_origin(to, origin);
+    GridSpec {
+        origin_x,
+        origin_y,
+        base_resolution: local_scale(forward, cx, cy, input.base_resolution),
+        chunk_px: input.chunk_px,
+    }
+}
+
+fn project_features(
+    input: &VectorChunk,
+    out: &WindowReq,
+    forward: &projicio_core::Transform,
+    latitude_band: Option<LatitudeBand>,
+    to: Crs,
+) -> Result<VectorChunk> {
+    let reaching_past_band =
+        latitude_band.filter(|band| input.bbox.min_y < band.south || input.bbox.max_y > band.north);
+    let inside: Vec<(&VectorFeature, Cow<'_, FeatureGeometry>)> = match reaching_past_band {
+        None => input
+            .features
+            .iter()
+            .map(|f| (f, Cow::Borrowed(&f.geometry)))
+            .collect(),
+        Some(band) => {
+            let band_bbox = Bbox::new(
+                input.bbox.min_x,
+                input.bbox.min_y.max(band.south),
+                input.bbox.max_x,
+                input.bbox.max_y.min(band.north),
+            );
+            if band_bbox.min_y >= band_bbox.max_y {
+                Vec::new()
+            } else {
+                input
+                    .features
+                    .iter()
+                    .flat_map(|f| {
+                        clip_geometry(&f.geometry, &band_bbox)
+                            .into_iter()
+                            .map(move |g| (f, Cow::Owned(g)))
+                    })
+                    .collect()
             }
         }
-        Ok(Chunk::Vector(VectorChunk::new(
-            features,
-            out.bbox,
-            out.resolution,
-            self.to,
-        )))
+    };
+    let mut coords = Vec::new();
+    for (_, geometry) in &inside {
+        collect_coords(geometry, &mut coords);
     }
+    // vertices only, no densification, the same trade geodukt's reproject makes
+    let projected = forward
+        .convert_batch(&coords)
+        .map_err(|e| Error::Projection(e.to_string()))?;
+    let mut src = projected.into_iter().map(|(x, y)| Coord::new(x, y));
+    let mut features = Vec::new();
+    for (f, geometry) in &inside {
+        let geometry = rebuild(geometry, &mut src);
+        for geometry in clip_geometry(&geometry, &out.bbox) {
+            features.push(VectorFeature {
+                id: f.id,
+                geometry,
+                properties: f.properties.clone(),
+            });
+        }
+    }
+    Ok(VectorChunk::new(features, out.bbox, out.resolution, to))
 }
 
 fn collect_coords(geometry: &FeatureGeometry, out: &mut Vec<(f64, f64)>) {

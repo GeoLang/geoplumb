@@ -32,7 +32,7 @@ use geoplumb::{
 use topoi_core::geojson::FeatureGeometry;
 use topoi_core::{Coord, Envelope, MultiPolygon, Polygon, Ring};
 
-use crate::{Layer, ServerState, bad_request, parse_time};
+use crate::{Layer, LayerOutput, ServerState, bad_request, parse_time};
 
 /// reductions the service runs at once. one holds a blocking thread for its
 /// whole run and pulls the tiles the tile path wants, so a burst of them is
@@ -364,6 +364,12 @@ fn plan(
     time: Option<TimeInterval>,
     steps: usize,
 ) -> Result<Plan, String> {
+    if let LayerOutput::Vector = layer.output {
+        return Err(format!(
+            "layer {} is a vector layer, zonal statistics reduce raster pixels",
+            layer.info.name
+        ));
+    }
     if features.len() > MAX_FEATURES {
         return Err(format!(
             "{} features is past the {MAX_FEATURES} cap",

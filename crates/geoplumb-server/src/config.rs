@@ -1,7 +1,8 @@
 //! the layer file: one entry per served layer, either a source plus an
 //! ordered op pipeline or several inputs joined by a fanin. every layer
-//! ends reprojected to web mercator and encoded as grayscale png, so the
-//! file says what varies and nothing else
+//! ends reprojected to web mercator and encoded as grayscale png, or as
+//! vector tiles where the chain ends in features, so the file says what
+//! varies and nothing else
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -128,8 +129,7 @@ pub enum SourceConfig {
         #[serde(default)]
         value_kind: ValueKindConfig,
     },
-    /// a feature collection read whole at startup, lon/lat per rfc 7946.
-    /// features are not pixels, so the chain over it needs a `rasterize`
+    /// a feature collection read whole at startup, lon/lat per rfc 7946
     Geojson { path: PathBuf },
     // table defaults to the first feature table, crs to the table's epsg srs
     Gpkg {
@@ -459,24 +459,6 @@ fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
                 "the {composite} composite blends values, so a categorical stac source \
                  takes latest, min, max or count"
             ));
-        }
-        SourceConfig::Geojson { .. }
-            if !ops
-                .iter()
-                .any(|op| matches!(op, OpConfig::Rasterize { .. })) =>
-        {
-            return Err("the geojson source has no rasterize op, so the chain \
-                        hands features to a png encoder that wants pixels"
-                .into());
-        }
-        SourceConfig::Gpkg { .. }
-            if !ops
-                .iter()
-                .any(|op| matches!(op, OpConfig::Rasterize { .. })) =>
-        {
-            return Err("the gpkg source has no rasterize op, so the chain \
-                        hands features to a png encoder that wants pixels"
-                .into());
         }
         SourceConfig::Las { .. } if !ops.iter().any(|op| matches!(op, OpConfig::Idw { .. })) => {
             return Err("the las source has no idw op, so the chain hands \

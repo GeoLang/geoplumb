@@ -13,6 +13,7 @@ geoplumb = { path = "../geoplumb" }
 terrano-core.workspace = true
 topoi-core.workspace = true
 projicio-core.workspace = true
+jung-mvt.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = [
     "macros",

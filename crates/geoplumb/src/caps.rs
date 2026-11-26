@@ -853,6 +853,17 @@ pub enum Constraint {
         passthrough: FieldMask,
         output: CapsPattern,
     },
+    AnyOf(Vec<Constraint>),
+}
+
+fn union(sets: impl IntoIterator<Item = CapsSet>) -> CapsSet {
+    let mut alternatives: Vec<CapsPattern> = Vec::new();
+    for pattern in sets.into_iter().flat_map(|set| set.alternatives) {
+        if !alternatives.contains(&pattern) {
+            alternatives.push(pattern);
+        }
+    }
+    CapsSet { alternatives }
 }
 
 impl Constraint {
@@ -874,6 +885,20 @@ impl Constraint {
         match self {
             Constraint::Derived { passthrough, .. } => Some(*passthrough),
             Constraint::Produces(_) | Constraint::Identity(_) => None,
+            Constraint::AnyOf(members) => members.iter().map(Constraint::coupled_fields).try_fold(
+                FieldMask::default(),
+                |coupled, member| {
+                    let member = member?;
+                    Some(FieldMask {
+                        dtype: coupled.dtype || member.dtype,
+                        bands: coupled.bands || member.bands,
+                        crs: coupled.crs || member.crs,
+                        resolution: coupled.resolution || member.resolution,
+                        chunk_px: coupled.chunk_px || member.chunk_px,
+                        value_kind: coupled.value_kind || member.value_kind,
+                    })
+                },
+            ),
         }
     }
 
@@ -883,6 +908,7 @@ impl Constraint {
             Constraint::Produces(_) => CapsSet::any(),
             Constraint::Identity(set) => set.clone(),
             Constraint::Derived { input, .. } => input.clone(),
+            Constraint::AnyOf(members) => union(members.iter().map(Constraint::input_set)),
         }
     }
 
@@ -904,6 +930,11 @@ impl Constraint {
                     .collect();
                 CapsSet { alternatives }
             }
+            Constraint::AnyOf(members) => union(
+                members
+                    .iter()
+                    .map(|member| member.output_set(&input_link.intersect(&member.input_set()))),
+            ),
         }
     }
 
@@ -926,6 +957,14 @@ impl Constraint {
                     .collect();
                 CapsSet { alternatives }
             }
+            Constraint::AnyOf(members) => union(members.iter().map(|member| {
+                let accepted = member.input_set();
+                let producible = member.output_set(&accepted);
+                member.narrow_input(
+                    &input_link.intersect(&accepted),
+                    &output_pin.intersect(&producible),
+                )
+            })),
         }
     }
 }

@@ -1,14 +1,17 @@
 //! window-local vector to vector elements plus the dissolve at the pull
 //! boundary: fragments merged back per feature, filter, schema map and clip
-//! semantics with the chunked-equals-whole invariant, and the vector
-//! reproject adapter spliced by the solver
+//! semantics with the chunked-equals-whole invariant, and the reproject
+//! on vector links, explicit or spliced by the solver
 
-use geoplumb::caps::{CapsPattern, CapsSet, Constraint, SetField, VectorCaps, VectorPattern};
+use geoplumb::caps::{
+    CapsPattern, CapsSet, Constraint, SetField, ValueKind, VectorCaps, VectorPattern,
+};
 use geoplumb::element::Transform;
-use geoplumb::elements::{VecClip, VecFilter, VecReproject, VecSchema, VecSrc};
+use geoplumb::elements::{RasterSrc, Reproject, VecClip, VecFilter, VecSchema, VecSrc};
 use geoplumb::{Bbox, Caps, Chunk, Crs, Engine, Graph, VectorChunk, WindowReq};
 use serde_json::json;
 use std::collections::HashMap;
+use terrano_core::{BandedRaster, Raster};
 use topoi_core::geojson::{Feature, FeatureCollection, FeatureGeometry};
 use topoi_core::{Coord, LineString, MultiPoint, MultiPolygon, Point, Polygon, Ring};
 
@@ -712,7 +715,7 @@ fn lonlat_src() -> VecSrc {
 }
 
 #[tokio::test]
-async fn a_vector_crs_demand_autoplugs_a_vector_reproject() {
+async fn a_vector_crs_demand_autoplugs_a_reproject() {
     let mut g = Graph::new();
     let vec = g.add_source(Box::new(lonlat_src()));
     let merc = g.add_transform(vec, Box::new(MercatorVec));
@@ -783,7 +786,7 @@ async fn a_vector_crs_demand_autoplugs_a_vector_reproject() {
 }
 
 #[test]
-fn vec_reproject_matches_projicio_vertex_by_vertex() {
+fn reproject_matches_projicio_vertex_by_vertex_on_features() {
     let source = Polygon::new(
         Ring::new(vec![
             Coord::new(7.0, 46.5),
@@ -794,7 +797,7 @@ fn vec_reproject_matches_projicio_vertex_by_vertex() {
         ]),
         vec![],
     );
-    let mut element = VecReproject::new(Crs::WEB_MERCATOR);
+    let mut element = Reproject::new(Crs::WEB_MERCATOR);
     let caps = |crs| {
         Caps::Vector(VectorCaps {
             crs,
@@ -847,4 +850,142 @@ fn vec_reproject_matches_projicio_vertex_by_vertex() {
         panic!("a polygon in, a polygon out");
     };
     assert_eq!(p.exterior().coords(), want.as_slice());
+}
+
+fn coord_bounds(coords: &[Coord]) -> [f64; 4] {
+    coords.iter().fold(
+        [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ],
+        |b, c| [b[0].min(c.x), b[1].min(c.y), b[2].max(c.x), b[3].max(c.y)],
+    )
+}
+
+const LONLAT_CELL: f64 = 0.005;
+const LONLAT_VALUE: f64 = 5.0;
+
+fn lonlat_raster() -> RasterSrc {
+    let side = (0.5 / LONLAT_CELL).round() as usize;
+    let band = Raster::from_vec(
+        side,
+        side,
+        vec![LONLAT_VALUE; side * side],
+        LONLAT_CELL,
+        f64::NAN,
+    )
+    .unwrap();
+    RasterSrc::new(
+        BandedRaster::new(vec![band]).unwrap(),
+        7.0,
+        47.0,
+        Crs::WGS84,
+        ValueKind::Continuous,
+    )
+}
+
+#[tokio::test]
+async fn one_reproject_element_takes_a_raster_and_a_vector_chain() {
+    let mut g = Graph::new();
+    let features = g.add_source(Box::new(lonlat_src()));
+    let features_tip = g.add_transform(features, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
+    let raster = g.add_source(Box::new(lonlat_raster()));
+    let raster_tip = g.add_transform(raster, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
+    let engine = Engine::new(g, 64 << 20).unwrap();
+    assert_eq!(engine.caps(features_tip).vector().crs, Crs::WEB_MERCATOR);
+    assert_eq!(engine.caps(raster_tip).raster().crs, Crs::WEB_MERCATOR);
+
+    let fwd = projicio_core::Transform::new("EPSG:4326", "EPSG:3857").unwrap();
+    let (x0, y1) = fwd.convert(7.0, 47.0).unwrap();
+    let (x1, y0) = fwd.convert(7.5, 46.5).unwrap();
+    let window = WindowReq {
+        bbox: Bbox::new(x0 - 2000.0, y0 - 2000.0, x1 + 2000.0, y1 + 2000.0),
+        resolution: 500.0,
+        time: None,
+    };
+
+    let pulled = engine
+        .pull(features_tip, window)
+        .await
+        .unwrap()
+        .into_vector()
+        .unwrap();
+    assert_eq!(pulled.crs, Crs::WEB_MERCATOR);
+    let merged = pulled.dissolve();
+    assert_eq!(merged.features.len(), 1);
+    let [min_x, min_y, max_x, max_y] = coord_bounds(&coords_of(&merged.features[0].geometry));
+    for (got, want) in [(min_x, x0), (min_y, y0), (max_x, x1), (max_y, y1)] {
+        assert!((got - want).abs() < 1.0, "{got} against {want}");
+    }
+
+    let pulled = engine
+        .pull(raster_tip, window)
+        .await
+        .unwrap()
+        .into_raster()
+        .unwrap();
+    assert_eq!(pulled.crs, Crs::WEB_MERCATOR);
+    let values: Vec<f64> = pulled.bands.band(0).unwrap().data().to_vec();
+    let finite: Vec<f64> = values.into_iter().filter(|v| v.is_finite()).collect();
+    assert!(finite.len() > 100, "only {} pixels warped", finite.len());
+    assert!(finite.iter().all(|v| (v - LONLAT_VALUE).abs() < 1e-9));
+}
+
+#[tokio::test]
+async fn a_polygon_reaching_the_pole_reprojects_to_the_edge_of_web_mercator() {
+    // epsg 4269 is nad83 lon/lat
+    for crs in [Crs::WGS84, Crs(4269)] {
+        polygon_reaching_the_pole_reprojects_to_the_edge_of_web_mercator(crs).await;
+    }
+}
+
+async fn polygon_reaching_the_pole_reprojects_to_the_edge_of_web_mercator(crs: Crs) {
+    let half_world = 20_037_508.342_789_244;
+    let source = VecSrc::new(
+        FeatureCollection {
+            features: vec![feature(
+                FeatureGeometry::Polygon(Polygon::new(rect(-10.0, -90.0, 10.0, -60.0), vec![])),
+                props(&[("kind", json!("cap"))]),
+            )],
+        },
+        crs,
+    )
+    .unwrap();
+    let mut g = Graph::new();
+    let src = g.add_source(Box::new(source));
+    let tip = g.add_transform(src, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
+    let engine = Engine::new(g, 64 << 20).unwrap();
+
+    let fwd = projicio_core::Transform::new(&crs.authority(), "EPSG:3857").unwrap();
+    let (x0, north) = fwd.convert(-10.0, -60.0).unwrap();
+    let (x1, _) = fwd.convert(10.0, -60.0).unwrap();
+    // a window reaching far below the mercator square plans a lon/lat read
+    // past the pole, which hands the reproject vertices at -90
+    let window = WindowReq {
+        bbox: Bbox::new(
+            x0 - 50_000.0,
+            -3.0 * half_world,
+            x1 + 50_000.0,
+            north + 50_000.0,
+        ),
+        resolution: 20_000.0,
+        time: None,
+    };
+    let pulled = engine
+        .pull(tip, window)
+        .await
+        .unwrap()
+        .into_vector()
+        .unwrap();
+    let merged = pulled.dissolve();
+    assert_eq!(merged.features.len(), 1);
+    let [min_x, min_y, max_x, max_y] = coord_bounds(&coords_of(&merged.features[0].geometry));
+    assert!(
+        (min_y + half_world).abs() < 1.0,
+        "{crs} south edge at {min_y}"
+    );
+    assert!((max_y - north).abs() < 1.0, "{crs} north edge at {max_y}");
+    assert!((min_x - x0).abs() < 1.0 && (max_x - x1).abs() < 1.0);
 }

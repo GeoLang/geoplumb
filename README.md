@@ -19,7 +19,7 @@ A served layer file can name these:
 
 - Sources: `stac` (a STAC collection), `cog` (a local COG file), `gdal` (any raster GDAL opens, in a build with the `gdal` feature), `geojson`, `gpkg` (a GeoPackage feature table), `las`, `copc` (a cloud-optimized point cloud, local or over HTTP), `netcdf` (one variable of a NetCDF classic or 64-bit offset file) and `grib` (one simple-packed GRIB2 field on a regular lat/lon grid).
 - Raster ops: `hillshade`, `slope`, `aspect`, `bandmath`, `focal`, `mask`, `reclassify`, `unary` and `convolve`.
-- Vector ops: `vec_filter`, `vec_schema` and `vec_clip`, then `rasterize`, which burns a constant or a numeric property per feature.
+- Vector ops: `vec_filter`, `vec_schema` and `vec_clip`, and `rasterize`, which burns a constant or a numeric property per feature into a raster.
 - Point op: `idw`, which grids LAS or COPC points into one raster band.
 - Fan-in: several `input` entries, each with its own op chain, joined by `mosaic` or a two-input `combine`, with an optional chain after the join.
 
@@ -37,9 +37,9 @@ Source behaviour:
 
 `cog`, `gdal`, `stac`, `netcdf` and `grib` take `value_kind = "categorical"` for class-coded rasters such as land cover, `source = { kind = "cog", path = "landcover.tif", value_kind = "categorical" }`. Coarse levels then take the most frequent code of each block, ties going to the smaller code, and reprojection and tile resampling take the nearest pixel, so every tile value is one of the file's codes or nodata. The default, `continuous`, averages blocks and resamples bilinearly. A file's own overviews are read as written, so an overview built by averaging still blends codes. `reclassify` and `rasterize` output is categorical whatever their input, and the terrain ops, `focal`, `bandmath`, `unary`, `convolve` and `idw` output is continuous. A `combine` samples each input by its own kind and its output is continuous, so it can join a categorical input with a continuous one. A `mosaic` needs every input on one kind, and a layer mixing them fails at startup naming `value_kind`. A categorical `stac` source takes the `latest`, `min`, `max` or `count` composite, `count` output being continuous. The layer file refuses `mean`, `median`, `percentile` and `stddev` over categorical values, since they blend codes.
 
-Every layer ends reprojected to web mercator and encoded as PNG. Neither step is named in the file. The PNG stretch range comes from the last op that fixes one, or from the layer's own `gray = { min, max }`. A layer has to name `gray` when it ends in `reclassify`, `rasterize` or `idw`, since class numbers, burned values and interpolated heights carry no range. A fan-in layer with no range-fixing op after the join has to name it too.
+Every layer ends reprojected to web mercator and encoded as PNG. Neither step is named in the file. A layer whose chain ends in features, a `geojson` or `gpkg` source with no `rasterize`, is a vector layer instead: it is served only as Mapbox Vector Tiles and names no `gray`. The PNG stretch range comes from the last op that fixes one, or from the layer's own `gray = { min, max }`. A layer has to name `gray` when it ends in `reclassify`, `rasterize` or `idw`, since class numbers, burned values and interpolated heights carry no range. A fan-in layer with no range-fixing op after the join has to name it too.
 
-Only Rust code against the crate can reach these: the in-memory GeoTIFF source (`RasterSrc::from_geotiff`), COG reads over HTTP range requests, the tensor elements (`ToTensor`, `TensorConv`, `ToRaster`, which `convolve` chains), explicit `Reproject` and `VecReproject` (also inserted automatically on any link that differs only in CRS), the zonal statistics and time-series drivers, and the XYZ tile adapter in `geoplumb::tile`.
+Only Rust code against the crate can reach these: the in-memory GeoTIFF source (`RasterSrc::from_geotiff`), COG reads over HTTP range requests, the tensor elements (`ToTensor`, `TensorConv`, `ToRaster`, which `convolve` chains), explicit `Reproject`, which takes raster and vector links alike (also inserted automatically on any link that differs only in CRS), the zonal statistics and time-series drivers, and the XYZ tile adapter in `geoplumb::tile`.
 
 ## Quick start
 
@@ -65,12 +65,13 @@ curl localhost:3000/layers
 |---|---|
 | `GET /tiles/{layer}/{z}/{x}/{y}.png` | grayscale PNG over the layer's stretch range |
 | `GET /tiles/{layer}/{z}/{x}/{y}.tif` | GeoTIFF with every band as f64 and web mercator georeferencing |
-| `POST /zonal/{layer}` | count, sum, min, max and mean per zone |
+| `GET /tiles/{layer}/{z}/{x}/{y}.mvt` | a vector layer's features as a Mapbox Vector Tile, one MVT layer named after the layer |
+| `POST /zonal/{layer}` | count, sum, min, max and mean per zone, raster layers only |
 | `POST /zonal/{layer}/series` | the same per time step |
-| `GET /layers` | each layer's source kind, collection, default datetime and temporal extent |
+| `GET /layers` | each layer's `kind` (`raster` or `vector`), source kind, collection, default datetime and temporal extent |
 | `GET /health` | `{"status":"ok"}` |
 
-Tiles take `?t=2024-06-01T00:00:00Z/2024-07-01T00:00:00Z` to render at that interval instead of the source's own `datetime`. A zonal body is a GeoJSON FeatureCollection of zones in lon/lat plus `resolution` (web mercator metres) and optional `bbox` and `t`. A series body takes `steps`, a list of intervals, in place of `t`. Four reductions run at once, a fifth is refused with 503, and one that takes over four minutes answers 504.
+A raster layer answers `.mvt` with 400, and a vector layer answers PNG and `.tif` with 400. An MVT tile holds the features in the tile plus a 64 unit buffer of its 4096 extent, and a feature the engine's chunk seams cut apart comes back as one MVT feature. The MVT id is the feature's position among a geojson file's features that have a geometry, counting from 0, or its primary key in a gpkg table. A geometry collection goes out as one MVT feature per geometry type, all with the same id. Null properties are left out, and arrays and objects go out as JSON text. Tiles take `?t=2024-06-01T00:00:00Z/2024-07-01T00:00:00Z` to render at that interval instead of the source's own `datetime`. A zonal body is a GeoJSON FeatureCollection of zones in lon/lat plus `resolution` (web mercator metres) and optional `bbox` and `t`. A series body takes `steps`, a list of intervals, in place of `t`. Four reductions run at once, a fifth is refused with 503, and one that takes over four minutes answers 504.
 
 | Variable | Default | Sets |
 |---|---|---|

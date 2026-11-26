@@ -344,14 +344,26 @@ only after a proof script passes on real input, recorded in
       grid and encode code is deleted. Proof: an export in EPSG:32632 passes
       GDAL's `validate_cloud_optimized_geotiff.py --full-check`, and its
       pixels match the same window pulled from the engine.
-- [ ] 8.5 Vector layers. A layer whose chain ends in vector features is
+- [x] 8.5 Vector layers. A layer whose chain ends in vector features is
       served as `/tiles/{layer}/{z}/{x}/{y}.mvt` through jung-mvt, with the
-      `rasterize` requirement on `geojson` and `gpkg` dropped for it. Proof:
-      `ogrinfo` reads a served tile, features match the source in a bbox.
+      `rasterize` requirement on `geojson` and `gpkg` dropped for it.
+      `Reproject` and `VecReproject` are one element over a new
+      `Constraint::AnyOf`, and vector features from a geographic crs are
+      clipped to web mercator's latitude band before projecting. Arrays and
+      objects go out as JSON text, nulls are left out. Proof: `ogrinfo` reads
+      served Natural Earth tiles at z0, z2 and z5, every required country is
+      present, a `vec_filter` lets only its continent through, `mvt_id` is the
+      source index and every polygon winds exterior positive, holes negative.
 - [ ] 8.6 Raster to vector elements. `Contours` and `Polygonize` over
       terrano's kernels as cross-kind transforms, seam-consistent across
       tiles, servable through 8.5. `Viewshed` as a transform whose plan is
-      the observer's radius, not the output window.
+      the observer's radius, not the output window. terrano's `contours`
+      builds levels by repeated addition from the window minimum and places
+      crossings as `col + t`, so adjacent tiles round differently, and its
+      saddle choice looks inverted. Fixed in terrano a4cc373 (levels from
+      `base + k * interval`, vertices as cell plus fraction, saddles paired
+      as `gdal_contour` pairs them) rather than padded around in geoplumb,
+      since tiletopia calls it too.
 
 ### Wave 3
 

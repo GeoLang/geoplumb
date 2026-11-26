@@ -32,7 +32,7 @@ pub use gpkg::GpkgSrc;
 pub use mosaic::Mosaic;
 pub use netcdf::NetcdfSrc;
 pub use points::{IdwGrid, LasSrc};
-pub use reproject::{Reproject, VecReproject};
+pub use reproject::Reproject;
 pub use source::RasterSrc;
 pub use stac::{Composite, StacSearch, StacSrc};
 pub use tensor::{TensorConv, ToRaster, ToTensor};
@@ -41,7 +41,7 @@ pub use vector::{Burn, Rasterize, VecSrc};
 
 /// adapters every graph starts with, see `Graph::register_adapter`
 pub(crate) fn default_adapters() -> Vec<crate::element::Adapter> {
-    vec![Reproject::adapter(), VecReproject::adapter()]
+    vec![Reproject::adapter()]
 }
 pub use terrain::{Aspect, Hillshade, Slope};
 pub mod mask;

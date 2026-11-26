@@ -588,6 +588,7 @@ dependencies = [
  "copc-core",
  "copc-writer",
  "geoplumb",
+ "jung-mvt",
  "nubis-core",
  "png",
  "projicio-core",
@@ -990,6 +991,14 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jung-mvt"
+version = "0.2.0"
+source = "git+https://github.com/GeoLang/jung.git?branch=master#6b996a4f6921dcb99b5c56437ec03c7561b964e1"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

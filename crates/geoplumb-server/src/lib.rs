@@ -1,5 +1,6 @@
 //! http tile server over geoplumb. one engine per configured layer, xyz
-//! tiles as gray png or, where the path ends in `.tif`, as geotiff, and a
+//! tiles as gray png or, where the path ends in `.tif`, as geotiff, or as
+//! mapbox vector tiles for a layer ending in features, and a
 //! per-request time interval wherever the layer's source resolves one.
 //! layers come from the toml named by `GEOPLUMB_LAYERS`, the service
 //! invents none of its own.
@@ -11,6 +12,7 @@
 #![recursion_limit = "256"]
 
 pub mod config;
+mod mvt;
 mod zonal;
 
 use std::path::Path;
@@ -35,7 +37,7 @@ use geoplumb::elements::{
     TensorConv, ToRaster, ToTensor, VecClip, VecFilter, VecSchema, VecSrc,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
-use geoplumb::{Crs, Engine, Graph, NodeId, Source, TimeInterval};
+use geoplumb::{Caps, Crs, Engine, Graph, NodeId, Source, TimeInterval};
 
 use config::{Config, FaninConfig, LayerConfig, LayerShape, OpConfig, SourceConfig};
 
@@ -52,8 +54,13 @@ const DISK_BUDGET_FACTOR: usize = 8;
 pub struct Layer {
     engine: Engine,
     node: NodeId,
-    gray: (f64, f64),
+    output: LayerOutput,
     info: LayerInfo,
+}
+
+enum LayerOutput {
+    Raster { gray: (f64, f64) },
+    Vector,
 }
 
 /// what `/layers` publishes about a layer
@@ -96,7 +103,6 @@ impl Layer {
     }
 
     fn build(cfg: &LayerConfig, budget_bytes: usize, disk: Option<&Path>) -> Result<Layer, String> {
-        let gray = cfg.gray_range()?;
         let LayerGraph {
             mut graph,
             node,
@@ -110,10 +116,24 @@ impl Layer {
             }
         }
         .map_err(|e| e.to_string())?;
+        let output = match engine.caps(node) {
+            Caps::Vector(_) if cfg.gray.is_some() => {
+                return Err("the chain ends in features, served as vector tiles, \
+                            so the layer takes no gray"
+                    .into());
+            }
+            Caps::Vector(_) => LayerOutput::Vector,
+            Caps::Raster(_) => LayerOutput::Raster {
+                gray: cfg.gray_range()?,
+            },
+            Caps::PointCloud(_) | Caps::Tensor(_) => {
+                unreachable!("a reproject outputs raster or vector caps")
+            }
+        };
         Ok(Layer {
             engine,
             node,
-            gray,
+            output,
             info,
         })
     }
@@ -506,8 +526,22 @@ async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({ "status": "ok" }))
 }
 
-async fn list_layers(State(state): State<Arc<ServerState>>) -> axum::Json<Vec<LayerInfo>> {
-    axum::Json(state.layers.iter().map(|l| l.info.clone()).collect())
+#[derive(Serialize)]
+struct ListedLayer {
+    #[serde(flatten)]
+    info: LayerInfo,
+    kind: &'static str,
+}
+
+async fn list_layers(State(state): State<Arc<ServerState>>) -> axum::Json<Vec<ListedLayer>> {
+    let listed = state.layers.iter().map(|l| ListedLayer {
+        info: l.info.clone(),
+        kind: match l.output {
+            LayerOutput::Raster { .. } => "raster",
+            LayerOutput::Vector => "vector",
+        },
+    });
+    axum::Json(listed.collect())
 }
 
 #[derive(Deserialize)]
@@ -516,10 +550,12 @@ struct TileQuery {
 }
 
 /// what the tile path asks to be encoded as. `.tif` hands over the chunk's
-/// own f64 bands and their georeferencing, everything else is the gray png
+/// own f64 bands and their georeferencing, `.mvt` a vector layer's
+/// features, everything else is the gray png
 enum TileFormat {
     Png,
     GeoTiff,
+    Mvt,
 }
 
 async fn tile(
@@ -530,9 +566,10 @@ async fn tile(
     let Some(layer) = state.layers.iter().find(|l| l.info.name == name) else {
         return (StatusCode::NOT_FOUND, format!("unknown layer {name}")).into_response();
     };
-    let (row, format) = match y.strip_suffix(".tif") {
-        Some(row) => (row, TileFormat::GeoTiff),
-        None => (y.trim_end_matches(".png"), TileFormat::Png),
+    let (row, format) = match (y.strip_suffix(".tif"), y.strip_suffix(".mvt")) {
+        (Some(row), _) => (row, TileFormat::GeoTiff),
+        (None, Some(row)) => (row, TileFormat::Mvt),
+        (None, None) => (y.trim_end_matches(".png"), TileFormat::Png),
     };
     let Ok(y) = row.parse::<u32>() else {
         return bad_request(format!("tile y {y} is not a number"));
@@ -548,14 +585,33 @@ async fn tile(
         Ok(time) => time,
         Err(e) => return bad_request(e),
     };
-    let chunk = match render_tile_at(&layer.engine, layer.node, XyzTile { z, x, y }, time).await {
-        Ok(chunk) => chunk,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let encoded = match format {
-        TileFormat::Png => geoplumb::encode::png_gray(&chunk, layer.gray.0, layer.gray.1)
-            .map(|bytes| ("image/png", bytes)),
-        TileFormat::GeoTiff => geoplumb::encode::geotiff(&chunk).map(|bytes| ("image/tiff", bytes)),
+    let tile = XyzTile { z, x, y };
+    let encoded = match (&layer.output, format) {
+        (LayerOutput::Raster { gray }, TileFormat::Png) => {
+            render_tile_at(&layer.engine, layer.node, tile, time)
+                .await
+                .and_then(|chunk| geoplumb::encode::png_gray(&chunk, gray.0, gray.1))
+                .map(|bytes| ("image/png", bytes))
+        }
+        (LayerOutput::Raster { .. }, TileFormat::GeoTiff) => {
+            render_tile_at(&layer.engine, layer.node, tile, time)
+                .await
+                .and_then(|chunk| geoplumb::encode::geotiff(&chunk))
+                .map(|bytes| ("image/tiff", bytes))
+        }
+        (LayerOutput::Vector, TileFormat::Mvt) => mvt::vector_tile(layer, tile, time)
+            .await
+            .map(|bytes| (jung_mvt::MVT_MEDIA_TYPE, bytes)),
+        (LayerOutput::Raster { .. }, TileFormat::Mvt) => {
+            return bad_request(format!(
+                "layer {name} is a raster layer, its tiles are .png or .tif"
+            ));
+        }
+        (LayerOutput::Vector, TileFormat::Png | TileFormat::GeoTiff) => {
+            return bad_request(format!(
+                "layer {name} is a vector layer, its tiles are .mvt"
+            ));
+        }
     };
     match encoded {
         Ok((content_type, bytes)) => {

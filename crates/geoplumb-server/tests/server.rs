@@ -16,6 +16,7 @@ use geoplumb_server::config::{
     SourceConfig, UnaryOpConfig, ValueKindConfig,
 };
 use geoplumb_server::{Layer, parse_time, router};
+use jung_mvt::{AttributeValue, TileGeometry, VectorLayer, decode_tile};
 use nubis_core::{Point3, PointCloud, write_las};
 use rusqlite::types::Value;
 use terrano_core::{
@@ -92,13 +93,13 @@ const PARCEL_STEP: f64 = 0.0005;
 const PARCEL_MIN_LAT: f64 = 46.70;
 const PARCEL_MAX_LAT: f64 = 46.85;
 
-fn parcel_ring(min_lon: f64, max_lon: f64) -> Vec<[f64; 2]> {
+fn box_ring(min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) -> Vec<[f64; 2]> {
     let corners = [
-        (min_lon, PARCEL_MIN_LAT),
-        (max_lon, PARCEL_MIN_LAT),
-        (max_lon, PARCEL_MAX_LAT),
-        (min_lon, PARCEL_MAX_LAT),
-        (min_lon, PARCEL_MIN_LAT),
+        (min_lon, min_lat),
+        (max_lon, min_lat),
+        (max_lon, max_lat),
+        (min_lon, max_lat),
+        (min_lon, min_lat),
     ];
     let mut ring = Vec::new();
     for edge in corners.windows(2) {
@@ -109,7 +110,7 @@ fn parcel_ring(min_lon: f64, max_lon: f64) -> Vec<[f64; 2]> {
             ring.push([a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)]);
         }
     }
-    ring.push([min_lon, PARCEL_MIN_LAT]);
+    ring.push([min_lon, min_lat]);
     ring
 }
 
@@ -122,7 +123,7 @@ fn parcels_geojson() -> String {
             "properties": { "depth": depth, "zone": zone },
             "geometry": {
                 "type": "Polygon",
-                "coordinates": [parcel_ring(min_lon, max_lon)],
+                "coordinates": [box_ring(min_lon, PARCEL_MIN_LAT, max_lon, PARCEL_MAX_LAT)],
             },
         })
     };
@@ -145,7 +146,7 @@ const BOUNDARY_MAX_LON: f64 = 7.32;
 fn boundary_geojson() -> String {
     serde_json::json!({
         "type": "Polygon",
-        "coordinates": [parcel_ring(7.20, BOUNDARY_MAX_LON)],
+        "coordinates": [box_ring(7.20, PARCEL_MIN_LAT, BOUNDARY_MAX_LON, PARCEL_MAX_LAT)],
     })
     .to_string()
 }
@@ -229,7 +230,7 @@ fn write_parcels(dir: &Path) -> String {
 // the geojson parcels as a geopackage feature table
 fn write_parcels_gpkg(dir: &Path) -> String {
     let parcel = |id: i64, min_lon: f64, max_lon: f64, depth: f64, zone: &str| {
-        let ring: Vec<Coord> = parcel_ring(min_lon, max_lon)
+        let ring: Vec<Coord> = box_ring(min_lon, PARCEL_MIN_LAT, max_lon, PARCEL_MAX_LAT)
             .into_iter()
             .map(|[x, y]| Coord::new(x, y))
             .collect();
@@ -1297,27 +1298,6 @@ source = { kind = "cog", path = "/b.tif" }"#,
         (
             r#"[[layer]]
 name = "a"
-source = { kind = "geojson", path = "/a.geojson" }
-gray = { min = 0.0, max = 1.0 }"#,
-            "a geojson layer with no rasterize",
-        ),
-        (
-            r#"[[layer]]
-name = "a"
-fanin = { kind = "mosaic" }
-gray = { min = 0.0, max = 1.0 }
-[[layer.input]]
-source = { kind = "geojson", path = "/a.geojson" }
-[[layer.input]]
-source = { kind = "cog", path = "/b.tif" }
-[[layer.op]]
-kind = "rasterize"
-burn = { constant = 1.0 }"#,
-            "a geojson input rasterized only after the join",
-        ),
-        (
-            r#"[[layer]]
-name = "a"
 source = { kind = "las", path = "/a.las", crs = 3857 }
 gray = { min = 0.0, max = 1.0 }"#,
             "a las layer with no idw",
@@ -1338,27 +1318,7 @@ kind = "idw""#,
 }
 
 #[test]
-fn a_geojson_layer_without_a_rasterize_is_named_at_parse() {
-    let text = r#"
-[[layer]]
-name = "parcels"
-fanin = { kind = "mosaic" }
-gray = { min = 0.0, max = 4.0 }
-
-[[layer.input]]
-source = { kind = "cog", path = "/a.tif" }
-
-[[layer.input]]
-source = { kind = "geojson", path = "/parcels.geojson" }
-"#;
-    let error = Config::parse(text).expect_err("a png encoder cannot take features");
-    assert!(error.contains("parcels"), "{error}");
-    assert!(error.contains("input 2"), "{error}");
-    assert!(error.contains("rasterize"), "{error}");
-}
-
-#[test]
-fn config_parses_a_gpkg_layer_and_names_a_missing_rasterize() {
+fn config_parses_a_gpkg_layer() {
     let config = Config::parse(&gpkg_layer_file("/parcels.gpkg")).unwrap();
     match source_of(&config.layers[0]) {
         SourceConfig::Gpkg { path, table, crs } => {
@@ -1368,17 +1328,6 @@ fn config_parses_a_gpkg_layer_and_names_a_missing_rasterize() {
         }
         other => panic!("unexpected source: {other:?}"),
     }
-
-    let text = r#"
-[[layer]]
-name = "parcels"
-source = { kind = "gpkg", path = "/parcels.gpkg" }
-gray = { min = 0.0, max = 4.0 }
-"#;
-    let error = Config::parse(text).expect_err("a png encoder cannot take features");
-    assert!(error.contains("parcels"), "{error}");
-    assert!(error.contains("gpkg"), "{error}");
-    assert!(error.contains("rasterize"), "{error}");
 }
 
 #[test]
@@ -1925,6 +1874,8 @@ async fn layers_publishes_a_fan_in_and_a_geojson_layer_by_what_they_read() {
     assert!(named("mosaicked")["collection"].is_null());
     assert!(named("mosaicked")["default_datetime"].is_null());
     assert_eq!(named("parcels")["source"], "geojson");
+    // features burned into pixels serve as a raster
+    assert_eq!(named("parcels")["kind"], "raster");
     assert!(named("parcels")["collection"].is_null());
     assert!(named("parcels")["temporal_extent"].is_null());
 }
@@ -2189,4 +2140,319 @@ fn netcdf_and_grib_layers_refuse_a_bad_datetime_and_message_zero() {
     let message = Config::parse(&zero).unwrap_err();
     assert!(message.contains("layer t2m"), "{message}");
     assert!(message.contains("count from 1"), "{message}");
+}
+
+const VECTOR_LAYERS: &str = r#"
+[[layer]]
+name = "parcel-features"
+source = { kind = "geojson", path = "GEOJSON_PATH" }
+
+[[layer]]
+name = "shallow-features"
+source = { kind = "geojson", path = "GEOJSON_PATH" }
+
+[[layer.op]]
+kind = "vec_filter"
+field = "zone"
+equals = "shallow"
+"#;
+
+fn vector_layer_file(dir: &Path) -> String {
+    VECTOR_LAYERS.replace("GEOJSON_PATH", &write_parcels(dir))
+}
+
+const MVT_EXTENT: f64 = 4096.0;
+const MVT_BUFFER: f64 = 64.0;
+
+fn tile_units(z: u8, x: u32, y: u32, lon: f64, lat: f64) -> [f64; 2] {
+    let radius = HALF_WORLD / std::f64::consts::PI;
+    let mercator_x = lon.to_radians() * radius;
+    let mercator_y = (std::f64::consts::FRAC_PI_4 + lat.to_radians() / 2.0)
+        .tan()
+        .ln()
+        * radius;
+    let (min_x, min_y, max_x, max_y) = tile_bounds(z, x, y);
+    [
+        (mercator_x - min_x) / (max_x - min_x) * MVT_EXTENT,
+        (max_y - mercator_y) / (max_y - min_y) * MVT_EXTENT,
+    ]
+}
+
+fn decoded_layer(body: &[u8], name: &str) -> VectorLayer {
+    let tile = decode_tile(body).expect("an mvt tile");
+    assert_eq!(tile.layers.len(), 1, "{:?}", tile.layers);
+    tile.layer(name)
+        .unwrap_or_else(|| panic!("no mvt layer {name}"))
+        .clone()
+}
+
+fn zones(layer: &VectorLayer) -> Vec<String> {
+    let mut zones: Vec<String> = layer
+        .features
+        .iter()
+        .map(|feature| match feature.attributes.get("zone") {
+            Some(AttributeValue::String(zone)) => zone.clone(),
+            other => panic!("zone is {other:?}"),
+        })
+        .collect();
+    zones.sort();
+    zones
+}
+
+fn exterior_bounds(geometry: &TileGeometry) -> [f64; 4] {
+    let TileGeometry::Polygons(polygons) = geometry else {
+        panic!("not a polygon: {geometry:?}");
+    };
+    let mut bounds = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for vertex in polygons.iter().flat_map(|polygon| &polygon.exterior) {
+        let (x, y) = (f64::from(vertex[0]), f64::from(vertex[1]));
+        bounds = [
+            bounds[0].min(x),
+            bounds[1].min(y),
+            bounds[2].max(x),
+            bounds[3].max(y),
+        ];
+    }
+    bounds
+}
+
+fn assert_near(got: f64, want: f64, what: &str) {
+    // jung-mvt truncates coordinates to whole tile units
+    assert!((got - want).abs() <= 1.0, "{what}: {got} against {want}");
+}
+
+#[tokio::test]
+async fn a_vector_layer_serves_its_filtered_features_as_mvt() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&vector_layer_file(dir.path()));
+    // the tile holding the shallow parcel's north east corner
+    let (x, y) = tile_of(12, 7.3, 46.83);
+
+    let (status, content_type, body) =
+        get_typed(&app, &format!("/tiles/parcel-features/12/{x}/{y}.mvt")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "application/vnd.mapbox-vector-tile");
+    let whole = decoded_layer(&body, "parcel-features");
+    assert_eq!(zones(&whole), ["deep", "shallow"]);
+
+    let uri = format!("/tiles/shallow-features/12/{x}/{y}.mvt");
+    let (status, body) = get(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let filtered = decoded_layer(&body, "shallow-features");
+    assert_eq!(zones(&filtered), ["shallow"]);
+    let feature = &filtered.features[0];
+    assert_eq!(
+        feature.attributes.get("depth"),
+        Some(&AttributeValue::Number(1.0))
+    );
+
+    // the parcel runs past the tile west and south, so those sides stop
+    // at the buffer, and its east and north edges fall inside the tile
+    let [min_x, min_y, max_x, max_y] = exterior_bounds(&feature.geometry);
+    let [east, north] = tile_units(12, x, y, 7.35, 46.85);
+    assert!(east > 0.0 && east < MVT_EXTENT && north > 0.0 && north < MVT_EXTENT);
+    assert_near(min_x, -MVT_BUFFER, "west edge");
+    assert_near(max_x, east, "east edge");
+    assert_near(min_y, north, "north edge");
+    assert_near(max_y, MVT_EXTENT + MVT_BUFFER, "south edge");
+
+    let (status, timed) = get(
+        &app,
+        &format!("{uri}?t=2024-06-01T00:00:00Z/2024-07-01T00:00:00Z"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(timed, body);
+    let (status, _) = get(&app, &format!("{uri}?t=yesterday")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_polygon_split_across_engine_chunks_comes_back_as_one_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    let region = serde_json::json!({
+        "type": "Feature",
+        "properties": { "name": "region" },
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [box_ring(6.9, 46.4, 7.7, 47.1)],
+        },
+    });
+    let path = write_geojson(dir.path(), "region.geojson", region.to_string());
+    let text = format!(
+        r#"
+[[layer]]
+name = "region"
+source = {{ kind = "geojson", path = "{path}" }}
+"#
+    );
+    let app = app(&text);
+    // at z10 the pull snaps to ladder level 1 over the 55 m vertex spacing, 28 km chunks under a 39 km tile
+    let (x, y) = tile_of(10, 7.3, 46.75);
+
+    let (status, body) = get(&app, &format!("/tiles/region/10/{x}/{y}.mvt")).await;
+    assert_eq!(status, StatusCode::OK);
+    let layer = decoded_layer(&body, "region");
+    assert_eq!(layer.features.len(), 1, "{:?}", layer.features);
+    let TileGeometry::Polygons(polygons) = &layer.features[0].geometry else {
+        panic!("not a polygon");
+    };
+    assert_eq!(polygons.len(), 1, "{polygons:?}");
+    assert!(polygons[0].holes.is_empty(), "{polygons:?}");
+    // the region covers the whole buffered tile
+    let [min_x, min_y, max_x, max_y] = exterior_bounds(&layer.features[0].geometry);
+    assert_near(min_x, -MVT_BUFFER, "west edge");
+    assert_near(min_y, -MVT_BUFFER, "north edge");
+    assert_near(max_x, MVT_EXTENT + MVT_BUFFER, "east edge");
+    assert_near(max_y, MVT_EXTENT + MVT_BUFFER, "south edge");
+}
+
+#[tokio::test]
+async fn array_and_object_properties_go_out_as_json_text_and_nulls_are_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let region = serde_json::json!({
+        "type": "Feature",
+        "properties": {
+            "name": "region",
+            "count": 3,
+            "tags": ["a", "b"],
+            "owner": { "id": 7 },
+            "note": null,
+        },
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [box_ring(7.2, 46.7, 7.4, 46.9)],
+        },
+    });
+    let path = write_geojson(dir.path(), "region.geojson", region.to_string());
+    let text = format!(
+        r#"
+[[layer]]
+name = "region"
+source = {{ kind = "geojson", path = "{path}" }}
+"#
+    );
+    let app = app(&text);
+    let (x, y) = tile_of(10, 7.3, 46.8);
+
+    let (status, body) = get(&app, &format!("/tiles/region/10/{x}/{y}.mvt")).await;
+    assert_eq!(status, StatusCode::OK);
+    let layer = decoded_layer(&body, "region");
+    assert_eq!(layer.features.len(), 1, "{:?}", layer.features);
+    let attributes = &layer.features[0].attributes;
+    let text_of = |key: &str| match attributes.get(key) {
+        Some(AttributeValue::String(text)) => text.clone(),
+        other => panic!("{key} is {other:?}"),
+    };
+    assert_eq!(text_of("name"), "region");
+    assert_eq!(attributes.get("count"), Some(&AttributeValue::Integer(3)));
+    assert_eq!(text_of("tags"), r#"["a","b"]"#);
+    assert_eq!(text_of("owner"), r#"{"id":7}"#);
+    assert!(!attributes.contains_key("note"), "{attributes:?}");
+}
+
+#[tokio::test]
+async fn a_layer_serves_only_its_own_kind_of_tile_and_zonal_takes_rasters() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = format!(
+        "{}{}",
+        cog_layer_file(dir.path()),
+        vector_layer_file(dir.path())
+    );
+    let app = app(&text);
+    let (x, y) = tile_of(12, 7.3, 46.83);
+
+    let (status, body) = get(&app, &format!("/tiles/dem/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(opaque_pixels(&body) > 0);
+    let refused = [
+        (format!("/tiles/dem/12/{x}/{y}.mvt"), "raster"),
+        (format!("/tiles/parcel-features/12/{x}/{y}"), "vector"),
+        (format!("/tiles/parcel-features/12/{x}/{y}.png"), "vector"),
+        (format!("/tiles/parcel-features/12/{x}/{y}.tif"), "vector"),
+    ];
+    for (uri, kind) in refused {
+        let (status, body) = get(&app, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        let message = String::from_utf8(body).unwrap();
+        assert!(message.contains(kind), "{uri}: {message}");
+    }
+
+    let window = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": [],
+        "bbox": [7.30, 46.81, 7.32, 46.83],
+        "resolution": 100.0,
+    });
+    let mut series = window.clone();
+    series["steps"] = serde_json::json!(["2024-06-01T00:00:00Z/2024-07-01T00:00:00Z"]);
+    for (uri, body) in [
+        ("/zonal/parcel-features", &window),
+        ("/zonal/parcel-features/series", &series),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let message = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let message = String::from_utf8(message.to_vec()).unwrap();
+        assert!(message.contains("vector"), "{uri}: {message}");
+    }
+
+    let (status, body) = get(&app, "/layers").await;
+    assert_eq!(status, StatusCode::OK);
+    let layers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let kinds: HashMap<&str, &str> = layers
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| (l["name"].as_str().unwrap(), l["kind"].as_str().unwrap()))
+        .collect();
+    assert_eq!(kinds["dem"], "raster");
+    assert_eq!(kinds["parcel-features"], "vector");
+    assert_eq!(kinds["shallow-features"], "vector");
+    assert_eq!(layers[1]["source"], "geojson", "{layers}");
+}
+
+#[test]
+fn a_vector_layer_takes_no_gray_and_a_burned_one_still_needs_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let vector = vector_layer_file(dir.path());
+    let config = Config::parse(&vector).expect("a vector layer needs no gray");
+    Layer::build_all(&config, 64 << 20, None).expect("a vector layer builds without gray");
+
+    let with_gray = vector.replacen(
+        "name = \"parcel-features\"",
+        "name = \"parcel-features\"\ngray = { min = 0.0, max = 4.0 }",
+        1,
+    );
+    let config = Config::parse(&with_gray).unwrap();
+    let error = match Layer::build_all(&config, 64 << 20, None) {
+        Ok(_) => panic!("a vector layer took a gray range"),
+        Err(error) => error,
+    };
+    assert!(error.contains("parcel-features"), "{error}");
+    assert!(error.contains("gray"), "{error}");
+
+    let burned = GEOJSON
+        .replace("GEOJSON_PATH", "/parcels.geojson")
+        .replace("gray = { min = 0.0, max = 4.0 }\n", "");
+    let error = Config::parse(&burned).expect_err("burned values carry no range");
+    assert!(error.contains("gray"), "{error}");
 }
