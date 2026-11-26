@@ -2,6 +2,9 @@
 
 ## 2026-11-26
 
+- `geoplumb`, a second binary in `geoplumb-server`. `geoplumb run <layers.toml> <layer> --bbox --crs --resolution [--t] -o <out>` builds the one named layer and writes a raster layer as a COG through `export::write_cog` on the grid `GET /export/{layer}` sizes, or a vector layer's features in the bbox as GeoJSON in EPSG:4326, with no time limit or value cap. `geoplumb info <file>` prints a COG's size, bands, sample format, bits, CRS, geotransform, compression, predictor, nodata and overview sizes. GeoPackage output is not written, see DESIGN.md
+- `GET /export/{layer}` refuses a grid side past 4294967295 pixels, TIFF's 32 bit width, naming that limit before the value cap
+- `LayerGraph` carries `chain_crs`, the crs the layer's ops run in, and `Layer` takes its crs from there instead of from the solved engine. `ExportQuery` and `DEFAULT_CACHE_BYTES` are public
 - `Transform::output_without_input` lets an element answer a chunk before the engine plans or pulls its input. `Viewshed` answers NaN for a tile clear of the observer's disc, which used to pull and run the whole disc
 - the window alignment's tolerance grows with the coordinates' size, `1e-12` of the largest coordinate in cells and at least `1e-9` cells, so a web mercator tile near x = 2e7 at z17 or z18 no longer pulls 257 columns
 - `export::write_cog` stops pulling tiles once its future is dropped, so `GET /export/{layer}` stops after the tile it is on when it answers 504 or its client disconnects, instead of writing on to the last tile

@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 
 use geoplumb_server::config::Config;
-use geoplumb_server::{Layer, router};
+use geoplumb_server::{DEFAULT_CACHE_BYTES, Layer, router};
 
-const DEFAULT_CACHE_BYTES: usize = 256 << 20;
 const DEFAULT_PORT: u16 = 3000;
 
 #[tokio::main]

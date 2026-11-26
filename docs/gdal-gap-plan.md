@@ -408,9 +408,9 @@ only after a proof script passes on real input, recorded in
 Routine GDAL work is a one-line command on a file: `gdalwarp`,
 `gdal_translate`, `gdaldem`, `gdal_calc`, `ogr2ogr`. GDAL 3.11 added
 `gdal raster pipeline` and 3.12 added `gdal pipeline`, which chain steps into a
-graph from the shell. geoplumb is reachable only through a layer file served
-by `geoplumb-server`, the Rust library and four examples, so a user who wants
-a reprojected, clipped file on disk has no command to run. The items are in
+graph from the shell. geoplumb runs from a layer file, served by
+`geoplumb-server` or written to disk by the `geoplumb` command, from the Rust
+library and from four examples. The items are in
 the order a first-time user meets them. 9.1 to 9.3 come first: a command
 that opens the user's file and writes it back in its own dtype.
 
@@ -423,11 +423,17 @@ that opens the user's file and writes it back in its own dtype.
       size, bands, dtype, CRS, geotransform, overviews, nodata and compression,
       in place of `gdalinfo`. The server's four-minute timeout and export pixel
       cap protect a shared process and do not apply on the command line.
-      Open: a binary in `geoplumb-server`, which holds `config.rs`, or the
-      config moved into a crate both use. Open: whether one-step jobs take
-      the source and ops as flags or always go through a TOML file.
-- [ ] 9.2 Open every GeoTIFF GDAL writes with its defaults. Left: ZSTD, JPEG and WebP tiles, striped GeoTIFF and BigTIFF in
-      `CogReader` (section 7 sizes each). A CRS given as WKT or PROJ JSON is
+      Built: the binary in `geoplumb-server`, jobs always through a TOML
+      file, `run` to `.tif` and `.geojson` (EPSG:4326 only), and `info`.
+      Proof: on a GDAL LZW COG of Copernicus GLO-30, `info` matches
+      `gdalinfo` and `run` to UTM 32N at 30 m matches
+      `gdalwarp -r bilinear -et 0` within 0.65 mm on every pixel.
+      Left: `.gpkg`, blocked on geodukt (its writers take `geodukt-core`
+      types, `geodukt-core` depends on geoplumb, and its rusqlite 0.40 links
+      a different `libsqlite3-sys` than geoplumb's 0.39), and `geoplumb
+      pyramid`.
+- [ ] 9.2 Open every GeoTIFF GDAL writes with its defaults. Left: ZSTD,
+      JPEG and WebP tiles, striped GeoTIFF and BigTIFF in `CogReader` (section 7 sizes each). A CRS given as WKT or PROJ JSON is
       8.10. Vector: shapefile and CSV as layer sources through geodukt, which
       reads both, then FlatGeobuf and GeoParquet (section 7).
 - [ ] 9.3 Native dtype on output, which is 8.9. A byte raster exported today

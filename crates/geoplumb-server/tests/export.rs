@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::{Command, Output};
 
 use axum::Router;
 use axum::body::Body;
@@ -6,7 +7,8 @@ use axum::http::{Request, StatusCode, header};
 use geoplumb_server::config::Config;
 use geoplumb_server::{Layer, router};
 use projicio_core::Transform;
-use terrano_core::{CogParams, CogReader, Raster, write_cog};
+use terrano_core::{CogParams, CogReader, RangeRead, Raster, SampleFormat, write_cog};
+use topoi_core::geojson::{FeatureGeometry, read_geojson};
 use tower::ServiceExt;
 
 const W: usize = 600;
@@ -154,7 +156,11 @@ async fn a_wgs84_layer_exports_onto_the_utm_grid_it_was_asked_for() {
         "attachment; filename=\"dem.tif\""
     );
 
-    let reader = CogReader::open(answer.body.as_slice()).unwrap();
+    assert_holds_the_dem_on_the_100_m_utm_grid(&CogReader::open(answer.body.as_slice()).unwrap());
+}
+
+fn assert_holds_the_dem_on_the_100_m_utm_grid<R: RangeRead>(reader: &CogReader<R>) {
+    let [min_x, _, _, max_y] = utm_window();
     let meta = reader.meta();
     assert_eq!(meta.epsg, 32632);
     assert_eq!((meta.origin_x, meta.origin_y), (min_x, max_y));
@@ -361,4 +367,446 @@ async fn an_export_writes_its_file_under_the_export_dir() {
     let reason = String::from_utf8_lossy(&answer.body);
     assert_eq!(answer.status, StatusCode::INTERNAL_SERVER_ERROR, "{reason}");
     assert!(reason.contains("no temp file for the export"), "{reason}");
+}
+
+fn geoplumb(arguments: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_geoplumb"))
+        .args(arguments)
+        .output()
+        .unwrap()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn write_command_layers(dir: &Path) -> String {
+    let sites = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": { "name": "pier", "kind": "keep" },
+                "geometry": { "type": "Point", "coordinates": [-122.45, 37.75] },
+            },
+            {
+                "type": "Feature",
+                "properties": { "name": "dropped", "kind": "drop" },
+                "geometry": { "type": "Point", "coordinates": [-122.40, 37.80] },
+            },
+            {
+                "type": "Feature",
+                "properties": { "name": "outside", "kind": "keep" },
+                "geometry": { "type": "Point", "coordinates": [-122.20, 37.75] },
+            },
+            {
+                "type": "Feature",
+                "properties": { "name": "park", "kind": "keep" },
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-122.48, 37.72], [-122.42, 37.72], [-122.42, 37.78],
+                        [-122.48, 37.78], [-122.48, 37.72],
+                    ]],
+                },
+            },
+            {
+                "type": "Feature",
+                "properties": { "name": "ferry", "kind": "keep" },
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[-122.35, 37.85], [-122.25, 37.85]],
+                },
+            },
+        ],
+    });
+    let sites_path = dir.join("sites.geojson");
+    std::fs::write(&sites_path, sites.to_string()).unwrap();
+    let text = format!(
+        r#"
+[[layer]]
+name = "dem"
+source = {{ kind = "cog", path = "{dem}" }}
+
+[[layer]]
+name = "contours"
+source = {{ kind = "cog", path = "{dem}" }}
+
+[[layer.op]]
+kind = "contours"
+interval = 50.0
+
+[[layer]]
+name = "sites"
+source = {{ kind = "geojson", path = "{sites}" }}
+
+[[layer.op]]
+kind = "vec_filter"
+field = "kind"
+equals = "keep"
+"#,
+        dem = write_dem(dir),
+        sites = sites_path.display().to_string().replace('\\', "/"),
+    );
+    let path = dir.join("layers.toml");
+    std::fs::write(&path, text).unwrap();
+    path.display().to_string()
+}
+
+#[test]
+fn geoplumb_run_writes_a_raster_layer_as_a_cog_on_the_grid_it_was_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let layers = write_command_layers(dir.path());
+    let [min_x, min_y, max_x, max_y] = utm_window();
+    let out = dir.path().join("dem-utm.tif");
+    let output = geoplumb(&[
+        "run",
+        &layers,
+        "dem",
+        "--bbox",
+        &format!("{min_x},{min_y},{max_x},{max_y}"),
+        "--crs",
+        "EPSG:32632",
+        "--resolution",
+        "100",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let file = std::fs::File::open(&out).unwrap();
+    assert_holds_the_dem_on_the_100_m_utm_grid(&CogReader::open(file).unwrap());
+}
+
+#[test]
+fn geoplumb_run_writes_contour_lines_as_geojson_on_their_elevation() {
+    let dir = tempfile::tempdir().unwrap();
+    let layers = write_command_layers(dir.path());
+    let out = dir.path().join("contours.geojson");
+    let output = geoplumb(&[
+        "run",
+        &layers,
+        "contours",
+        "--bbox",
+        "7.2,46.7,7.4,46.9",
+        "--crs",
+        "EPSG:4326",
+        "--resolution",
+        "0.001",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let collection = read_geojson(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    // the dem runs from about 300 to 480 m over this window
+    let mut elevations: Vec<f64> = Vec::new();
+    for feature in &collection.features {
+        let elevation = feature.properties["elevation"].as_f64().unwrap();
+        assert_eq!(elevation % 50.0, 0.0, "elevation {elevation}");
+        elevations.push(elevation);
+        let lines = match feature.geometry.as_ref().unwrap() {
+            FeatureGeometry::LineString(line) => vec![line.clone()],
+            FeatureGeometry::MultiLineString(lines) => lines.linestrings().to_vec(),
+            other => panic!("contour {elevation} is {other:?}"),
+        };
+        for coord in lines.iter().flat_map(|line| line.coords()) {
+            assert!(
+                (7.2 - 1e-9..=7.4 + 1e-9).contains(&coord.x)
+                    && (46.7 - 1e-9..=46.9 + 1e-9).contains(&coord.y),
+                "contour {elevation} has a vertex at {},{} outside the bbox",
+                coord.x,
+                coord.y
+            );
+            let dem = dem_at(coord.x, coord.y);
+            assert!(
+                (dem - elevation).abs() < 0.05,
+                "contour {elevation} passes {},{} where the dem is {dem}",
+                coord.x,
+                coord.y
+            );
+        }
+    }
+    elevations.sort_by(f64::total_cmp);
+    elevations.dedup();
+    assert_eq!(elevations, [350.0, 400.0, 450.0]);
+}
+
+#[test]
+fn geoplumb_run_writes_a_filtered_vector_layer_clipped_to_a_western_bbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let layers = write_command_layers(dir.path());
+    let out = dir.path().join("sites.geojson");
+    let output = geoplumb(&[
+        "run",
+        &layers,
+        "sites",
+        "--bbox",
+        "-122.5,37.7,-122.3,37.9",
+        "--crs",
+        "EPSG:4326",
+        "--resolution",
+        "0.001",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let collection = read_geojson(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    let mut names: Vec<&str> = collection
+        .features
+        .iter()
+        .map(|feature| feature.properties["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["ferry", "park", "pier"]);
+    let geometry_of = |name: &str| {
+        collection
+            .features
+            .iter()
+            .find(|feature| feature.properties["name"] == name)
+            .and_then(|feature| feature.geometry.clone())
+            .unwrap()
+    };
+
+    let FeatureGeometry::Point(pier) = geometry_of("pier") else {
+        panic!("the pier is no longer a point");
+    };
+    assert_eq!((pier.0.x, pier.0.y), (-122.45, 37.75));
+
+    let park = match geometry_of("park") {
+        FeatureGeometry::Polygon(polygon) => polygon,
+        FeatureGeometry::MultiPolygon(multi) if multi.polygons().len() == 1 => {
+            multi.polygons()[0].clone()
+        }
+        other => panic!("the park is {other:?}"),
+    };
+    let ring = park.exterior().coords();
+    let west = ring
+        .iter()
+        .map(|coord| coord.x)
+        .fold(f64::INFINITY, f64::min);
+    let east = ring
+        .iter()
+        .map(|coord| coord.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let south = ring
+        .iter()
+        .map(|coord| coord.y)
+        .fold(f64::INFINITY, f64::min);
+    let north = ring
+        .iter()
+        .map(|coord| coord.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    for (got, want) in [
+        (west, -122.48),
+        (east, -122.42),
+        (south, 37.72),
+        (north, 37.78),
+    ] {
+        assert!(
+            (got - want).abs() < 1e-6,
+            "park edge {got}, the source has {want}"
+        );
+    }
+
+    // the ferry line runs east past the bbox and is cut at its east edge
+    let ferry = match geometry_of("ferry") {
+        FeatureGeometry::LineString(line) => line.coords().to_vec(),
+        FeatureGeometry::MultiLineString(lines) => lines
+            .linestrings()
+            .iter()
+            .flat_map(|line| line.coords().to_vec())
+            .collect(),
+        other => panic!("the ferry is {other:?}"),
+    };
+    let east_end = ferry
+        .iter()
+        .map(|coord| coord.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let west_end = ferry
+        .iter()
+        .map(|coord| coord.x)
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        (east_end - -122.3).abs() < 1e-6,
+        "the ferry ends at {east_end}"
+    );
+    assert!(
+        (west_end - -122.35).abs() < 1e-6,
+        "the ferry starts at {west_end}"
+    );
+    assert!(ferry.iter().all(|coord| (coord.y - 37.85).abs() < 1e-6));
+}
+
+#[test]
+fn geoplumb_run_refuses_a_job_it_cannot_write_and_writes_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let layers = write_command_layers(dir.path());
+    let [min_x, min_y, max_x, max_y] = utm_window();
+    let utm_bbox = format!("{min_x},{min_y},{max_x},{max_y}");
+    let lon_lat_bbox = "7.2,46.7,7.4,46.9";
+    let missing = dir.path().join("missing.toml").display().to_string();
+    let cases: [(&str, &str, &str, &str, &str, &str); 9] = [
+        (
+            &layers,
+            "dem",
+            &utm_bbox,
+            "EPSG:32632",
+            "dem.gpkg",
+            ".geojson for a vector layer",
+        ),
+        (
+            &layers,
+            "nowhere",
+            &utm_bbox,
+            "EPSG:32632",
+            "dem.tif",
+            "no layer is named nowhere, the file names dem, contours, sites",
+        ),
+        (
+            &layers,
+            "dem",
+            lon_lat_bbox,
+            "EPSG:4326",
+            "dem.geojson",
+            "raster layer, its output is a .tif",
+        ),
+        (
+            &layers,
+            "contours",
+            lon_lat_bbox,
+            "EPSG:4326",
+            "contours.tif",
+            "vector layer, its output is a .geojson",
+        ),
+        (
+            &layers,
+            "contours",
+            &utm_bbox,
+            "EPSG:32632",
+            "contours.geojson",
+            "--crs EPSG:4326",
+        ),
+        (
+            &layers,
+            "dem",
+            "1,2,3",
+            "EPSG:32632",
+            "dem.tif",
+            "four numbers",
+        ),
+        (&layers, "dem", &utm_bbox, "32632", "dem.tif", "EPSG:<code>"),
+        (
+            &layers,
+            "dem",
+            &utm_bbox,
+            "EPSG:32632",
+            "dem.tiff.txt",
+            ".tif for a raster layer",
+        ),
+        (
+            &missing,
+            "dem",
+            &utm_bbox,
+            "EPSG:32632",
+            "dem.tif",
+            "missing.toml",
+        ),
+    ];
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    for (layer_file, layer, bbox, crs, name, problem) in cases {
+        let out = out_dir.join(name);
+        let output = geoplumb(&[
+            "run",
+            layer_file,
+            layer,
+            "--bbox",
+            bbox,
+            "--crs",
+            crs,
+            "--resolution",
+            "100",
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+        let message = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{layer} to {name}: {message}"
+        );
+        assert!(message.contains(problem), "{layer} to {name}: {message}");
+        assert!(!out.exists(), "{layer} to {name} left a file behind");
+    }
+
+    let output = geoplumb(&[
+        "run",
+        &layers,
+        "dem",
+        "--bbox",
+        &utm_bbox,
+        "--crs",
+        "EPSG:32632",
+        "--resolution",
+        "100",
+        "--t",
+        "yesterday",
+        "-o",
+        out_dir.join("dem.tif").to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("bad t parameter"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!out_dir.join("dem.tif").exists());
+
+    let output = geoplumb(&["info", &layers]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("not a little-endian tiff"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn geoplumb_info_prints_what_the_cog_declares() {
+    let dir = tempfile::tempdir().unwrap();
+    let raster = Raster::from_vec(W, H, vec![500.0; W * H], 20.0, f64::NAN).unwrap();
+    let params = CogParams {
+        tile_width: 256,
+        tile_height: 256,
+        overview_levels: 2,
+        epsg: 32632,
+        origin_x: 380000.0,
+        origin_y: 5190000.0,
+        pixel_width: 20.0,
+        pixel_height: 20.0,
+        deflate: true,
+        format: SampleFormat::U16,
+        nodata: Some(0.0),
+    };
+    let path = dir.path().join("dem-u16.tif");
+    write_cog(&raster, &params, &mut std::fs::File::create(&path).unwrap()).unwrap();
+
+    let output = geoplumb(&["info", path.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "size: 600 x 400\n\
+         bands: 1\n\
+         sample format: u16\n\
+         bits: 16\n\
+         crs: EPSG:32632\n\
+         geotransform: 380000, 20, 0, 5190000, 0, -20\n\
+         compression: deflate\n\
+         predictor: none\n\
+         nodata: 0\n\
+         overviews:\n\
+         - 300 x 200\n\
+         - 150 x 100\n"
+    );
 }

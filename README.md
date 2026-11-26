@@ -119,6 +119,71 @@ name = "dem"
 source = { kind = "gdal", path = "/data/dem.tif", band = 1 }
 ```
 
+## Command line
+
+`geoplumb` writes a layer from the same TOML file to disk instead of serving it. It is the second binary of the `geoplumb-server` crate.
+
+```sh
+cargo install --path crates/geoplumb-server --bin geoplumb
+geoplumb run <layers.toml> <layer> --bbox minx,miny,maxx,maxy --crs EPSG:<code> --resolution <r> [--t <start>/<end>] -o <out>
+geoplumb info <file.tif>
+```
+
+`run` builds the one layer it names. `--bbox`, `--crs`, `--resolution` and `--t` mean what they mean on `GET /export/{layer}`, and the grid is sized the same way. A raster layer writes a COG to a `.tif` or `.tiff` path, in the layout the export route writes. A vector layer writes GeoJSON to a `.geojson` path: the features in the bbox, clipped to it and merged back where chunk seams cut them. GeoJSON coordinates are lon/lat, so a `.geojson` output takes `--crs EPSG:4326` only. Any other extension is an error, `.gpkg` included. The file is written under a temporary name in the output's directory and renamed when it is complete, so a failed run leaves no file. There is no time limit and no pixel cap. The COG is a classic TIFF, so a run whose compressed tiles pass 4 GiB fails after its last tile.
+
+`info` prints one `key: value` line each for size, band count, sample format, bits, CRS, geotransform (GDAL order), compression, predictor and nodata, then the overview sizes as a list. It reads what terrano's `CogReader` reads: tiled, uncompressed, LZW or deflate.
+
+```
+size: 600 x 400
+bands: 1
+sample format: u16
+bits: 16
+crs: EPSG:32632
+geotransform: 380000, 20, 0, 5190000, 0, -20
+compression: deflate
+predictor: none
+nodata: 0
+overviews:
+- 300 x 200
+- 150 x 100
+```
+
+Routine GDAL jobs, each with the `geoplumb` command that does the same over this layer file:
+
+```toml
+[[layer]]
+name = "dem"
+source = { kind = "cog", path = "/data/dem.tif" }
+
+[[layer]]
+name = "contours"
+source = { kind = "cog", path = "/data/dem.tif" }
+
+[[layer.op]]
+kind = "contours"
+interval = 10.0
+
+[[layer]]
+name = "s2-red-median"
+source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "sentinel-2-l2a", assets = ["red"], bbox = [7.0, 46.3, 8.0, 46.9], composite = "median" }
+```
+
+```sh
+# gdalwarp -t_srs EPSG:32632 -te 380000 5170000 400000 5190000 -tr 20 20 -r bilinear -of COG dem.tif dem-utm.tif
+geoplumb run layers.toml dem --bbox 380000,5170000,400000,5190000 --crs EPSG:32632 --resolution 20 -o dem-utm.tif
+
+# gdal_contour -i 10 -a elevation dem.tif contours.geojson, over a lon/lat window
+geoplumb run layers.toml contours --bbox 7.2,46.5,7.6,46.8 --crs EPSG:4326 --resolution 0.0003 -o contours.geojson
+
+# a summer median of Sentinel-2 red over the same UTM window, pulled from the STAC API window by window
+geoplumb run layers.toml s2-red-median --bbox 380000,5170000,400000,5190000 --crs EPSG:32632 --resolution 10 --t 2025-06-01T00:00:00Z/2025-09-01T00:00:00Z -o red-median.tif
+
+# gdalinfo dem-utm.tif
+geoplumb info dem-utm.tif
+```
+
+The Docker image holds `geoplumb-server` only.
+
 ## Library
 
 ```rust

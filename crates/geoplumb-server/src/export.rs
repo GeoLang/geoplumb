@@ -8,7 +8,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use geoplumb::elements::Reproject;
 use geoplumb::export::{COG_TILE_PX, ExportGrid, write_cog};
-use geoplumb::{Bbox, Caps, Crs, Engine, TimeInterval};
+use geoplumb::{Bbox, Caps, Crs, Engine, NodeId, TimeInterval};
 use projicio_core::Transform;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -26,18 +26,82 @@ const MAX_EXPORT_VALUES: f64 = 16384.0 * 16384.0;
 const STREAM_CHUNK_BYTES: usize = 64 << 10;
 
 #[derive(Deserialize)]
-pub(crate) struct ExportQuery {
-    bbox: String,
-    crs: String,
-    resolution: f64,
-    t: Option<String>,
+pub struct ExportQuery {
+    pub bbox: String,
+    pub crs: String,
+    pub resolution: f64,
+    pub t: Option<String>,
 }
 
 #[derive(Clone, Copy)]
-struct Plan {
-    crs: Crs,
-    grid: ExportGrid,
-    time: Option<TimeInterval>,
+pub(crate) struct Plan {
+    pub(crate) crs: Crs,
+    pub(crate) grid: ExportGrid,
+    pub(crate) time: Option<TimeInterval>,
+}
+
+impl Plan {
+    pub(crate) fn from_query(query: &ExportQuery, chain_crs: Crs) -> Result<Plan, String> {
+        let time = parse_time(query.t.as_deref())?;
+        let bbox = parse_bbox(&query.bbox)?;
+        let resolution = query.resolution;
+        if !resolution.is_finite() || resolution <= 0.0 {
+            return Err(format!(
+                "resolution {resolution} is not a positive number of crs units per pixel"
+            ));
+        }
+        let crs = parse_crs(&query.crs, chain_crs)?;
+
+        // gdalwarp's -te with -tr rounds the pixel count and keeps at least one
+        let cols = (bbox.width() / resolution).round().max(1.0);
+        let rows = (bbox.height() / resolution).round().max(1.0);
+        // tiff stores the image width and height as 32 bit integers
+        let tiff_side = f64::from(u32::MAX);
+        if cols > tiff_side || rows > tiff_side {
+            return Err(format!(
+                "{cols} x {rows} pixels is past the {} pixel side a tiff holds, coarsen the \
+                 resolution or shrink the bbox",
+                u32::MAX
+            ));
+        }
+        Ok(Plan {
+            crs,
+            grid: ExportGrid {
+                origin_x: bbox.min_x,
+                origin_y: bbox.max_y,
+                pixel_size: resolution,
+                cols: cols as usize,
+                rows: rows as usize,
+            },
+            time,
+        })
+    }
+}
+
+pub(crate) fn engine_onto_grid(
+    layer_graph: LayerGraph,
+    plan: &Plan,
+    budget_bytes: usize,
+) -> Result<(Engine, NodeId), String> {
+    let LayerGraph {
+        mut graph,
+        node,
+        chain_crs,
+        ..
+    } = layer_graph;
+    let node = if plan.crs == chain_crs {
+        node
+    } else {
+        let onto_grid = Reproject::onto_grid(
+            plan.crs,
+            plan.grid.origin_x,
+            plan.grid.origin_y,
+            plan.grid.pixel_size,
+        );
+        graph.add_transform(node, Box::new(onto_grid))
+    };
+    let engine = Engine::new(graph, budget_bytes).map_err(|e| e.to_string())?;
+    Ok((engine, node))
 }
 
 pub(crate) async fn cog(
@@ -75,21 +139,8 @@ pub(crate) async fn cog(
         let _slot = slot;
         let built = tokio::task::spawn_blocking(move || {
             let layer = &state.layers[index];
-            let LayerGraph {
-                mut graph, node, ..
-            } = build_layer_graph(&layer.config)?;
-            let node = if plan.crs == layer.chain_crs {
-                node
-            } else {
-                let onto_grid = Reproject::onto_grid(
-                    plan.crs,
-                    plan.grid.origin_x,
-                    plan.grid.origin_y,
-                    plan.grid.pixel_size,
-                );
-                graph.add_transform(node, Box::new(onto_grid))
-            };
-            let engine = Engine::new(graph, layer.budget_bytes).map_err(|e| e.to_string())?;
+            let layer_graph = build_layer_graph(&layer.config)?;
+            let (engine, node) = engine_onto_grid(layer_graph, &plan, layer.budget_bytes)?;
             let file = tempfile::tempfile_in(&export_dir).map_err(|e| {
                 format!(
                     "no temp file for the export in {}: {e}",
@@ -158,40 +209,19 @@ fn plan(layer: &Layer, query: &ExportQuery) -> Result<Plan, String> {
             layer.info.name
         ));
     };
-    let time = parse_time(query.t.as_deref())?;
-    let bbox = parse_bbox(&query.bbox)?;
-    let resolution = query.resolution;
-    if !resolution.is_finite() || resolution <= 0.0 {
-        return Err(format!(
-            "resolution {resolution} is not a positive number of crs units per pixel"
-        ));
-    }
-    let crs = parse_crs(&query.crs, layer.chain_crs)?;
-
-    // gdalwarp's -te with -tr rounds the pixel count and keeps at least one
-    let cols = (bbox.width() / resolution).round().max(1.0);
-    let rows = (bbox.height() / resolution).round().max(1.0);
+    let plan = Plan::from_query(query, layer.chain_crs)?;
+    let (cols, rows) = (plan.grid.cols as f64, plan.grid.rows as f64);
     let tile = COG_TILE_PX as f64;
-    // compared as floats so an absurd resolution fails here instead of overflowing the casts below
+    // two 32 bit sides and a band count overflow a usize product
     let values = (cols / tile).ceil() * tile * (rows / tile).ceil() * tile * f64::from(caps.bands);
-    if !values.is_finite() || values > MAX_EXPORT_VALUES {
+    if values > MAX_EXPORT_VALUES {
         return Err(format!(
             "{cols} x {rows} pixels in {} bands, padded to whole {COG_TILE_PX} px tiles, is past \
              the {} value export cap, coarsen the resolution or shrink the bbox",
             caps.bands, MAX_EXPORT_VALUES as u64
         ));
     }
-    Ok(Plan {
-        crs,
-        grid: ExportGrid {
-            origin_x: bbox.min_x,
-            origin_y: bbox.max_y,
-            pixel_size: resolution,
-            cols: cols as usize,
-            rows: rows as usize,
-        },
-        time,
-    })
+    Ok(plan)
 }
 
 fn parse_bbox(text: &str) -> Result<Bbox, String> {

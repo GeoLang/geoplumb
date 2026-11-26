@@ -11,6 +11,7 @@
 // proving Send for geoplumb's wgpu chunks exceeds the default limit
 #![recursion_limit = "256"]
 
+pub mod cli;
 pub mod config;
 mod export;
 mod mvt;
@@ -43,6 +44,10 @@ use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Caps, CapsSet, Crs, Engine, Graph, NodeId, Source, TimeInterval};
 
 use config::{Config, FaninConfig, LayerConfig, LayerShape, OpConfig, SourceConfig};
+
+pub use export::ExportQuery;
+
+pub const DEFAULT_CACHE_BYTES: usize = 256 << 20;
 
 /// past this a tile index stops fitting the zoom arithmetic, and no
 /// viewer asks for it
@@ -113,6 +118,7 @@ impl Layer {
             mut graph,
             node: chain_tip,
             info,
+            chain_crs,
         } = build_layer_graph(&cfg)?;
         let node = graph.add_transform(chain_tip, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
         let engine = match disk {
@@ -136,7 +142,6 @@ impl Layer {
                 unreachable!("a reproject outputs raster or vector caps")
             }
         };
-        let chain_crs = engine.caps(chain_tip).crs();
         Ok(Layer {
             engine,
             node,
@@ -157,6 +162,7 @@ pub struct LayerGraph {
     pub graph: Graph,
     pub node: NodeId,
     pub info: LayerInfo,
+    pub chain_crs: Crs,
 }
 
 pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
@@ -190,7 +196,12 @@ pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
         }
     };
     let node = add_ops(&mut graph, node, &layer.ops, crs)?;
-    Ok(LayerGraph { graph, node, info })
+    Ok(LayerGraph {
+        graph,
+        node,
+        info,
+        chain_crs: crs,
+    })
 }
 
 fn source_crs(source: &dyn Source) -> Result<Crs, String> {
