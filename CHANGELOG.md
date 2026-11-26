@@ -2,6 +2,7 @@
 
 ## 2026-11-26
 
+- `GpuContext::request` opens wgpu without `InstanceFlags::DEBUG` in debug builds too, so Vulkan objects carry no debug names unless `WGPU_DEBUG=1`. With several contexts submitting at once, libvulkan on mesa 26.0.8 lavapipe segfaulted in `vkSetDebugUtilsObjectNameEXT`, which crashed the wgpu tests in 9 of 20 parallel runs under coverage
 - raster to vector elements: `Contours { interval, base }` turns a one-band continuous raster into one feature per elevation level, `Polygonize` a one-band categorical raster into one feature per class code, both on the raster's crs and chunk grid, with ids from the level index or the code so `dissolve` merges a level or a class across tiles, and seam points the same f64 in both neighbouring tiles. `Polygonize` refuses a continuous input at solve naming `value_kind` and a non-integer code at pull
 - `Viewshed { observer_x, observer_y, observer_height, radius }` marks what an observer sees on a continuous DEM, 1 visible, 0 hidden, nodata past the radius, as a categorical raster. Every output tile computes the observer's whole disc, so chunked output equals whole output
 - layer files take the ops `contours` (`interval`, and `base` 0 when absent), `polygonize` and `viewshed` (`lon`, `lat`, `height`, `radius`), lon and lat converted to the source crs at startup and radius in its units. A chain ending in `contours` or `polygonize` is a vector layer served as `.mvt`, and `viewshed` stretches over 0 to 1

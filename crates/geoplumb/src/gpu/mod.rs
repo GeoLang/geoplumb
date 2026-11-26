@@ -93,8 +93,10 @@ impl GpuContext {
     }
 
     pub fn request(budget_bytes: usize) -> Result<GpuContext> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        // libvulkan segfaults in vkSetDebugUtilsObjectNameEXT while several devices submit on mesa 26.0.8 lavapipe, and wgpu enables debug utils only with DEBUG
+        descriptor.flags.remove(wgpu::InstanceFlags::DEBUG);
+        let instance = wgpu::Instance::new(descriptor.with_env());
         let adapter = block_on(choose_adapter(&instance))?;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .map_err(|e| Error::Gpu(format!("wgpu device: {e}")))?;
