@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -s /bin/false geoplumb \
-    && mkdir -p /cache && chown geoplumb:geoplumb /cache
+    && mkdir -p /cache /exports && chown geoplumb:geoplumb /cache /exports
 
 COPY --from=builder /app/target/release/geoplumb-server /usr/local/bin/geoplumb-server
 

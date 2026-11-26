@@ -22,6 +22,7 @@ async fn run() -> Result<(), String> {
     let budget = env_number("GEOPLUMB_CACHE_BYTES", DEFAULT_CACHE_BYTES)?;
     let port = env_number("PORT", DEFAULT_PORT)?;
     let disk = std::env::var_os("GEOPLUMB_DISK_CACHE").map(PathBuf::from);
+    let export_dir = std::env::var_os("GEOPLUMB_EXPORT_DIR").map(PathBuf::from);
 
     // opening sources is blocking: a stac layer searches its anchor bbox
     // and a cog layer reads a file header
@@ -39,7 +40,7 @@ async fn run() -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|e| format!("{bind}: {e}"))?;
-    axum::serve(listener, router(layers))
+    axum::serve(listener, router(layers, export_dir))
         .await
         .map_err(|e| e.to_string())
 }

@@ -57,6 +57,21 @@ impl Transform for Viewshed {
         out.with_window(self.disc(), out.resolution)
     }
 
+    fn output_without_input(&self, out: &WindowReq, output: &Caps) -> Option<Chunk> {
+        if out.bbox.intersects(&self.disc()) {
+            return None;
+        }
+        let columns = (out.bbox.width() / out.resolution).round() as usize;
+        let rows = (out.bbox.height() / out.resolution).round() as usize;
+        let outside = Raster::new(columns, rows, out.resolution, f64::NAN);
+        Some(Chunk::Raster(RasterChunk {
+            bands: BandedRaster::new(vec![outside]).expect("one band"),
+            bbox: out.bbox,
+            resolution: out.resolution,
+            crs: output.crs(),
+        }))
+    }
+
     fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {
         let disc = self.disc().expand(resolution);
         if dirty.intersects(&disc) {
@@ -74,15 +89,6 @@ impl Transform for Viewshed {
             .ok_or(Error::Source("empty input chunk".into()))?;
         let columns = (out.bbox.width() / out.resolution).round() as usize;
         let rows = (out.bbox.height() / out.resolution).round() as usize;
-        if !out.bbox.intersects(&self.disc()) {
-            let outside = Raster::new(columns, rows, out.resolution, dem.nodata);
-            return Ok(Chunk::Raster(RasterChunk {
-                bands: BandedRaster::new(vec![outside]).expect("one band"),
-                bbox: out.bbox,
-                resolution: out.resolution,
-                crs: input.crs,
-            }));
-        }
         let column = ((self.observer_x - input.bbox.min_x) / input.resolution).floor() as usize;
         let row = ((input.bbox.max_y - self.observer_y) / input.resolution).floor() as usize;
         let seen = viewshed(dem, row, column, self.observer_height, self.radius);

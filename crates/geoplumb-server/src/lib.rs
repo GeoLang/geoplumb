@@ -16,7 +16,7 @@ mod export;
 mod mvt;
 mod zonal;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -550,19 +550,19 @@ pub fn parse_time(t: Option<&str>) -> Result<Option<TimeInterval>, String> {
     })
 }
 
-/// what every handler shares: the built layers, the reduction slots the
-/// zonal endpoints take one of each, and the export slots
 struct ServerState {
     layers: Vec<Layer>,
     reductions: Arc<Semaphore>,
     exports: Arc<Semaphore>,
+    export_dir: Option<PathBuf>,
 }
 
-pub fn router(layers: Vec<Layer>) -> Router {
+pub fn router(layers: Vec<Layer>, export_dir: Option<PathBuf>) -> Router {
     let state = Arc::new(ServerState {
         layers,
         reductions: Arc::new(Semaphore::new(zonal::MAX_CONCURRENT_REDUCTIONS)),
         exports: Arc::new(Semaphore::new(export::MAX_CONCURRENT_EXPORTS)),
+        export_dir,
     });
     Router::new()
         .route("/health", get(health))

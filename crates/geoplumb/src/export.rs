@@ -1,5 +1,6 @@
 use std::io::{Seek, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use terrano_core::{CogParams, SampleFormat, write_cog_tiles};
 
@@ -65,6 +66,14 @@ pub fn overview_levels(cols: usize, rows: usize) -> u32 {
         .clamp(0.0, MAX_OVERVIEW_LEVELS) as u32
 }
 
+struct SetWhenDropped(Arc<AtomicBool>);
+
+impl Drop for SetWhenDropped {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 pub async fn write_cog<W: Write + Seek + Send + 'static>(
     engine: Arc<Engine>,
     node: NodeId,
@@ -97,6 +106,8 @@ pub async fn write_cog<W: Write + Seek + Send + 'static>(
         nodata: None,
     };
     let runtime = tokio::runtime::Handle::current();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let _set_when_dropped = SetWhenDropped(Arc::clone(&dropped));
     tokio::task::spawn_blocking(move || -> Result<W> {
         let mut failed_pull = None;
         let written = write_cog_tiles(
@@ -105,6 +116,11 @@ pub async fn write_cog<W: Write + Seek + Send + 'static>(
             bands,
             &params,
             |level, tile_col, tile_row| {
+                if dropped.load(Ordering::Relaxed) {
+                    return Err(terrano_core::Error::InvalidInput(
+                        "the export was dropped before its last tile".into(),
+                    ));
+                }
                 let tile = grid.level(level).tile(tile_col, tile_row);
                 let bbox = tile.bbox();
                 let request = WindowReq {

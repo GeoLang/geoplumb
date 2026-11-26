@@ -98,7 +98,7 @@ source = {{ kind = "cog", path = "{}" }}
 fn app(text: &str) -> Router {
     let config = Config::parse(text).expect("the layer file must parse");
     let layers = Layer::build_all(config, 64 << 20, None).expect("the layers must build");
-    router(layers)
+    router(layers, None)
 }
 
 /// a rectangular zone in lon/lat degrees

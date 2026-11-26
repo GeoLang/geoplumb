@@ -1,12 +1,19 @@
-use std::io::Cursor;
+use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use geoplumb::caps::ValueKind;
+use futures::future::BoxFuture;
+use geoplumb::caps::{
+    CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField, ValueKind,
+};
+use geoplumb::element::Source;
 use geoplumb::elements::{RasterSrc, Slope};
-use geoplumb::export::{ExportGrid, write_cog};
+use geoplumb::export::{COG_TILE_PX, ExportGrid, write_cog};
 use geoplumb::resample::resample_to_grid;
-use geoplumb::{Crs, Engine, Graph, NodeId, RasterChunk, WindowReq};
+use geoplumb::window::GridSpec;
+use geoplumb::{Chunk, Crs, Engine, Graph, NodeId, RasterChunk, WindowReq};
 use terrano_core::{BandedRaster, CogReader, Raster};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 const W: usize = 1200;
 const H: usize = 800;
@@ -368,5 +375,118 @@ async fn a_grid_off_the_tile_size_keeps_the_pixels_of_its_edge_tiles() {
         &written.bands()[0],
         &expected.bands.bands()[0],
         "corner tile",
+    );
+}
+
+struct GatedSrc {
+    inner: RasterSrc,
+    reads: Arc<AtomicUsize>,
+    entered: mpsc::UnboundedSender<()>,
+    gate: Arc<Semaphore>,
+}
+
+impl Source for GatedSrc {
+    fn identity(&self) -> String {
+        format!("GatedSrc {}", self.inner.identity())
+    }
+
+    fn constraint(&self) -> Constraint {
+        Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
+            dtype: SetField::one(Dtype::F64),
+            bands: SetField::one(1),
+            crs: SetField::one(UTM_32N),
+            resolution: ResRange::at_least(CELL),
+            chunk_px: SetField::one(COG_TILE_PX as u32),
+            value_kind: SetField::one(ValueKind::Continuous),
+        })))
+    }
+
+    fn grid(&self) -> GridSpec {
+        self.inner.grid()
+    }
+
+    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, geoplumb::Result<Chunk>> {
+        Box::pin(async move {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.entered.send(()).unwrap();
+            let _open = self.gate.acquire().await.unwrap();
+            self.inner.read(req).await
+        })
+    }
+}
+
+struct SignalOnDrop {
+    bytes: Cursor<Vec<u8>>,
+    dropped: Option<oneshot::Sender<()>>,
+}
+
+impl Write for SignalOnDrop {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.bytes.flush()
+    }
+}
+
+impl Seek for SignalOnDrop {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.bytes.seek(position)
+    }
+}
+
+impl Drop for SignalOnDrop {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.dropped.take() {
+            let _ = dropped.send(());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_export_stops_pulling_tiles() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(Semaphore::new(0));
+    let (entered_sender, mut entered) = mpsc::unbounded_channel();
+    let src = GatedSrc {
+        inner: RasterSrc::new(
+            BandedRaster::new(vec![rough_dem(0)]).unwrap(),
+            ORIGIN_X,
+            ORIGIN_Y,
+            UTM_32N,
+            ValueKind::Continuous,
+        ),
+        reads: Arc::clone(&reads),
+        entered: entered_sender,
+        gate: Arc::clone(&gate),
+    };
+    let mut graph = Graph::new();
+    let node = graph.add_source(Box::new(src));
+    let engine = Arc::new(Engine::new(graph, 256 << 20).unwrap());
+    // one overview tile and two base tiles, each exactly one 512 px source chunk
+    let grid = ExportGrid {
+        origin_x: ORIGIN_X,
+        origin_y: ORIGIN_Y,
+        pixel_size: CELL,
+        cols: 1024,
+        rows: 512,
+    };
+    let (dropped_sender, dropped) = oneshot::channel();
+    let writer = SignalOnDrop {
+        bytes: Cursor::new(Vec::new()),
+        dropped: Some(dropped_sender),
+    };
+    let export = tokio::spawn(write_cog(engine, node, grid, None, writer));
+
+    entered.recv().await.unwrap();
+    export.abort();
+    assert!(export.await.is_err_and(|error| error.is_cancelled()));
+    gate.add_permits(16);
+    dropped.await.unwrap();
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the export pulled more tiles after it was dropped"
     );
 }

@@ -61,7 +61,7 @@ fn write_dem(dir: &Path) -> String {
     })
 }
 
-fn app(dir: &Path) -> Router {
+fn app(dir: &Path, export_dir: Option<&Path>) -> Router {
     let text = format!(
         r#"
 [[layer]]
@@ -78,7 +78,7 @@ source = {{ kind = "cog", path = "{}", value_kind = "categorical" }}
     );
     let config = Config::parse(&text).expect("the layer file must parse");
     let layers = Layer::build_all(config, 64 << 20, None).expect("the layers must build");
-    router(layers)
+    router(layers, export_dir.map(Path::to_path_buf))
 }
 
 struct Answer {
@@ -135,7 +135,7 @@ fn utm_window() -> [f64; 4] {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wgs84_layer_exports_onto_the_utm_grid_it_was_asked_for() {
     let dir = tempfile::tempdir().unwrap();
-    let app = app(dir.path());
+    let app = app(dir.path(), Some(dir.path()));
     let [min_x, min_y, max_x, max_y] = utm_window();
     let answer = get(
         &app,
@@ -183,7 +183,7 @@ async fn a_wgs84_layer_exports_onto_the_utm_grid_it_was_asked_for() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_categorical_export_samples_the_source_once_at_each_pixel_center() {
     let dir = tempfile::tempdir().unwrap();
-    let app = app(dir.path());
+    let app = app(dir.path(), Some(dir.path()));
     let [min_x, min_y, max_x, max_y] = utm_window();
     let answer = get(
         &app,
@@ -231,7 +231,7 @@ async fn a_categorical_export_samples_the_source_once_at_each_pixel_center() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_export_sizes_its_grid_the_way_gdalwarp_sizes_te_and_tr() {
     let dir = tempfile::tempdir().unwrap();
-    let app = app(dir.path());
+    let app = app(dir.path(), Some(dir.path()));
     let [min_x, min_y, max_x, max_y] = utm_window();
     // gdalwarp rounds the 10 km by 6 km window's pixel counts
     for (resolution, size) in [(104.0, (96, 58)), (30.0, (333, 200))] {
@@ -261,7 +261,7 @@ async fn an_export_sizes_its_grid_the_way_gdalwarp_sizes_te_and_tr() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_export_it_cannot_serve_is_refused_naming_the_problem() {
     let dir = tempfile::tempdir().unwrap();
-    let app = app(dir.path());
+    let app = app(dir.path(), Some(dir.path()));
     let [min_x, min_y, max_x, max_y] = utm_window();
     let bbox = format!("{min_x},{min_y},{max_x},{max_y}");
     let cases = [
@@ -318,4 +318,47 @@ async fn an_export_it_cannot_serve_is_refused_naming_the_problem() {
     )
     .await;
     assert_eq!(answer.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lowercase_epsg_authority_names_the_same_crs() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(dir.path(), Some(dir.path()));
+    let [min_x, min_y, max_x, max_y] = utm_window();
+    let answer = get(
+        &app,
+        &format!("/export/dem?bbox={min_x},{min_y},{max_x},{max_y}&crs=epsg:32632&resolution=100"),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        CogReader::open(answer.body.as_slice()).unwrap().meta().epsg,
+        32632
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_export_writes_its_file_under_the_export_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let [min_x, min_y, max_x, max_y] = utm_window();
+    let uri =
+        format!("/export/dem?bbox={min_x},{min_y},{max_x},{max_y}&crs=EPSG:32632&resolution=100");
+
+    let answer = get(&app(dir.path(), None), &uri).await;
+    let reason = String::from_utf8_lossy(&answer.body);
+    assert_eq!(answer.status, StatusCode::INTERNAL_SERVER_ERROR, "{reason}");
+    assert!(reason.contains("GEOPLUMB_EXPORT_DIR"), "{reason}");
+
+    let export_dir = tempfile::tempdir().unwrap();
+    let app = app(dir.path(), Some(export_dir.path()));
+    std::fs::remove_dir_all(export_dir.path()).unwrap();
+    let answer = get(&app, &uri).await;
+    let reason = String::from_utf8_lossy(&answer.body);
+    assert_eq!(answer.status, StatusCode::INTERNAL_SERVER_ERROR, "{reason}");
+    assert!(reason.contains("no temp file for the export"), "{reason}");
 }

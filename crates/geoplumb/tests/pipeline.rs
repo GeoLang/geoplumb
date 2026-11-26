@@ -372,3 +372,45 @@ async fn an_absurd_pull_fails_instead_of_enumerating() {
         "unexpected error: {err}"
     );
 }
+
+#[tokio::test]
+async fn web_mercator_tiles_near_the_antimeridian_pull_exactly_their_cells() {
+    // z17 cells are 1.2 m and z18 cells 0.6 m, where f64 rounding of x near 2e7 exceeds 1e-9 cells
+    let z18 = geoplumb::tile::XyzTile { z: 18, x: 0, y: 0 };
+    let px = Raster::from_vec(1, 1, vec![1.0], z18.resolution(), f64::NAN).unwrap();
+    let src = RasterSrc::new(
+        BandedRaster::new(vec![px]).unwrap(),
+        z18.bbox().min_x,
+        z18.bbox().max_y,
+        Crs::WEB_MERCATOR,
+        ValueKind::Continuous,
+    );
+    let mut g = Graph::new();
+    let s = g.add_source(Box::new(src));
+    let engine = Engine::new(g, 64 << 20).unwrap();
+    for z in [17u8, 18] {
+        let columns = 1u32 << z;
+        for x in columns - 200..columns {
+            let tile = geoplumb::tile::XyzTile { z, x, y: 0 };
+            let pulled = engine
+                .pull(
+                    s,
+                    WindowReq {
+                        bbox: tile.bbox(),
+                        resolution: tile.resolution(),
+                        time: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .into_raster()
+                .unwrap();
+            assert_eq!(
+                (pulled.width(), pulled.height()),
+                (geoplumb::tile::TILE_PX, geoplumb::tile::TILE_PX),
+                "z{z} x{x} min_x {}",
+                tile.bbox().min_x
+            );
+        }
+    }
+}

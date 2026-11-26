@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use futures::future::BoxFuture;
 use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField, ValueKind};
-use geoplumb::element::Transform;
+use geoplumb::element::{Source, Transform};
 use geoplumb::elements::{Contours, Polygonize, RasterSrc, Viewshed};
 use geoplumb::window::{ChunkKey, GridSpec};
 use geoplumb::{Bbox, Chunk, Crs, Engine, Graph, NodeId, RasterChunk, VectorChunk, WindowReq};
@@ -671,4 +674,62 @@ fn viewshed_spreads_a_dirty_cell_in_its_disc_to_the_whole_disc() {
     assert_eq!(viewshed.spread(&inside, CELL), disc);
     let outside = window(CELL, 60, 0, 61, 1);
     assert_eq!(viewshed.spread(&outside, CELL), outside);
+}
+
+struct CountingSrc {
+    inner: RasterSrc,
+    reads: Arc<AtomicUsize>,
+}
+
+impl Source for CountingSrc {
+    fn identity(&self) -> String {
+        format!("CountingSrc {}", self.inner.identity())
+    }
+
+    fn constraint(&self) -> Constraint {
+        self.inner.constraint()
+    }
+
+    fn grid(&self) -> GridSpec {
+        self.inner.grid()
+    }
+
+    fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, geoplumb::Result<Chunk>> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.read(req)
+    }
+}
+
+#[tokio::test]
+async fn a_viewshed_tile_clear_of_the_disc_reads_no_input() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut g = Graph::new();
+    let src = g.add_source(Box::new(CountingSrc {
+        inner: wall_source(),
+        reads: Arc::clone(&reads),
+    }));
+    let pinned = g.add_transform(src, Box::new(ChunkPin(16)));
+    let node = g.add_transform(pinned, Box::new(wall_viewshed()));
+    let engine = Engine::new(g, 64 << 20).unwrap();
+    assert_eq!(engine.grid(node).chunk_px, 16);
+
+    // the disc spans columns 0 to 41, so the 16 px chunk at columns 48 to 64 lies clear of it
+    let clear = pull(&engine, node, window(CELL, 48, 0, 64, 16), CELL)
+        .await
+        .into_raster()
+        .unwrap();
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "a tile clear of the disc read its input"
+    );
+    let values = clear.bands.band(0).unwrap().data();
+    assert_eq!(values.len(), 16 * 16);
+    assert!(values.iter().all(|value| value.is_nan()), "{values:?}");
+
+    pull(&engine, node, window(CELL, 16, 16, 32, 32), CELL).await;
+    assert!(
+        reads.load(Ordering::SeqCst) > 0,
+        "a tile in the disc read no input either, so the count shows nothing"
+    );
 }

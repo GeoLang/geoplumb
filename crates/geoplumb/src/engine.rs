@@ -606,6 +606,9 @@ impl Engine {
         match &self.nodes[node].elem {
             RtElem::Source(s) => s.read(&out).await,
             RtElem::Transform { parent, element } => {
+                if let Some(chunk) = element.output_without_input(&out, &self.nodes[node].caps) {
+                    return Ok(chunk);
+                }
                 // the pull's time is the engine's to carry, not an
                 // element's to rewrite: a plan that dropped it would ask
                 // upstream for the wrong instant
@@ -751,8 +754,14 @@ fn union(a: Bbox, b: Bbox) -> Bbox {
 /// widen a bbox outward onto the pixel grid this origin and resolution
 /// describe
 pub(crate) fn align_outward(bbox: &Bbox, origin_x: f64, origin_y: f64, res: f64) -> Bbox {
-    // eps is in cells, like the quotients it nudges
-    let eps = 1e-9;
+    // eps is in cells, and f64 rounding of a coordinate grows with it, to about 4e-9 m near x = 2e7
+    let magnitude = [
+        origin_x, origin_y, bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y,
+    ]
+    .into_iter()
+    .map(f64::abs)
+    .fold(0.0, f64::max);
+    let eps = (magnitude * 1e-12 / res).max(1e-9);
     let min_x = origin_x + (((bbox.min_x - origin_x) / res + eps).floor()) * res;
     let max_x = origin_x + (((bbox.max_x - origin_x) / res - eps).ceil()) * res;
     let max_y = origin_y - (((origin_y - bbox.max_y) / res + eps).floor()) * res;

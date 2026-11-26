@@ -2,6 +2,11 @@
 
 ## 2026-11-26
 
+- `Transform::output_without_input` lets an element answer a chunk before the engine plans or pulls its input. `Viewshed` answers NaN for a tile clear of the observer's disc, which used to pull and run the whole disc
+- the window alignment's tolerance grows with the coordinates' size, `1e-12` of the largest coordinate in cells and at least `1e-9` cells, so a web mercator tile near x = 2e7 at z17 or z18 no longer pulls 257 columns
+- `export::write_cog` stops pulling tiles once its future is dropped, so `GET /export/{layer}` stops after the tile it is on when it answers 504 or its client disconnects, instead of writing on to the last tile
+- `GET /export/{layer}` writes its temp file under the new `GEOPLUMB_EXPORT_DIR` instead of the system temp dir, which is tmpfs on many hosts, and answers 500 naming the variable when it is unset. `router` takes that directory as a second argument
+- `GET /export/{layer}` takes the crs authority in any case, `epsg:4326` as well as `EPSG:4326`
 - `GpuContext::request` opens wgpu without `InstanceFlags::DEBUG` in debug builds too, so Vulkan objects carry no debug names unless `WGPU_DEBUG=1`. With several contexts submitting at once, libvulkan on mesa 26.0.8 lavapipe segfaulted in `vkSetDebugUtilsObjectNameEXT`, which crashed the wgpu tests in 9 of 20 parallel runs under coverage
 - raster to vector elements: `Contours { interval, base }` turns a one-band continuous raster into one feature per elevation level, `Polygonize` a one-band categorical raster into one feature per class code, both on the raster's crs and chunk grid, with ids from the level index or the code so `dissolve` merges a level or a class across tiles, and seam points the same f64 in both neighbouring tiles. `Polygonize` refuses a continuous input at solve naming `value_kind` and a non-integer code at pull
 - `Viewshed { observer_x, observer_y, observer_height, radius }` marks what an observer sees on a continuous DEM, 1 visible, 0 hidden, nodata past the radius, as a categorical raster. Every output tile computes the observer's whole disc, so chunked output equals whole output

@@ -284,7 +284,7 @@ altitude = 45.0
 fn app(text: &str) -> Router {
     let config = Config::parse(text).expect("the layer file must parse");
     let layers = Layer::build_all(config, 64 << 20, None).expect("the layers must build");
-    router(layers)
+    router(layers, None)
 }
 
 /// the response's content type beside its body, which only the encoding
@@ -2367,7 +2367,7 @@ fn exterior_bounds(geometry: &TileGeometry) -> [f64; 4] {
 }
 
 fn assert_near(got: f64, want: f64, what: &str) {
-    // jung-mvt truncates coordinates to whole tile units
+    // jung-mvt rounds coordinates to whole tile units
     assert!((got - want).abs() <= 1.0, "{what}: {got} against {want}");
 }
 

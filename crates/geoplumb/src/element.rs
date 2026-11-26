@@ -79,6 +79,11 @@ pub trait Transform: Send + Sync {
     /// engine reasserts it either way
     fn plan(&self, out: &WindowReq) -> WindowReq;
 
+    fn output_without_input(&self, out: &WindowReq, output: &Caps) -> Option<Chunk> {
+        let _ = (out, output);
+        None
+    }
+
     /// forward image of a dirty region at a given chunk resolution, for
     /// invalidation walks. widen by the halo, project across a crs change
     fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {

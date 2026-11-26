@@ -52,6 +52,13 @@ pub(crate) async fn cog(
     else {
         return (StatusCode::NOT_FOUND, format!("unknown layer {name}")).into_response();
     };
+    let Some(export_dir) = state.export_dir.clone() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an export writes its file under GEOPLUMB_EXPORT_DIR, which is unset".to_string(),
+        )
+            .into_response();
+    };
     let plan = match plan(&state.layers[index], &query) {
         Ok(plan) => plan,
         Err(reason) => return bad_request(reason),
@@ -64,7 +71,7 @@ pub(crate) async fn cog(
             .into_response();
     };
 
-    let exporting = tokio::spawn(async move {
+    let exporting = async move {
         let _slot = slot;
         let built = tokio::task::spawn_blocking(move || {
             let layer = &state.layers[index];
@@ -83,8 +90,12 @@ pub(crate) async fn cog(
                 graph.add_transform(node, Box::new(onto_grid))
             };
             let engine = Engine::new(graph, layer.budget_bytes).map_err(|e| e.to_string())?;
-            let file =
-                tempfile::tempfile().map_err(|e| format!("no temp file for the export: {e}"))?;
+            let file = tempfile::tempfile_in(&export_dir).map_err(|e| {
+                format!(
+                    "no temp file for the export in {}: {e}",
+                    export_dir.display()
+                )
+            })?;
             Ok::<_, String>((engine, node, file))
         })
         .await
@@ -94,7 +105,7 @@ pub(crate) async fn cog(
             .await
             .map_err(|e| e.to_string())?;
         Ok::<_, String>(file)
-    });
+    };
     let file = match tokio::time::timeout(EXPORT_TIMEOUT, exporting).await {
         Err(_) => {
             return (
@@ -106,17 +117,10 @@ pub(crate) async fn cog(
             )
                 .into_response();
         }
-        Ok(Err(_)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the export did not finish".to_string(),
-            )
-                .into_response();
-        }
-        Ok(Ok(Err(reason))) => {
+        Ok(Err(reason)) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response();
         }
-        Ok(Ok(Ok(file))) => file,
+        Ok(Ok(file)) => file,
     };
 
     let mut file = tokio::fs::File::from_std(file);
@@ -213,8 +217,9 @@ fn parse_bbox(text: &str) -> Result<Bbox, String> {
 
 fn parse_crs(text: &str, layer_crs: Crs) -> Result<Crs, String> {
     let crs = text
-        .strip_prefix("EPSG:")
-        .and_then(|code| code.parse::<u32>().ok())
+        .split_once(':')
+        .filter(|(authority, _)| authority.eq_ignore_ascii_case("EPSG"))
+        .and_then(|(_, code)| code.parse::<u32>().ok())
         .map(Crs)
         .ok_or_else(|| format!("crs {text:?} is not EPSG:<code>"))?;
     Transform::new(&layer_crs.authority(), &crs.authority())
