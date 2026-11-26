@@ -44,3 +44,6 @@ name = "stac_tiles"
 
 [[example]]
 name = "pyramid"
+
+[[example]]
+name = "contours_geojson"

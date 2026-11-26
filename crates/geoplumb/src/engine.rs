@@ -751,7 +751,8 @@ fn union(a: Bbox, b: Bbox) -> Bbox {
 /// widen a bbox outward onto the pixel grid this origin and resolution
 /// describe
 pub(crate) fn align_outward(bbox: &Bbox, origin_x: f64, origin_y: f64, res: f64) -> Bbox {
-    let eps = res * 1e-9;
+    // eps is in cells, like the quotients it nudges
+    let eps = 1e-9;
     let min_x = origin_x + (((bbox.min_x - origin_x) / res + eps).floor()) * res;
     let max_x = origin_x + (((bbox.max_x - origin_x) / res - eps).ceil()) * res;
     let max_y = origin_y - (((origin_y - bbox.max_y) / res + eps).floor()) * res;

@@ -361,19 +361,35 @@ pub fn clip_geometry(geometry: &FeatureGeometry, bbox: &Bbox) -> Vec<FeatureGeom
 
 /// tile membership for lines, the half-open rule points already follow.
 /// rect clipping is closed on all four sides, so a line lying exactly on a
-/// seam survives in both neighbouring tiles: drop the parts that sit
-/// entirely on an excluded edge, since the neighbour holds that edge as its
+/// seam survives in both neighbouring tiles: drop the segments that run
+/// along an excluded edge, since the neighbour holds that edge as its
 /// min_x or max_y and keeps them. parts of fewer than two coords carry no
 /// length and go too
 fn clip_line_parts(coords: &[Coord], bbox: &Bbox) -> Vec<Vec<Coord>> {
-    clip_linestring_rect(coords, bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)
-        .into_iter()
-        .filter(|part| {
-            part.len() >= 2
-                && !part.iter().all(|c| c.x == bbox.max_x)
-                && !part.iter().all(|c| c.y == bbox.min_y)
-        })
-        .collect()
+    let on_excluded_edge = |a: &Coord, b: &Coord| {
+        (a.x == bbox.max_x && b.x == bbox.max_x) || (a.y == bbox.min_y && b.y == bbox.min_y)
+    };
+    let mut parts = Vec::new();
+    for part in clip_linestring_rect(coords, bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y) {
+        let mut run: Vec<Coord> = Vec::new();
+        for segment in part.windows(2) {
+            if on_excluded_edge(&segment[0], &segment[1]) {
+                if run.len() >= 2 {
+                    parts.push(std::mem::take(&mut run));
+                }
+                run.clear();
+                continue;
+            }
+            if run.is_empty() {
+                run.push(segment[0]);
+            }
+            run.push(segment[1]);
+        }
+        if run.len() >= 2 {
+            parts.push(run);
+        }
+    }
+    parts
 }
 
 fn clip_polygon_to(p: &Polygon, bbox: &Bbox) -> Option<Polygon> {
@@ -496,6 +512,20 @@ fn stitch(pieces: Vec<Vec<Coord>>) -> Vec<Vec<Coord>> {
             }
             if let Some(k) = pending.iter().position(|p| meets(p.last(), piece.first())) {
                 let mut prev = pending.remove(k);
+                prev.extend_from_slice(&piece[1..]);
+                piece = prev;
+                continue;
+            }
+            // terrano can link a contour backwards through a cell whose value equals the level
+            if let Some(k) = pending.iter().position(|p| meets(p.last(), piece.last())) {
+                let mut next = pending.remove(k);
+                next.reverse();
+                piece.extend_from_slice(&next[1..]);
+                continue;
+            }
+            if let Some(k) = pending.iter().position(|p| meets(p.first(), piece.first())) {
+                let mut prev = pending.remove(k);
+                prev.reverse();
                 prev.extend_from_slice(&piece[1..]);
                 piece = prev;
                 continue;

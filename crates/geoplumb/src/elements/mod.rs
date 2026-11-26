@@ -9,6 +9,7 @@ mod grib;
 pub mod mosaic;
 pub mod netcdf;
 pub mod points;
+pub mod raster_vector;
 pub mod reproject;
 pub mod source;
 pub mod stac;
@@ -17,6 +18,7 @@ pub mod tensor;
 pub mod terrain;
 pub mod vec_ops;
 pub mod vector;
+pub mod viewshed;
 #[cfg(feature = "wgpu")]
 pub mod wgpu;
 
@@ -32,12 +34,14 @@ pub use gpkg::GpkgSrc;
 pub use mosaic::Mosaic;
 pub use netcdf::NetcdfSrc;
 pub use points::{IdwGrid, LasSrc};
+pub use raster_vector::{Contours, Polygonize};
 pub use reproject::Reproject;
 pub use source::RasterSrc;
 pub use stac::{Composite, StacSearch, StacSrc};
 pub use tensor::{TensorConv, ToRaster, ToTensor};
 pub use vec_ops::{VecClip, VecFilter, VecSchema};
 pub use vector::{Burn, Rasterize, VecSrc};
+pub use viewshed::Viewshed;
 
 /// adapters every graph starts with, see `Graph::register_adapter`
 pub(crate) fn default_adapters() -> Vec<crate::element::Adapter> {

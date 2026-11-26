@@ -366,7 +366,15 @@ only after a proof script passes on real input, recorded in
       saddle choice looks inverted. Fixed in terrano a4cc373 (levels from
       `base + k * interval`, vertices as cell plus fraction, saddles paired
       as `gdal_contour` pairs them) rather than padded around in geoplumb,
-      since tiletopia calls it too.
+      since tiletopia calls it too. All three elements and their layer ops
+      are in geoplumb. `Contours` is proven: over 900 x 900 pixels of
+      Copernicus GLO-30 pulled in 256 px chunks, every 100 m level has
+      `gdal_contour`'s length, and no line ends inside the window.
+      `Polygonize` and `Viewshed` still need a proof on real input. Left
+      open: tiles wholly outside a viewshed's disc still pull the whole
+      disc, and `align_outward`'s 1e-9 cell tolerance is below the rounding
+      of web mercator coordinates near the antimeridian at resolutions
+      under about 2 m.
 
 ### Wave 3
 

@@ -23,6 +23,8 @@ const DEFAULT_GRAY: (f64, f64) = (0.0, 255.0);
 const SLOPE_GRAY: (f64, f64) = (0.0, 90.0);
 /// aspect is compass degrees
 const ASPECT_GRAY: (f64, f64) = (0.0, 360.0);
+// viewshed cells are 0 where hidden and 1 where visible
+const VIEWSHED_GRAY: (f64, f64) = (0.0, 1.0);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -270,6 +272,21 @@ pub enum OpConfig {
         radius_px: Option<f64>,
         /// cells reached by fewer points than this stay nodata
         min_points: Option<usize>,
+    },
+    // contour lines every `interval` elevation units counted from `base`
+    Contours {
+        interval: f64,
+        #[serde(default)]
+        base: f64,
+    },
+    // one polygon set per class code of a categorical raster
+    Polygonize,
+    // cells an observer standing at lon, lat sees, `radius` in the source crs units
+    Viewshed {
+        lon: f64,
+        lat: f64,
+        height: f64,
+        radius: f64,
     },
 }
 
@@ -596,6 +613,8 @@ impl LayerConfig {
                 OpConfig::Bandmath { min, max, .. } => Some((*min, *max)),
                 OpConfig::Slope => Some(SLOPE_GRAY),
                 OpConfig::Aspect => Some(ASPECT_GRAY),
+                OpConfig::Viewshed { .. } => Some(VIEWSHED_GRAY),
+                OpConfig::Contours { .. } | OpConfig::Polygonize => Some(DEFAULT_GRAY),
                 OpConfig::Reclassify { .. } | OpConfig::Rasterize { .. } | OpConfig::Idw { .. } => {
                     None
                 }

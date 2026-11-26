@@ -1848,6 +1848,151 @@ kind = "idw"
     Config::parse(&with_range).expect("a named gray range makes it servable");
 }
 
+const CONTOURS: &str = r#"
+[[layer]]
+name = "contour-lines"
+source = { kind = "cog", path = "COG_PATH" }
+
+[[layer.op]]
+kind = "contours"
+interval = 10.0
+"#;
+
+#[tokio::test]
+async fn a_layer_ending_in_contours_serves_its_lines_as_mvt() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&CONTOURS.replace("COG_PATH", &write_dem(dir.path())));
+    let (x, y) = tile_of(12, 7.3, 46.8);
+
+    let (status, body) = get(&app, &format!("/tiles/contour-lines/12/{x}/{y}.mvt")).await;
+    assert_eq!(status, StatusCode::OK);
+    let layer = decoded_layer(&body, "contour-lines");
+    assert!(layer.features.len() >= 2, "{:?}", layer.features);
+    for feature in &layer.features {
+        assert!(
+            matches!(feature.geometry, TileGeometry::Lines(_)),
+            "{:?}",
+            feature.geometry
+        );
+        match feature.attributes.get("elevation") {
+            Some(AttributeValue::Number(elevation)) => {
+                assert_eq!(elevation % 10.0, 0.0, "elevation {elevation}")
+            }
+            Some(AttributeValue::Integer(elevation)) => {
+                assert_eq!(elevation % 10, 0, "elevation {elevation}")
+            }
+            other => panic!("elevation is {other:?}"),
+        }
+    }
+
+    let (status, _) = get(&app, &format!("/tiles/contour-lines/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn chains_ending_in_features_parse_without_gray_and_burned_ones_need_it() {
+    let text = r#"
+[[layer]]
+name = "classes-as-polygons"
+source = { kind = "cog", path = "/data/dem.tif" }
+
+[[layer.op]]
+kind = "reclassify"
+classes = [
+    { min = 0.0, max = 350.0, value = 1.0 },
+    { min = 350.0, max = 1000.0, value = 2.0 },
+]
+
+[[layer.op]]
+kind = "polygonize"
+
+[[layer]]
+name = "point-heights-as-contours"
+source = { kind = "las", path = "/data/points.las", crs = 3857 }
+
+[[layer.op]]
+kind = "idw"
+
+[[layer.op]]
+kind = "contours"
+interval = 10.0
+
+[[layer]]
+name = "mosaic-as-contours"
+fanin = { kind = "mosaic" }
+
+[[layer.input]]
+source = { kind = "cog", path = "/data/dem.tif" }
+
+[[layer.input]]
+source = { kind = "cog", path = "/data/dem.tif" }
+
+[[layer.op]]
+kind = "contours"
+interval = 10.0
+"#;
+    let config = Config::parse(text).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(config.layers.len(), 3);
+
+    let burned = r#"
+[[layer]]
+name = "burned-contours"
+source = { kind = "cog", path = "/data/dem.tif" }
+
+[[layer.op]]
+kind = "contours"
+interval = 10.0
+
+[[layer.op]]
+kind = "rasterize"
+burn = { property = "elevation" }
+"#;
+    let error = Config::parse(burned).expect_err("burned contours carry no range");
+    assert!(error.contains("gray"), "{error}");
+}
+
+const VIEWSHED: &str = r#"
+[[layer]]
+name = "seen"
+source = { kind = "cog", path = "COG_PATH" }
+
+[[layer.op]]
+kind = "viewshed"
+lon = 7.3
+lat = 46.8
+height = 2.0
+radius = 0.05
+"#;
+
+#[tokio::test]
+async fn a_viewshed_layer_serves_only_hidden_and_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = VIEWSHED.replace("COG_PATH", &write_dem(dir.path()));
+    let (x, y) = tile_of(12, 7.3, 46.8);
+    let (status, png) = get(&app(&text), &format!("/tiles/seen/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    let grays = opaque_grays(&png);
+    assert!(
+        !grays.is_empty(),
+        "the tile around the observer is all nodata"
+    );
+    assert!(grays.iter().all(|g| *g == 0 || *g == 255), "{grays:?}");
+
+    let config = Config::parse(&text).unwrap();
+    assert_eq!(config.layers[0].gray_range().unwrap(), (0.0, 1.0));
+    match &config.layers[0].ops[..] {
+        [
+            OpConfig::Viewshed {
+                lon,
+                lat,
+                height,
+                radius,
+            },
+        ] => assert_eq!((*lon, *lat, *height, *radius), (7.3, 46.8, 2.0, 0.05)),
+        other => panic!("unexpected ops: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn layers_publishes_a_fan_in_and_a_geojson_layer_by_what_they_read() {
     let dir = tempfile::tempdir().unwrap();

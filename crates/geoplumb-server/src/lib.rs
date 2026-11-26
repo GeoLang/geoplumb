@@ -33,12 +33,13 @@ use geoplumb::elements::GdalSrc;
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::stac::format_rfc3339;
 use geoplumb::elements::{
-    Aspect, BandMath, CogSrc, Combine, CopcSrc, Focal, GpkgSrc, Hillshade, IdwGrid, LasSrc,
-    MapAlgebra, Mosaic, NetcdfSrc, QualityMask, RasterSrc, Rasterize, Reproject, Slope, StacSrc,
-    TensorConv, ToRaster, ToTensor, VecClip, VecFilter, VecSchema, VecSrc,
+    Aspect, BandMath, CogSrc, Combine, Contours, CopcSrc, Focal, GpkgSrc, Hillshade, IdwGrid,
+    LasSrc, MapAlgebra, Mosaic, NetcdfSrc, Polygonize, QualityMask, RasterSrc, Rasterize,
+    Reproject, Slope, StacSrc, TensorConv, ToRaster, ToTensor, VecClip, VecFilter, VecSchema,
+    VecSrc, Viewshed,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
-use geoplumb::{Caps, Crs, Engine, Graph, NodeId, Source, TimeInterval};
+use geoplumb::{Caps, CapsSet, Crs, Engine, Graph, NodeId, Source, TimeInterval};
 
 use config::{Config, FaninConfig, LayerConfig, LayerShape, OpConfig, SourceConfig};
 
@@ -159,19 +160,23 @@ pub struct LayerGraph {
 
 pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
     let mut graph = Graph::new();
-    let (node, info) = match layer.shape()? {
+    let (node, crs, info) = match layer.shape()? {
         LayerShape::Single(source) => {
             let (source, info) = open_source(&layer.name, source)?;
-            (graph.add_source(source), info)
+            let crs = source_crs(source.as_ref())?;
+            (graph.add_source(source), crs, info)
         }
         LayerShape::Fanin(fanin, inputs) => {
             let mut tips = Vec::with_capacity(inputs.len());
             let mut infos = Vec::with_capacity(inputs.len());
+            let mut input_crs = Vec::with_capacity(inputs.len());
             for input in inputs {
                 let (source, info) = open_source(&layer.name, &input.source)?;
+                let crs = source_crs(source.as_ref())?;
                 let head = graph.add_source(source);
-                tips.push(add_ops(&mut graph, head, &input.ops)?);
+                tips.push(add_ops(&mut graph, head, &input.ops, crs)?);
                 infos.push(info);
+                input_crs.push(crs);
             }
             let joined = match fanin {
                 FaninConfig::Mosaic => graph.add_fanin(&tips, Box::new(Mosaic::default())),
@@ -179,16 +184,26 @@ pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
                     graph.add_fanin(&tips, Box::new(Combine::new((*op).into())))
                 }
             };
-            (joined, composite_info(&layer.name, infos))
+            // the solver reprojects every later fan-in input onto the first one's crs
+            (joined, input_crs[0], composite_info(&layer.name, infos))
         }
     };
-    let node = add_ops(&mut graph, node, &layer.ops)?;
+    let node = add_ops(&mut graph, node, &layer.ops, crs)?;
     Ok(LayerGraph { graph, node, info })
+}
+
+fn source_crs(source: &dyn Source) -> Result<Crs, String> {
+    source
+        .constraint()
+        .output_set(&CapsSet::any())
+        .fixate()
+        .map(|caps| caps.crs())
+        .ok_or_else(|| "the source names no crs".to_string())
 }
 
 /// one op chain over `node`, the translation a layer's own ops and a
 /// fan-in input's both take
-fn add_ops(graph: &mut Graph, node: NodeId, ops: &[OpConfig]) -> Result<NodeId, String> {
+fn add_ops(graph: &mut Graph, node: NodeId, ops: &[OpConfig], crs: Crs) -> Result<NodeId, String> {
     let mut node = node;
     for op in ops {
         node = match op {
@@ -262,6 +277,32 @@ fn add_ops(graph: &mut Graph, node: NodeId, ops: &[OpConfig]) -> Result<NodeId, 
                     min_points: min_points.unwrap_or(default.min_points),
                 };
                 graph.add_transform(node, Box::new(idw))
+            }
+            OpConfig::Contours { interval, base } => graph.add_transform(
+                node,
+                Box::new(Contours {
+                    interval: *interval,
+                    base: *base,
+                }),
+            ),
+            OpConfig::Polygonize => graph.add_transform(node, Box::new(Polygonize)),
+            OpConfig::Viewshed {
+                lon,
+                lat,
+                height,
+                radius,
+            } => {
+                let (observer_x, observer_y) =
+                    projicio_core::Transform::new(&Crs::WGS84.authority(), &crs.authority())
+                        .and_then(|transform| transform.convert(*lon, *lat))
+                        .map_err(|e| format!("viewshed observer {lon}, {lat} into {crs}: {e}"))?;
+                let viewshed = Viewshed {
+                    observer_x,
+                    observer_y,
+                    observer_height: *height,
+                    radius: *radius,
+                };
+                graph.add_transform(node, Box::new(viewshed))
             }
         };
     }

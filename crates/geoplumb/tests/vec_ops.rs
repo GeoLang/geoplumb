@@ -449,6 +449,42 @@ fn adjacent_tiles_cut_a_seam_crossing_at_the_same_point() {
     assert!(close(want.last().unwrap(), &Coord::new(15.77, 3.31)));
 }
 
+#[test]
+fn dissolve_joins_line_pieces_that_run_opposite_ways() {
+    let piece = |coords: &[(f64, f64)]| geoplumb::VectorFeature {
+        id: 0,
+        geometry: FeatureGeometry::LineString(LineString::new(
+            coords.iter().map(|&(x, y)| Coord::new(x, y)).collect(),
+        )),
+        properties: HashMap::new(),
+    };
+    let window = Bbox::new(0.0, 0.0, 16.0, 16.0);
+    for (pieces, want) in [
+        (
+            vec![
+                piece(&[(2.0, 5.0), (8.0, 6.0)]),
+                piece(&[(14.0, 3.0), (8.0, 6.0)]),
+            ],
+            [(2.0, 5.0), (8.0, 6.0), (14.0, 3.0)],
+        ),
+        (
+            vec![
+                piece(&[(8.0, 6.0), (2.0, 5.0)]),
+                piece(&[(8.0, 6.0), (14.0, 3.0)]),
+            ],
+            [(14.0, 3.0), (8.0, 6.0), (2.0, 5.0)],
+        ),
+    ] {
+        let merged = VectorChunk::new(pieces, window, 1.0, Crs::WGS84).dissolve();
+        assert_eq!(merged.features.len(), 1);
+        let FeatureGeometry::LineString(line) = &merged.features[0].geometry else {
+            panic!("the pieces stay apart: {:?}", merged.features[0].geometry);
+        };
+        let want: Vec<Coord> = want.iter().map(|&(x, y)| Coord::new(x, y)).collect();
+        assert_eq!(line.coords(), want);
+    }
+}
+
 #[tokio::test]
 async fn dissolve_passes_an_unsplit_feature_through_untouched() {
     let merged = pull_window(8).await.dissolve();
