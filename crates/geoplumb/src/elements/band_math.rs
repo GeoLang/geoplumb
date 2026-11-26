@@ -3,7 +3,8 @@
 //! identity plan, so chunked output equals whole-window output
 
 use crate::caps::{
-    CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField, ValueKind,
+    BandKinds, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField,
+    ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
@@ -411,12 +412,12 @@ impl Transform for BandMath {
                 crs: true,
                 resolution: true,
                 chunk_px: true,
-                value_kind: false,
+                value_kinds: false,
             },
             output: CapsPattern::Raster(RasterPattern {
                 dtype: SetField::one(Dtype::F64),
                 bands: SetField::one(1),
-                value_kind: SetField::one(ValueKind::Continuous),
+                value_kinds: SetField::one(BandKinds::from(ValueKind::Continuous)),
                 ..RasterPattern::default()
             }),
         }

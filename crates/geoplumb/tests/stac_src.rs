@@ -4,13 +4,14 @@
 //! another crs warped onto the anchor grid, and lazy per-window block
 //! searches past the open bbox
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
-use geoplumb::caps::ValueKind;
+use geoplumb::caps::{BandKinds, ValueKind};
 use geoplumb::element::Source;
 use geoplumb::elements::{
     Composite, StacSearch, StacSrc,
@@ -2353,7 +2354,7 @@ fn class_search(
     composite: Composite,
 ) -> StacSearch {
     let mut search = StacSearch::new(base, "landcover", "data", bbox);
-    search.value_kind = value_kind;
+    search.value_kinds = BTreeMap::from([("data".to_string(), value_kind)]);
     search.composite = composite;
     search
 }
@@ -2517,9 +2518,131 @@ async fn a_categorical_search_negotiates_its_composites_kind() {
         let node = g.add_source(Box::new(open_search(search).await));
         let engine = Engine::new(g, 64 << 20).unwrap();
         assert_eq!(
-            engine.caps(node).raster().value_kind,
-            expected,
+            engine.caps(node).raster().value_kinds,
+            BandKinds::from(expected),
             "{composite:?}"
         );
     }
+}
+
+async fn start_elevation_and_class_mock() -> (String, Arc<Mock>) {
+    start_mock_with(|base| {
+        let mut elevations = Vec::with_capacity(CLASS_COLS * CLASS_ROWS);
+        let mut classes = Vec::with_capacity(CLASS_COLS * CLASS_ROWS);
+        for row in 0..CLASS_ROWS {
+            for col in 0..CLASS_COLS {
+                let lon = ORIGIN_X + (col as f64 + 0.5) * CELL;
+                let lat = ORIGIN_Y - (row as f64 + 0.5) * CELL;
+                elevations.push(elevation(lon, lat));
+                classes.push(class_at(lon, lat));
+            }
+        }
+        let encode = |data: Vec<f64>| -> Vec<u8> {
+            let raster = Raster::from_vec(CLASS_COLS, CLASS_ROWS, data, CELL, f64::NAN).unwrap();
+            let mut buf = std::io::Cursor::new(Vec::new());
+            write_cog(&raster, &class_params(), &mut buf).unwrap();
+            buf.into_inner()
+        };
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert("elevation.tif".into(), encode(elevations));
+        cogs.insert("classes.tif".into(), encode(classes));
+        let features = vec![asset_item(
+            "pair",
+            "2024-06-01T00:00:00Z",
+            &[
+                ("data", format!("{base}/cog/elevation.tif")),
+                ("classes", format!("{base}/cog/classes.tif")),
+            ],
+            CLASS_BBOX,
+            4326,
+        )];
+        (cogs, features)
+    })
+    .await
+}
+
+fn bits(values: &[f64]) -> Vec<u64> {
+    values.iter().map(|v| v.to_bits()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_search_reads_each_asset_by_its_own_kind() {
+    let (base, _mock) = start_elevation_and_class_mock().await;
+    let req = WindowReq {
+        bbox: Bbox::new(CLASS_BBOX[0], CLASS_BBOX[1], CLASS_BBOX[2], CLASS_BBOX[3]),
+        resolution: 4.0 * CELL,
+        time: None,
+    };
+    let read = |assets: &[&str], categorical: &[&str]| {
+        let mut search = StacSearch::new(&base, "landcover", assets[0], CLASS_BBOX);
+        search.assets = assets.iter().map(|asset| asset.to_string()).collect();
+        search.value_kinds = categorical
+            .iter()
+            .map(|asset| (asset.to_string(), ValueKind::Categorical))
+            .collect();
+        async move {
+            let mut g = Graph::new();
+            let node = g.add_source(Box::new(open_search(search).await));
+            let engine = Engine::new(g, 64 << 20).unwrap();
+            let kinds = engine.caps(node).raster().value_kinds.clone();
+            let chunk = engine.pull(node, req).await.unwrap().into_raster().unwrap();
+            (kinds, chunk)
+        }
+    };
+    let band = |chunk: &RasterChunk, index: usize| chunk.bands.band(index).unwrap().data().to_vec();
+    let off_codes = |values: Vec<f64>| -> Vec<f64> {
+        values
+            .into_iter()
+            .filter(|v| !v.is_nan() && !CLASS_CODES.contains(v))
+            .collect()
+    };
+
+    let (kinds, mixed) = read(&["data", "classes"], &["classes"]).await;
+    assert_eq!(
+        kinds,
+        BandKinds::per_band(vec![ValueKind::Continuous, ValueKind::Categorical])
+    );
+    assert_eq!(off_codes(band(&mixed, 1)), Vec::<f64>::new());
+    assert!(
+        band(&mixed, 1).iter().all(|v| !v.is_nan()),
+        "the item did not cover the window"
+    );
+    let (_, reference) = read(&["data"], &[]).await;
+    assert_eq!(bits(&band(&mixed, 0)), bits(&band(&reference, 0)));
+
+    let (_, every_asset_continuous) = read(&["data", "classes"], &[]).await;
+    assert!(
+        !off_codes(band(&every_asset_continuous, 1)).is_empty(),
+        "no block of the fixture mixes codes"
+    );
+    let (_, every_asset_categorical) = read(&["data", "classes"], &["data", "classes"]).await;
+    assert_ne!(
+        bits(&band(&every_asset_categorical, 0)),
+        bits(&band(&reference, 0))
+    );
+}
+
+#[test]
+fn a_value_kind_for_no_asset_or_a_blended_categorical_asset_fails() {
+    let mut search = StacSearch::new("http://127.0.0.1:9", "s2", "red", CLASS_BBOX);
+    search.assets = vec!["red".into(), "scl".into()];
+    search.value_kinds = BTreeMap::from([("qa".to_string(), ValueKind::Categorical)]);
+    let err = search
+        .asset_value_kinds()
+        .expect_err("a kind for no asset passed");
+    assert!(err.to_string().contains("qa"), "{err}");
+
+    search.value_kinds = BTreeMap::from([("scl".to_string(), ValueKind::Categorical)]);
+    assert_eq!(
+        search.asset_value_kinds().unwrap(),
+        [ValueKind::Continuous, ValueKind::Categorical]
+    );
+    search.composite = Composite::Median;
+    let err = search
+        .asset_value_kinds()
+        .expect_err("a median over a categorical asset passed");
+    assert!(
+        err.to_string().contains("median") && err.to_string().contains("scl"),
+        "{err}"
+    );
 }

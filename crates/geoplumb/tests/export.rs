@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::future::BoxFuture;
 use geoplumb::caps::{
-    CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField, ValueKind,
+    BandKinds, CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, ResRange, SetField,
+    ValueKind,
 };
 use geoplumb::element::Source;
 use geoplumb::elements::{RasterSrc, Slope};
@@ -122,7 +123,7 @@ async fn engine_at(
         &bbox,
         grid.cols,
         grid.rows,
-        value_kind,
+        &BandKinds::from(value_kind),
     )
 }
 
@@ -397,7 +398,7 @@ impl Source for GatedSrc {
             crs: SetField::one(UTM_32N),
             resolution: ResRange::at_least(CELL),
             chunk_px: SetField::one(COG_TILE_PX as u32),
-            value_kind: SetField::one(ValueKind::Continuous),
+            value_kinds: SetField::one(BandKinds::from(ValueKind::Continuous)),
         })))
     }
 

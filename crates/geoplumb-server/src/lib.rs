@@ -28,6 +28,7 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
+use geoplumb::caps::ValueKind;
 #[cfg(feature = "gdal")]
 use geoplumb::elements::GdalSrc;
 use geoplumb::elements::algebra::AlgebraOp;
@@ -329,7 +330,8 @@ fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, L
     match source {
         SourceConfig::Cog { path, value_kind } => {
             let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let src = CogSrc::open(file, (*value_kind).into()).map_err(|e| e.to_string())?;
+            let src =
+                CogSrc::open(file, ValueKind::from(*value_kind)).map_err(|e| e.to_string())?;
             Ok((
                 Box::new(src),
                 LayerInfo {
@@ -348,8 +350,8 @@ fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, L
             value_kind,
         } => {
             let src = match band {
-                None => GdalSrc::open(path, (*value_kind).into()),
-                Some(band) => GdalSrc::open_band(path, *band, (*value_kind).into()),
+                None => GdalSrc::open(path, ValueKind::from(*value_kind)),
+                Some(band) => GdalSrc::open_band(path, *band, ValueKind::from(*value_kind)),
             }
             .map_err(|e| e.to_string())?;
             println!("layer {layer}: gdal driver {}", src.driver());

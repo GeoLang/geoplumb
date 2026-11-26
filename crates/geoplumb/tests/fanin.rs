@@ -154,7 +154,7 @@ impl Source for PrefSrc {
                         crs: SetField::one(crs),
                         resolution: ResRange::at_least(CELL),
                         chunk_px: SetField::Any,
-                        value_kind: SetField::Any,
+                        value_kinds: SetField::Any,
                     })
                 })
                 .collect(),

@@ -1,4 +1,4 @@
-use geoplumb::caps::ValueKind;
+use geoplumb::caps::{BandKinds, ValueKind};
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::{CogSrc, Combine, Hillshade, MapAlgebra, Mosaic, RasterSrc, Reproject};
 use geoplumb::tile::{XyzTile, render_tile};
@@ -86,16 +86,24 @@ async fn pull(engine: &Engine, node: NodeId, bbox: Bbox, resolution: f64) -> Ras
         .unwrap()
 }
 
-fn values(chunk: &RasterChunk) -> &[f64] {
-    chunk.bands.band(0).unwrap().data()
+fn band(chunk: &RasterChunk, index: usize) -> &[f64] {
+    chunk.bands.band(index).unwrap().data()
 }
 
-fn off_code(chunk: &RasterChunk, codes: &[f64]) -> Vec<f64> {
-    values(chunk)
+fn values(chunk: &RasterChunk) -> &[f64] {
+    band(chunk, 0)
+}
+
+fn off_code_in(values: &[f64], codes: &[f64]) -> Vec<f64> {
+    values
         .iter()
         .copied()
         .filter(|v| !v.is_nan() && !codes.contains(v))
         .collect()
+}
+
+fn off_code(chunk: &RasterChunk, codes: &[f64]) -> Vec<f64> {
+    off_code_in(values(chunk), codes)
 }
 
 fn tile_of(z: u8, lon: f64, lat: f64) -> XyzTile {
@@ -123,7 +131,7 @@ async fn raster_src_decimates_categories_by_mode_and_continuous_by_mean() {
         nan,  nan,  40.0, nan,
         nan,  nan,  50.0, 50.0,
     ];
-    let src = |value_kind| {
+    let src = |value_kind: ValueKind| {
         RasterSrc::new(
             BandedRaster::new(vec![
                 Raster::from_vec(4, 4, block.clone(), CELL, nan).unwrap(),
@@ -178,7 +186,9 @@ async fn cog_src_decimates_categories_by_mode() {
         &mut std::fs::File::create(&path).unwrap(),
     )
     .unwrap();
-    let open = |value_kind| CogSrc::open(std::fs::File::open(&path).unwrap(), value_kind).unwrap();
+    let open = |value_kind: ValueKind| {
+        CogSrc::open(std::fs::File::open(&path).unwrap(), value_kind).unwrap()
+    };
     let bbox = window(0, 0, side, side);
     let resolution = 4.0 * CELL;
 
@@ -231,7 +241,10 @@ async fn reprojected_categories_stay_class_codes() {
         let src = g.add_source(Box::new(class_src(value_kind)));
         let rp = g.add_transform(src, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
         let engine = Engine::new(g, 64 << 20).unwrap();
-        assert_eq!(engine.caps(rp).raster().value_kind, value_kind);
+        assert_eq!(
+            engine.caps(rp).raster().value_kinds,
+            BandKinds::from(value_kind)
+        );
         let warped = pull(&engine, rp, center.bbox(), center.resolution()).await;
         let rendered = render_tile(&engine, rp, center).await.unwrap();
         (warped, rendered)
@@ -311,14 +324,17 @@ fn reclassify_pins_categorical_and_hillshade_pins_continuous() {
         )]))),
     );
     let engine = Engine::new(g, 64 << 20).unwrap();
-    assert_eq!(engine.caps(src).raster().value_kind, ValueKind::Categorical);
     assert_eq!(
-        engine.caps(shaded).raster().value_kind,
-        ValueKind::Continuous
+        engine.caps(src).raster().value_kinds,
+        BandKinds::from(ValueKind::Categorical)
     );
     assert_eq!(
-        engine.caps(classified).raster().value_kind,
-        ValueKind::Categorical
+        engine.caps(shaded).raster().value_kinds,
+        BandKinds::from(ValueKind::Continuous)
+    );
+    assert_eq!(
+        engine.caps(classified).raster().value_kinds,
+        BandKinds::from(ValueKind::Categorical)
     );
 }
 
@@ -330,7 +346,10 @@ async fn mosaic_samples_categories_from_the_containing_pixel() {
         let classes = g.add_source(Box::new(shifted_class_src(value_kind)));
         let joined = g.add_fanin(&[empty, classes], Box::new(Mosaic::default()));
         let engine = Engine::new(g, 64 << 20).unwrap();
-        assert_eq!(engine.caps(joined).raster().value_kind, value_kind);
+        assert_eq!(
+            engine.caps(joined).raster().value_kinds,
+            BandKinds::from(value_kind)
+        );
         pull(&engine, joined, window(20, 20, 300, 200), CELL).await
     };
 
@@ -354,10 +373,13 @@ async fn combine_samples_each_input_by_its_own_kind_and_outputs_continuous() {
         let product = g.add_fanin(&[ones, classes], Box::new(Combine::new(BinaryOp::Multiply)));
         let engine = Engine::new(g, 64 << 20).unwrap();
         assert_eq!(
-            engine.caps(product).raster().value_kind,
-            ValueKind::Continuous
+            engine.caps(product).raster().value_kinds,
+            BandKinds::from(ValueKind::Continuous)
         );
-        assert_eq!(engine.caps(classes).raster().value_kind, class_kind);
+        assert_eq!(
+            engine.caps(classes).raster().value_kinds,
+            BandKinds::from(class_kind)
+        );
         pull(&engine, product, window(20, 20, 300, 200), CELL).await
     };
     // bilinear weights over the ones input sum to one only within rounding
@@ -390,8 +412,172 @@ fn a_mosaic_of_two_value_kinds_fails_naming_value_kind() {
         .err()
         .expect("a mosaic mixing value kinds solved");
     assert!(
-        err.to_string().contains("no common value for value_kind"),
+        err.to_string().contains("no common value for value_kinds"),
         "{err}"
+    );
+}
+
+fn reflectance_map(width: usize, height: usize) -> Raster {
+    let mut data = Vec::with_capacity(width * height);
+    for row in 0..height {
+        for col in 0..width {
+            data.push(1000.0 + 3.0 * col as f64 + 7.0 * row as f64);
+        }
+    }
+    Raster::from_vec(width, height, data, CELL, f64::NAN).unwrap()
+}
+
+fn empty_band() -> Raster {
+    Raster::from_vec(W, H, vec![f64::NAN; W * H], CELL, f64::NAN).unwrap()
+}
+
+fn banded_src(bands: Vec<Raster>, shift: f64, value_kinds: BandKinds) -> RasterSrc {
+    RasterSrc::new(
+        BandedRaster::new(bands).unwrap(),
+        ORIGIN_X + shift,
+        ORIGIN_Y - shift,
+        Crs::WGS84,
+        value_kinds,
+    )
+}
+
+fn reflectance_and_classes() -> BandKinds {
+    BandKinds::per_band(vec![ValueKind::Continuous, ValueKind::Categorical])
+}
+
+fn two_band_src(value_kinds: BandKinds) -> RasterSrc {
+    banded_src(
+        vec![reflectance_map(W, H), class_map(W, H)],
+        0.0,
+        value_kinds,
+    )
+}
+
+fn reflectance_src() -> RasterSrc {
+    banded_src(
+        vec![reflectance_map(W, H)],
+        0.0,
+        BandKinds::from(ValueKind::Continuous),
+    )
+}
+
+fn bits(values: &[f64]) -> Vec<u64> {
+    values.iter().map(|v| v.to_bits()).collect()
+}
+
+#[test]
+fn band_kinds_shared_by_every_band_equal_the_single_kind() {
+    let both_categorical = BandKinds::per_band(vec![ValueKind::Categorical; 2]);
+    assert_eq!(both_categorical, BandKinds::from(ValueKind::Categorical));
+    assert_eq!(both_categorical.band(1), ValueKind::Categorical);
+    let mixed = reflectance_and_classes();
+    assert_ne!(mixed, BandKinds::from(ValueKind::Continuous));
+    assert_eq!(mixed.band(0), ValueKind::Continuous);
+    assert_eq!(mixed.band(1), ValueKind::Categorical);
+}
+
+#[tokio::test]
+async fn a_two_band_source_decimates_each_band_by_its_own_kind() {
+    let bbox = window(0, 0, W, H);
+    let resolution = 4.0 * CELL;
+    let decimated = move |src: RasterSrc| async move {
+        let (engine, node) = engine_over(src);
+        let kinds = engine.caps(node).raster().value_kinds.clone();
+        (kinds, pull(&engine, node, bbox, resolution).await)
+    };
+
+    let (kinds, mixed) = decimated(two_band_src(reflectance_and_classes())).await;
+    assert_eq!(kinds, reflectance_and_classes());
+    assert_eq!(off_code_in(band(&mixed, 1), &CODES), Vec::<f64>::new());
+    assert!(band(&mixed, 1).iter().any(|v| !v.is_nan()));
+    let (_, reference) = decimated(reflectance_src()).await;
+    assert_eq!(bits(band(&mixed, 0)), bits(band(&reference, 0)));
+
+    let (_, every_band_continuous) =
+        decimated(two_band_src(BandKinds::from(ValueKind::Continuous))).await;
+    assert!(
+        !off_code_in(band(&every_band_continuous, 1), &CODES).is_empty(),
+        "no block of the fixture mixes codes"
+    );
+    let (_, every_band_categorical) =
+        decimated(two_band_src(BandKinds::from(ValueKind::Categorical))).await;
+    assert_ne!(
+        bits(band(&every_band_categorical, 0)),
+        bits(band(&reference, 0))
+    );
+}
+
+#[tokio::test]
+async fn a_two_band_warp_samples_each_band_by_its_own_kind() {
+    let center = tile_of(
+        10,
+        ORIGIN_X + W as f64 * CELL / 2.0,
+        ORIGIN_Y - H as f64 * CELL / 2.0,
+    );
+    let render = move |src: RasterSrc| async move {
+        let mut g = Graph::new();
+        let node = g.add_source(Box::new(src));
+        let rp = g.add_transform(node, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
+        let engine = Engine::new(g, 64 << 20).unwrap();
+        let warped = pull(&engine, rp, center.bbox(), center.resolution()).await;
+        let rendered = render_tile(&engine, rp, center).await.unwrap();
+        (warped, rendered)
+    };
+
+    let (warped, rendered) = render(two_band_src(reflectance_and_classes())).await;
+    let (warped_reference, rendered_reference) = render(reflectance_src()).await;
+    for chunk in [&warped, &rendered] {
+        assert_eq!(off_code_in(band(chunk, 1), &CODES), Vec::<f64>::new());
+        assert!(
+            band(chunk, 1).iter().any(|v| !v.is_nan()),
+            "the tile missed the class map"
+        );
+    }
+    assert_eq!(bits(band(&warped, 0)), bits(band(&warped_reference, 0)));
+    assert_eq!(bits(band(&rendered, 0)), bits(band(&rendered_reference, 0)));
+
+    let (warped, rendered) = render(two_band_src(BandKinds::from(ValueKind::Continuous))).await;
+    assert!(
+        !off_code_in(band(&warped, 1), &CODES).is_empty(),
+        "the tile crosses no class boundary"
+    );
+    assert!(!off_code_in(band(&rendered, 1), &CODES).is_empty());
+    let (warped, _) = render(two_band_src(BandKinds::from(ValueKind::Categorical))).await;
+    assert_ne!(bits(band(&warped, 0)), bits(band(&warped_reference, 0)));
+}
+
+#[tokio::test]
+async fn a_two_band_mosaic_samples_each_band_by_its_own_kind() {
+    let mosaic = |bands: Vec<Raster>, value_kinds: BandKinds| async move {
+        let empties = bands.iter().map(|_| empty_band()).collect();
+        let mut g = Graph::new();
+        let empty = g.add_source(Box::new(banded_src(empties, 0.0, value_kinds.clone())));
+        let shifted = g.add_source(Box::new(banded_src(bands, CELL / 2.0, value_kinds)));
+        let joined = g.add_fanin(&[empty, shifted], Box::new(Mosaic::default()));
+        let engine = Engine::new(g, 64 << 20).unwrap();
+        pull(&engine, joined, window(20, 20, 300, 200), CELL).await
+    };
+    let both = || vec![reflectance_map(W, H), class_map(W, H)];
+
+    let mixed = mosaic(both(), reflectance_and_classes()).await;
+    assert_eq!(off_code_in(band(&mixed, 1), &CODES), Vec::<f64>::new());
+    assert!(band(&mixed, 1).iter().any(|v| !v.is_nan()));
+    let reference = mosaic(
+        vec![reflectance_map(W, H)],
+        BandKinds::from(ValueKind::Continuous),
+    )
+    .await;
+    assert_eq!(bits(band(&mixed, 0)), bits(band(&reference, 0)));
+
+    let every_band_continuous = mosaic(both(), BandKinds::from(ValueKind::Continuous)).await;
+    assert!(
+        !off_code_in(band(&every_band_continuous, 1), &CODES).is_empty(),
+        "the half-cell shift blends no codes"
+    );
+    let every_band_categorical = mosaic(both(), BandKinds::from(ValueKind::Categorical)).await;
+    assert_ne!(
+        bits(band(&every_band_categorical, 0)),
+        bits(band(&reference, 0))
     );
 }
 

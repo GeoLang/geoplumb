@@ -1,6 +1,6 @@
 //! per-cell map algebra and reclassification over terrano ops
 
-use crate::caps::{Caps, CapsSet, Constraint, ValueKind};
+use crate::caps::{BandKinds, Caps, CapsSet, Constraint, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::{Fanin, Transform};
 use crate::error::{Error, Result};
@@ -70,12 +70,9 @@ impl Transform for MapAlgebra {
     }
 }
 
-/// two-input per-cell algebra: both inputs are sampled onto the output
-/// grid, each by its own value kind, then terrano's binary op runs band by
-/// band. the inputs may differ in value kind and the output is continuous
 pub struct Combine {
     op: BinaryOp,
-    input_value_kinds: Option<[ValueKind; 2]>,
+    input_value_kinds: Option<[BandKinds; 2]>,
 }
 
 impl Combine {
@@ -111,13 +108,16 @@ impl Fanin for Combine {
                 inputs.len()
             )));
         };
-        self.input_value_kinds = Some([first.raster().value_kind, second.raster().value_kind]);
+        self.input_value_kinds = Some([
+            first.raster().value_kinds.clone(),
+            second.raster().value_kinds.clone(),
+        ]);
         Ok(())
     }
 
     fn compute(&self, out: &WindowReq, inputs: &[Chunk]) -> Result<Chunk> {
         let inputs: Vec<&RasterChunk> = inputs.iter().map(Chunk::raster).collect::<Result<_>>()?;
-        let [first_kind, second_kind] = self.input_value_kinds.expect("configured");
+        let [first_kinds, second_kinds] = self.input_value_kinds.as_ref().expect("configured");
         let res = out.resolution;
         let cols = (out.bbox.width() / res).round() as usize;
         let rows = (out.bbox.height() / res).round() as usize;
@@ -135,8 +135,8 @@ impl Fanin for Combine {
         };
         let bands: Vec<Raster> = (0..inputs[0].bands.band_count())
             .map(|bi| {
-                on_grid(inputs[0], first_kind, bi)
-                    .apply_binary(&on_grid(inputs[1], second_kind, bi), &self.op)
+                on_grid(inputs[0], first_kinds.band(bi), bi)
+                    .apply_binary(&on_grid(inputs[1], second_kinds.band(bi), bi), &self.op)
                     .expect("equal dims by construction")
             })
             .collect();

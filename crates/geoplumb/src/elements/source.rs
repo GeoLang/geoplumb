@@ -1,11 +1,11 @@
 //! in-memory raster source. the whole dataset is held resident (a geotiff is
 //! fetched or read once at open) and windows are served by block decimation
-//! per ladder level, the block mean for continuous values and its mode for
+//! per ladder level, the block mean for continuous bands and its mode for
 //! categorical ones. for tiled cogs use CogSrc, which reads windows without
 //! holding the file
 
 use crate::caps::{
-    CapsPattern, CapsSet, Constraint, Crs, RasterPattern, ResRange, SetField, ValueKind,
+    BandKinds, CapsPattern, CapsSet, Constraint, Crs, RasterPattern, ResRange, SetField,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
@@ -22,7 +22,7 @@ pub struct RasterSrc {
     origin_y: f64,
     base_resolution: f64,
     crs: Crs,
-    value_kind: ValueKind,
+    value_kinds: BandKinds,
 }
 
 impl RasterSrc {
@@ -31,8 +31,14 @@ impl RasterSrc {
         origin_x: f64,
         origin_y: f64,
         crs: Crs,
-        value_kind: ValueKind,
+        value_kinds: impl Into<BandKinds>,
     ) -> Self {
+        let value_kinds = value_kinds.into();
+        assert!(
+            value_kinds.fits(data.band_count()),
+            "{value_kinds:?} for {} bands",
+            data.band_count()
+        );
         let base_resolution = data.cell_size();
         RasterSrc {
             data,
@@ -40,18 +46,18 @@ impl RasterSrc {
             origin_y,
             base_resolution,
             crs,
-            value_kind,
+            value_kinds,
         }
     }
 
-    pub fn from_geotiff(bytes: &[u8], value_kind: ValueKind) -> Result<Self> {
+    pub fn from_geotiff(bytes: &[u8], value_kinds: impl Into<BandKinds>) -> Result<Self> {
         let (data, meta): (BandedRaster, GeoTiffMetadata) = read_geotiff_bands(bytes)?;
         Ok(RasterSrc::new(
             data,
             meta.origin_x,
             meta.origin_y,
             Crs(u32::from(meta.epsg)),
-            value_kind,
+            value_kinds,
         ))
     }
 
@@ -64,7 +70,9 @@ impl RasterSrc {
             .data
             .bands()
             .iter()
-            .map(|band| {
+            .enumerate()
+            .map(|(bi, band)| {
+                let value_kind = self.value_kinds.band(bi);
                 let nodata = band.nodata;
                 let mut out = vec![nodata; cols * rows];
                 let mut block = Vec::with_capacity(factor * factor);
@@ -90,7 +98,7 @@ impl RasterSrc {
                             }
                         }
                         out[row * cols + col] =
-                            reduce_block(self.value_kind, &mut block).unwrap_or(nodata);
+                            reduce_block(value_kind, &mut block).unwrap_or(nodata);
                     }
                 }
                 Raster::from_vec(cols, rows, out, res, nodata).expect("level dims")
@@ -117,13 +125,13 @@ impl Source for RasterSrc {
             }
         }
         format!(
-            "RasterSrc bands={} origin_x={:?} origin_y={:?} base_resolution={:?} crs={} value_kind={:?} content={:016x}",
+            "RasterSrc bands={} origin_x={:?} origin_y={:?} base_resolution={:?} crs={} value_kinds={:?} content={:016x}",
             self.data.band_count(),
             self.origin_x,
             self.origin_y,
             self.base_resolution,
             self.crs,
-            self.value_kind,
+            self.value_kinds,
             digest.finish()
         )
     }
@@ -135,7 +143,7 @@ impl Source for RasterSrc {
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.base_resolution),
             chunk_px: SetField::Any,
-            value_kind: SetField::one(self.value_kind),
+            value_kinds: SetField::one(self.value_kinds.clone()),
         })))
     }
 

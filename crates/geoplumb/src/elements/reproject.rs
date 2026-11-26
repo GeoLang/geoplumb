@@ -1,14 +1,14 @@
 //! crs change via projicio, for raster and vector links alike. the request
 //! plan inverse-projects the output window into the source crs. a raster
 //! compute inverse-maps each output pixel center and samples the input
-//! there, bilinearly for continuous values and from the containing pixel
+//! there, bilinearly for continuous bands and from the containing pixel
 //! for categorical ones, a vector compute forward-projects the fragments
 //! themselves
 
 use std::borrow::Cow;
 
 use crate::caps::{
-    Caps, CapsPattern, CapsSet, Constraint, Crs, FieldMask, RasterPattern, SetField, ValueKind,
+    BandKinds, Caps, CapsPattern, CapsSet, Constraint, Crs, FieldMask, RasterPattern, SetField,
     VectorPattern,
 };
 use crate::chunk::{Chunk, RasterChunk, VectorChunk, VectorFeature, clip_geometry};
@@ -34,7 +34,7 @@ struct ConfiguredReprojection {
 }
 
 enum ReprojectedKind {
-    Raster { value_kind: ValueKind },
+    Raster { value_kinds: BandKinds },
     Vector { latitude_band: Option<LatitudeBand> },
 }
 
@@ -194,7 +194,7 @@ pub(crate) fn warp_to_grid(
     out: &WindowReq,
     inverse: &projicio_core::Transform,
     to: Crs,
-    value_kind: ValueKind,
+    value_kinds: &BandKinds,
 ) -> Result<RasterChunk> {
     let res = out.resolution;
     let cols = (out.bbox.width() / res).round() as usize;
@@ -215,7 +215,9 @@ pub(crate) fn warp_to_grid(
         .bands
         .bands()
         .iter()
-        .map(|band| {
+        .enumerate()
+        .map(|(bi, band)| {
+            let value_kind = value_kinds.band(bi);
             let nodata = band.nodata;
             let data = src_pts
                 .iter()
@@ -264,7 +266,7 @@ impl Transform for Reproject {
         let to = output.crs();
         let kind = match input {
             Caps::Raster(raster) => ReprojectedKind::Raster {
-                value_kind: raster.value_kind,
+                value_kinds: raster.value_kinds.clone(),
             },
             Caps::Vector(_) => ReprojectedKind::Vector {
                 latitude_band: latitude_band(from, to),
@@ -318,20 +320,20 @@ impl Transform for Reproject {
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let configured = self.configured();
-        match configured.kind {
-            ReprojectedKind::Raster { value_kind } => warp_to_grid(
+        match &configured.kind {
+            ReprojectedKind::Raster { value_kinds } => warp_to_grid(
                 input.raster()?,
                 out,
                 &configured.inverse,
                 self.to,
-                value_kind,
+                value_kinds,
             )
             .map(Chunk::Raster),
             ReprojectedKind::Vector { latitude_band } => project_features(
                 input.vector()?,
                 out,
                 &configured.forward,
-                latitude_band,
+                *latitude_band,
                 self.to,
             )
             .map(Chunk::Vector),

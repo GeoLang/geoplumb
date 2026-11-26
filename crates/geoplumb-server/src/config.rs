@@ -116,7 +116,7 @@ pub enum SourceConfig {
         datetime: Option<String>,
         composite: Option<CompositeConfig>,
         #[serde(default)]
-        value_kind: ValueKindConfig,
+        value_kind: AssetValueKindsConfig,
     },
     Cog {
         path: PathBuf,
@@ -181,6 +181,21 @@ pub enum ValueKindConfig {
     #[default]
     Continuous,
     Categorical,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum AssetValueKindsConfig {
+    // `value_kind = "categorical"`
+    EveryAsset(ValueKindConfig),
+    // `value_kind = { scl = "categorical" }`, an asset left out is continuous
+    PerAsset(BTreeMap<String, ValueKindConfig>),
+}
+
+impl Default for AssetValueKindsConfig {
+    fn default() -> Self {
+        AssetValueKindsConfig::EveryAsset(ValueKindConfig::Continuous)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -463,19 +478,12 @@ fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
         SourceConfig::Stac { assets, .. } if assets.is_empty() => {
             return Err("stac source names no assets".into());
         }
-        SourceConfig::Stac {
-            composite: Some(composite),
-            value_kind,
-            ..
-        } if Composite::from(*composite)
-            .output_value_kind((*value_kind).into())
-            .is_none() =>
-        {
-            let composite = format!("{composite:?}").to_lowercase();
-            return Err(format!(
-                "the {composite} composite blends values, so a categorical stac source \
-                 takes latest, min, max or count"
-            ));
+        SourceConfig::Stac { .. } => {
+            source
+                .stac_search()
+                .expect("a stac source has a search")
+                .asset_value_kinds()
+                .map_err(|e| e.to_string())?;
         }
         SourceConfig::Las { .. } if !ops.iter().any(|op| matches!(op, OpConfig::Idw { .. })) => {
             return Err("the las source has no idw op, so the chain hands \
@@ -678,7 +686,16 @@ impl SourceConfig {
                 search.assets = assets.clone();
                 search.datetime = datetime.clone();
                 search.composite = composite.map(Composite::from).unwrap_or_default();
-                search.value_kind = (*value_kind).into();
+                search.value_kinds = match value_kind {
+                    AssetValueKindsConfig::EveryAsset(kind) => assets
+                        .iter()
+                        .map(|asset| (asset.clone(), ValueKind::from(*kind)))
+                        .collect(),
+                    AssetValueKindsConfig::PerAsset(kinds) => kinds
+                        .iter()
+                        .map(|(asset, kind)| (asset.clone(), ValueKind::from(*kind)))
+                        .collect(),
+                };
                 Some(search)
             }
         }

@@ -91,7 +91,7 @@ pub async fn write_cog<W: Write + Seek + Send + 'static>(
         ))
     })?;
     let bands = usize::from(caps.bands);
-    let value_kind = caps.value_kind;
+    let value_kinds = caps.value_kinds.clone();
     let params = CogParams {
         tile_width: COG_TILE_PX as u32,
         tile_height: COG_TILE_PX as u32,
@@ -133,7 +133,11 @@ pub async fn write_cog<W: Write + Seek + Send + 'static>(
                     .and_then(|chunk| {
                         let raster = chunk.raster()?;
                         Ok(resample_to_grid(
-                            raster, &bbox, tile.cols, tile.rows, value_kind,
+                            raster,
+                            &bbox,
+                            tile.cols,
+                            tile.rows,
+                            &value_kinds,
                         ))
                     });
                 match exact {

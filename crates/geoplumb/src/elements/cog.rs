@@ -1,7 +1,7 @@
 //! windowed cog source. each pull fetches only the tiles it touches
 //! through terrano's CogReader, served from the file overview nearest the
 //! requested ladder level. when the file pyramid is shallower than the
-//! request the remainder is block-decimated by value kind, matching
+//! request the remainder is block-decimated by each band's value kind, matching
 //! RasterSrc semantics
 
 use std::collections::HashMap;
@@ -9,7 +9,8 @@ use std::io::Write;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use crate::caps::{
-    CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField, ValueKind,
+    BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
+    ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
@@ -27,23 +28,29 @@ pub struct CogSrc<R: RangeRead + Send + Sync + 'static> {
     base_resolution: f64,
     bands: u16,
     crs: Crs,
-    value_kind: ValueKind,
+    value_kinds: BandKinds,
 }
 
 impl<R: RangeRead + Send + Sync + 'static> CogSrc<R> {
     /// reads the file layout with blocking range requests, call it off
     /// the async runtime (`spawn_blocking`) when one is running
-    pub fn open(source: R, value_kind: ValueKind) -> Result<Self> {
+    pub fn open(source: R, value_kinds: impl Into<BandKinds>) -> Result<Self> {
+        let value_kinds = value_kinds.into();
         let reader = CogReader::open(source)?;
         let meta = reader.meta().clone();
         let bands = band_count(&reader)?;
+        if !value_kinds.fits(usize::from(bands)) {
+            return Err(Error::Source(format!(
+                "{value_kinds:?} does not fit a cog of {bands} bands"
+            )));
+        }
         Ok(CogSrc {
             origin_x: meta.origin_x,
             origin_y: meta.origin_y,
             base_resolution: meta.pixel_width,
             bands,
             crs: Crs(u32::from(meta.epsg)),
-            value_kind,
+            value_kinds,
             reader: Arc::new(reader),
         })
     }
@@ -70,10 +77,10 @@ impl<R: RangeRead + Send + Sync + 'static> Source for CogSrc<R> {
         let mut layout = Fnv1a::new();
         write!(layout, "{:?}", self.reader.levels()).expect("hashing never fails");
         format!(
-            "CogSrc meta={:?} layout={:016x} value_kind={:?}",
+            "CogSrc meta={:?} layout={:016x} value_kinds={:?}",
             self.reader.meta(),
             layout.finish(),
-            self.value_kind
+            self.value_kinds
         )
     }
 
@@ -84,7 +91,7 @@ impl<R: RangeRead + Send + Sync + 'static> Source for CogSrc<R> {
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.base_resolution),
             chunk_px: SetField::Any,
-            value_kind: SetField::one(self.value_kind),
+            value_kinds: SetField::one(self.value_kinds.clone()),
         })))
     }
 
@@ -100,11 +107,11 @@ impl<R: RangeRead + Send + Sync + 'static> Source for CogSrc<R> {
     fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<Chunk>> {
         let reader = self.reader.clone();
         let req = *req;
-        let (origin_x, origin_y, crs, value_kind) =
-            (self.origin_x, self.origin_y, self.crs, self.value_kind);
+        let (origin_x, origin_y, crs) = (self.origin_x, self.origin_y, self.crs);
+        let value_kinds = self.value_kinds.clone();
         Box::pin(async move {
             crate::engine::offload(move || {
-                read_chunk(&reader, &req, origin_x, origin_y, crs, value_kind).map(Chunk::Raster)
+                read_chunk(&reader, &req, origin_x, origin_y, crs, &value_kinds).map(Chunk::Raster)
             })
             .await
         })
@@ -117,7 +124,7 @@ pub(crate) fn read_chunk<R: RangeRead>(
     origin_x: f64,
     origin_y: f64,
     crs: Crs,
-    value_kind: ValueKind,
+    value_kinds: &BandKinds,
 ) -> Result<RasterChunk> {
     let level = reader.select_level(req.resolution);
     let lres = reader.levels()[level].pixel_width;
@@ -152,11 +159,12 @@ pub(crate) fn read_chunk<R: RangeRead>(
 
     let bands: Vec<Raster> = fine
         .into_iter()
-        .map(|plane| {
+        .enumerate()
+        .map(|(bi, plane)| {
             let data = if factor == 1 {
                 plane
             } else {
-                decimate(&plane, cols, rows, factor, value_kind)
+                decimate(&plane, cols, rows, factor, value_kinds.band(bi))
             };
             Raster::from_vec(cols, rows, data, req.resolution, f64::NAN).expect("window dims")
         })

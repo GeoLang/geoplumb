@@ -18,11 +18,12 @@
 //! rfc 3339 side of `TimeInterval` lives here, the only place that speaks
 //! it
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 
 use crate::caps::{
-    CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField, ValueKind,
+    BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange, SetField,
+    ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
@@ -278,7 +279,7 @@ pub struct StacSearch {
     pub limit: u32,
     /// what a pull does with the items covering one window
     pub composite: Composite,
-    pub value_kind: ValueKind,
+    pub value_kinds: BTreeMap<String, ValueKind>,
 }
 
 impl StacSearch {
@@ -291,8 +292,39 @@ impl StacSearch {
             datetime: None,
             limit: 100,
             composite: Composite::default(),
-            value_kind: ValueKind::Continuous,
+            value_kinds: BTreeMap::new(),
         }
+    }
+
+    pub fn asset_value_kinds(&self) -> Result<Vec<ValueKind>> {
+        if let Some(unknown) = self
+            .value_kinds
+            .keys()
+            .find(|key| !self.assets.contains(*key))
+        {
+            return Err(Error::Source(format!(
+                "value_kind names {unknown}, which is not one of the assets {:?}",
+                self.assets
+            )));
+        }
+        self.assets
+            .iter()
+            .map(|asset| {
+                let kind = self
+                    .value_kinds
+                    .get(asset)
+                    .copied()
+                    .unwrap_or(ValueKind::Continuous);
+                if self.composite.output_value_kind(kind).is_none() {
+                    let composite = format!("{:?}", self.composite).to_lowercase();
+                    return Err(Error::Source(format!(
+                        "the {composite} composite blends values, so the categorical asset \
+                         {asset} takes latest, min, max or count"
+                    )));
+                }
+                Ok(kind)
+            })
+            .collect()
     }
 }
 
@@ -416,6 +448,7 @@ struct Inner {
     /// per-asset band counts of the anchor item's cogs, which every kept
     /// item shares
     asset_bands: Vec<u16>,
+    asset_value_kinds: Vec<ValueKind>,
     /// their sum, the band count a pull produces
     bands: u16,
     /// lon/lat to the anchor crs for item footprints, `None` when it is 4326
@@ -438,7 +471,7 @@ pub struct StacSrc {
     base_resolution: f64,
     bands: u16,
     crs: Crs,
-    value_kind: ValueKind,
+    value_kinds: BandKinds,
 }
 
 /// stac asset hrefs on aws are often `s3://bucket/key`, publicly readable
@@ -566,16 +599,7 @@ impl StacSrc {
         if search.assets.is_empty() {
             return Err(Error::Source("stac search names no assets".into()));
         }
-        let value_kind = search
-            .composite
-            .output_value_kind(search.value_kind)
-            .ok_or_else(|| {
-                let composite = format!("{:?}", search.composite).to_lowercase();
-                Error::Source(format!(
-                    "the {composite} composite blends values, so a categorical stac search \
-                     takes latest, min, max or count"
-                ))
-            })?;
+        let asset_value_kinds = search.asset_value_kinds()?;
         let client = reqwest::blocking::Client::new();
         let mut found = search_page(&client, search, search.bbox, None)?;
         if found.is_empty() {
@@ -627,6 +651,19 @@ impl StacSrc {
             .map(band_count)
             .collect::<Result<Vec<u16>>>()?;
         let bands = asset_bands.iter().sum();
+        let value_kinds = BandKinds::per_band(
+            asset_value_kinds
+                .iter()
+                .zip(&asset_bands)
+                .flat_map(|(kind, asset_band_count)| {
+                    let served = search
+                        .composite
+                        .output_value_kind(*kind)
+                        .expect("asset_value_kinds refuses a composite that blends an asset");
+                    std::iter::repeat_n(served, usize::from(*asset_band_count))
+                })
+                .collect(),
+        );
 
         let item_pool = Arc::new(Mutex::new(HashMap::new()));
         let mut inner = Inner {
@@ -634,6 +671,7 @@ impl StacSrc {
             client,
             crs,
             asset_bands,
+            asset_value_kinds,
             bands,
             to_native,
             to_lonlat,
@@ -665,7 +703,7 @@ impl StacSrc {
             base_resolution: meta.pixel_width,
             bands,
             crs,
-            value_kind,
+            value_kinds,
         })
     }
 
@@ -874,7 +912,7 @@ impl Inner {
                 item.hrefs[k], self.asset_bands[k]
             )));
         }
-        let value_kind = self.search.value_kind;
+        let value_kinds = BandKinds::from(self.asset_value_kinds[k]);
         match &item.reprojection {
             None => read_chunk(
                 reader,
@@ -882,7 +920,7 @@ impl Inner {
                 meta.origin_x,
                 meta.origin_y,
                 self.crs,
-                value_kind,
+                &value_kinds,
             ),
             Some(reprojection) => read_warped(
                 reader,
@@ -890,7 +928,7 @@ impl Inner {
                 reprojection,
                 self.crs,
                 scale_window,
-                value_kind,
+                &value_kinds,
             ),
         }
     }
@@ -955,7 +993,7 @@ fn read_warped(
     reprojection: &Reprojection,
     anchor: Crs,
     scale_window: &Bbox,
-    value_kind: ValueKind,
+    value_kinds: &BandKinds,
 ) -> Result<RasterChunk> {
     let (origin_x, origin_y) = (reader.meta().origin_x, reader.meta().origin_y);
     let (region, _) = inverse_window(&reprojection.from_anchor, &req.bbox, req.resolution);
@@ -986,9 +1024,9 @@ fn read_warped(
         origin_x,
         origin_y,
         reprojection.crs,
-        value_kind,
+        value_kinds,
     )?;
-    warp_to_grid(&chunk, req, &reprojection.from_anchor, anchor, value_kind)
+    warp_to_grid(&chunk, req, &reprojection.from_anchor, anchor, value_kinds)
 }
 
 /// one item's window across every asset, the assets read in parallel and
@@ -1462,14 +1500,14 @@ impl Source for StacSrc {
         // there is to name
         let search = &self.inner.search;
         format!(
-            "StacSrc api={:?} collection={:?} assets={:?} bbox={:?} datetime={:?} composite={:?} value_kind={:?} crs={} bands={}",
+            "StacSrc api={:?} collection={:?} assets={:?} bbox={:?} datetime={:?} composite={:?} value_kinds={:?} crs={} bands={}",
             search.api,
             search.collection,
             search.assets,
             search.bbox,
             search.datetime,
             search.composite,
-            search.value_kind,
+            search.value_kinds,
             self.crs,
             self.bands
         )
@@ -1482,7 +1520,7 @@ impl Source for StacSrc {
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.base_resolution),
             chunk_px: SetField::Any,
-            value_kind: SetField::one(self.value_kind),
+            value_kinds: SetField::one(self.value_kinds.clone()),
         })))
     }
 

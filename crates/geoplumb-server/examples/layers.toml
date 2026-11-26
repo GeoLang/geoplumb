@@ -61,13 +61,15 @@ altitude = 45.0
 
 # sentinel-2 red kept only where the scl band holds a clear-ground code.
 # band 1 is the second asset, and a pixel of any other code renders
-# transparent. band 0, the red one, is what the png encodes.
+# transparent. band 0, the red one, is what the png encodes. scl holds
+# class codes, so it is categorical: coarse tiles take the most common
+# code in a block instead of averaging codes into values no class has.
 [[layer]]
 name = "s2-red-clear"
 source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "sentinel-2-l2a", assets = [
     "red",
     "scl",
-], bbox = [7.0, 46.3, 8.0, 46.9], datetime = "2025-06-01T00:00:00Z/2025-09-01T00:00:00Z" }
+], bbox = [7.0, 46.3, 8.0, 46.9], datetime = "2025-06-01T00:00:00Z/2025-09-01T00:00:00Z", value_kind = { scl = "categorical" } }
 gray = { min = 0.0, max = 3000.0 }
 
 [[layer.op]]

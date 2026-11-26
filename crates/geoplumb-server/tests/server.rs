@@ -5,12 +5,13 @@
 #[path = "../../geoplumb/tests/gpkg_fixture/mod.rs"]
 mod gpkg_fixture;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use geoplumb::caps::ValueKind;
 use geoplumb_server::config::{
     BinaryOpConfig, BurnConfig, Config, FaninConfig, FocalOpConfig, LayerConfig, OpConfig,
     SourceConfig, UnaryOpConfig, ValueKindConfig,
@@ -753,11 +754,43 @@ fn config_parses_a_categorical_value_kind() {
     let search = source_of(&config.layers[1])
         .stac_search()
         .expect("a stac source");
-    assert_eq!(search.value_kind, geoplumb::caps::ValueKind::Categorical);
+    assert_eq!(
+        search.value_kinds,
+        BTreeMap::from([("map".to_string(), ValueKind::Categorical)])
+    );
 
     let err = Config::parse(&CATEGORICAL.replacen("\"categorical\"", "\"ordinal\"", 1))
         .expect_err("an unknown value kind parsed");
     assert!(err.contains("ordinal"), "{err}");
+}
+
+const PER_ASSET_KINDS: &str = r#"
+[[layer]]
+name = "clear"
+source = { kind = "stac", api = "https://example.test", collection = "sentinel-2-l2a", assets = ["red", "scl"], bbox = [7.0, 46.3, 8.0, 46.9], value_kind = { scl = "categorical" } }
+gray = { min = 0.0, max = 3000.0 }
+"#;
+
+#[test]
+fn config_parses_a_value_kind_per_stac_asset() {
+    let config = Config::parse(PER_ASSET_KINDS).unwrap();
+    let search = source_of(&config.layers[0])
+        .stac_search()
+        .expect("a stac source");
+    assert_eq!(
+        search.asset_value_kinds().unwrap(),
+        [ValueKind::Continuous, ValueKind::Categorical]
+    );
+
+    let err = Config::parse(&PER_ASSET_KINDS.replace("scl = ", "qa = "))
+        .expect_err("a value kind for no asset parsed");
+    assert!(err.contains("qa"), "{err}");
+
+    let err = Config::parse(
+        &PER_ASSET_KINDS.replace("value_kind = {", "composite = \"median\", value_kind = {"),
+    )
+    .expect_err("a median over a categorical asset parsed");
+    assert!(err.contains("median") && err.contains("scl"), "{err}");
 }
 
 const CATEGORICAL_STAC: &str = r#"

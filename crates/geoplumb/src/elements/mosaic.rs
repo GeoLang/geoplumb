@@ -1,9 +1,9 @@
 //! first-wins mosaic: each output pixel takes the first input, wiring
 //! order, that has a value there. inputs are sampled onto the output grid,
-//! bilinearly for continuous values and from the containing pixel for
+//! bilinearly for continuous bands and from the containing pixel for
 //! categorical ones, exact when an input shares the output alignment
 
-use crate::caps::{Caps, CapsSet, Constraint, ValueKind};
+use crate::caps::{BandKinds, Caps, CapsSet, Constraint};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Fanin;
 use crate::error::Result;
@@ -13,7 +13,7 @@ use terrano_core::{BandedRaster, Raster};
 
 #[derive(Default)]
 pub struct Mosaic {
-    value_kind: Option<ValueKind>,
+    value_kinds: Option<BandKinds>,
 }
 
 impl Fanin for Mosaic {
@@ -26,19 +26,20 @@ impl Fanin for Mosaic {
     }
 
     fn configure(&mut self, _inputs: &[Caps], output: &Caps) -> Result<()> {
-        self.value_kind = Some(output.raster().value_kind);
+        self.value_kinds = Some(output.raster().value_kinds.clone());
         Ok(())
     }
 
     fn compute(&self, out: &WindowReq, inputs: &[Chunk]) -> Result<Chunk> {
         let inputs: Vec<&RasterChunk> = inputs.iter().map(Chunk::raster).collect::<Result<_>>()?;
-        let value_kind = self.value_kind.expect("configured");
+        let value_kinds = self.value_kinds.as_ref().expect("configured");
         let res = out.resolution;
         let cols = (out.bbox.width() / res).round() as usize;
         let rows = (out.bbox.height() / res).round() as usize;
         let band_count = inputs[0].bands.band_count();
         let bands: Vec<Raster> = (0..band_count)
             .map(|bi| {
+                let value_kind = value_kinds.band(bi);
                 let nodata = inputs[0].bands.band(bi).expect("negotiated bands").nodata;
                 let mut data = Vec::with_capacity(cols * rows);
                 for row in 0..rows {

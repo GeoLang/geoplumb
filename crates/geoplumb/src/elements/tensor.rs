@@ -5,8 +5,8 @@
 //! ends of it
 
 use crate::caps::{
-    Caps, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField, TensorDtype,
-    TensorPattern, ValueKind,
+    BandKinds, Caps, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField,
+    TensorDtype, TensorPattern, ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk, TensorChunk, TensorData};
 use crate::element::Transform;
@@ -24,7 +24,7 @@ fn cross_kind_passthrough() -> FieldMask {
         bands: true,
         dtype: false,
         resolution: false,
-        value_kind: false,
+        value_kinds: false,
     }
 }
 
@@ -209,7 +209,7 @@ impl Transform for ToRaster {
             passthrough: cross_kind_passthrough(),
             output: CapsPattern::Raster(RasterPattern {
                 dtype: SetField::one(Dtype::F64),
-                value_kind: SetField::one(ValueKind::Continuous),
+                value_kinds: SetField::one(BandKinds::from(ValueKind::Continuous)),
                 ..RasterPattern::default()
             }),
         }

@@ -1,9 +1,9 @@
 //! driver-side resample onto an exact output grid, bilinear for continuous
-//! values and nearest for categorical ones. the engine returns
+//! bands and nearest for categorical ones. the engine returns
 //! chunk-aligned windows at ladder resolutions, a tile wants an exact
 //! 256 px grid, this bridges the two
 
-use crate::caps::ValueKind;
+use crate::caps::{BandKinds, ValueKind};
 use crate::chunk::RasterChunk;
 use crate::window::Bbox;
 use terrano_core::{BandedRaster, Raster};
@@ -13,7 +13,7 @@ pub fn resample_to_grid(
     bbox: &Bbox,
     cols: usize,
     rows: usize,
-    value_kind: ValueKind,
+    value_kinds: &BandKinds,
 ) -> RasterChunk {
     let out_res_x = bbox.width() / cols as f64;
     let out_res_y = bbox.height() / rows as f64;
@@ -21,7 +21,9 @@ pub fn resample_to_grid(
         .bands
         .bands()
         .iter()
-        .map(|band| {
+        .enumerate()
+        .map(|(bi, band)| {
+            let value_kind = value_kinds.band(bi);
             let nodata = band.nodata;
             let mut data = Vec::with_capacity(cols * rows);
             for row in 0..rows {

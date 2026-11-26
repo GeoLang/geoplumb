@@ -33,6 +33,36 @@ pub enum ValueKind {
     Categorical,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
+pub struct BandKinds(Vec<ValueKind>);
+
+impl From<ValueKind> for BandKinds {
+    fn from(every_band: ValueKind) -> BandKinds {
+        BandKinds(vec![every_band])
+    }
+}
+
+impl BandKinds {
+    pub fn per_band(kinds: Vec<ValueKind>) -> BandKinds {
+        let first = *kinds.first().expect("a raster has at least one band");
+        if kinds.iter().all(|kind| *kind == first) {
+            return BandKinds::from(first);
+        }
+        BandKinds(kinds)
+    }
+
+    pub fn band(&self, band: usize) -> ValueKind {
+        match self.0.as_slice() {
+            [every_band] => *every_band,
+            kinds => kinds[band],
+        }
+    }
+
+    pub fn fits(&self, bands: usize) -> bool {
+        self.0.len() == 1 || self.0.len() == bands
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
 pub enum TensorDtype {
     F32,
@@ -135,7 +165,7 @@ pub struct RasterPattern {
     pub crs: SetField<Crs>,
     pub resolution: ResRange,
     pub chunk_px: SetField<u32>,
-    pub value_kind: SetField<ValueKind>,
+    pub value_kinds: SetField<BandKinds>,
 }
 
 impl Default for RasterPattern {
@@ -146,7 +176,7 @@ impl Default for RasterPattern {
             crs: SetField::Any,
             resolution: ResRange::ANY,
             chunk_px: SetField::Any,
-            value_kind: SetField::Any,
+            value_kinds: SetField::Any,
         }
     }
 }
@@ -159,7 +189,7 @@ impl RasterPattern {
             crs: self.crs.intersect(&other.crs),
             resolution: self.resolution.intersect(&other.resolution),
             chunk_px: self.chunk_px.intersect(&other.chunk_px),
-            value_kind: self.value_kind.intersect(&other.value_kind),
+            value_kinds: self.value_kinds.intersect(&other.value_kinds),
         }
     }
 
@@ -169,7 +199,7 @@ impl RasterPattern {
             || self.crs.is_empty()
             || self.resolution.is_empty()
             || self.chunk_px.is_empty()
-            || self.value_kind.is_empty()
+            || self.value_kinds.is_empty()
     }
 }
 
@@ -349,7 +379,7 @@ impl CapsPattern {
                 ("crs", r.crs.is_empty()),
                 ("resolution", r.resolution.is_empty()),
                 ("chunk_px", r.chunk_px.is_empty()),
-                ("value_kind", r.value_kind.is_empty()),
+                ("value_kinds", r.value_kinds.is_empty()),
             ],
             CapsPattern::PointCloud(p) => vec![
                 ("crs", p.crs.is_empty()),
@@ -520,10 +550,6 @@ impl CapsSet {
         self.alternatives.is_empty()
     }
 
-    /// fixate the first alternative to concrete link caps, resolution stays
-    /// ranged. dtype defaults to the kind's only choice, bands, channels and
-    /// chunk size left `Any` by every constraint on the link fall back to one
-    /// band or channel and 256 px, an open value kind to continuous
     pub fn fixate(&self) -> Option<Caps> {
         match self.alternatives.first()? {
             CapsPattern::Raster(first) => Some(Caps::Raster(RasterCaps {
@@ -532,7 +558,10 @@ impl CapsSet {
                 crs: first.crs.fixate()?,
                 resolution: first.resolution,
                 chunk_px: first.chunk_px.fixate().unwrap_or(256),
-                value_kind: first.value_kind.fixate().unwrap_or(ValueKind::Continuous),
+                value_kinds: first
+                    .value_kinds
+                    .fixate()
+                    .unwrap_or_else(|| BandKinds::from(ValueKind::Continuous)),
             })),
             CapsPattern::PointCloud(first) => Some(Caps::PointCloud(PointCaps {
                 crs: first.crs.fixate()?,
@@ -572,7 +601,7 @@ pub struct RasterCaps {
     pub crs: Crs,
     pub resolution: ResRange,
     pub chunk_px: u32,
-    pub value_kind: ValueKind,
+    pub value_kinds: BandKinds,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -659,7 +688,7 @@ impl Caps {
                 crs: SetField::one(r.crs),
                 resolution: r.resolution,
                 chunk_px: SetField::one(r.chunk_px),
-                value_kind: SetField::one(r.value_kind),
+                value_kinds: SetField::one(r.value_kinds.clone()),
             }),
             Caps::PointCloud(p) => CapsPattern::PointCloud(PointPattern {
                 crs: SetField::one(p.crs),
@@ -695,7 +724,7 @@ impl Caps {
                 r.chunk_px.hash(&mut h);
                 r.resolution.min.to_bits().hash(&mut h);
                 r.resolution.max.to_bits().hash(&mut h);
-                r.value_kind.hash(&mut h);
+                r.value_kinds.hash(&mut h);
             }
             Caps::PointCloud(p) => {
                 1u8.hash(&mut h);
@@ -739,7 +768,7 @@ pub struct FieldMask {
     pub crs: bool,
     pub resolution: bool,
     pub chunk_px: bool,
-    pub value_kind: bool,
+    pub value_kinds: bool,
 }
 
 impl FieldMask {
@@ -749,7 +778,7 @@ impl FieldMask {
         crs: true,
         resolution: true,
         chunk_px: true,
-        value_kind: true,
+        value_kinds: true,
     };
 
     pub fn without_crs_resolution() -> Self {
@@ -792,10 +821,10 @@ pub fn mask_project(from: &CapsPattern, onto: &CapsPattern, mask: FieldMask) -> 
             } else {
                 o.chunk_px.clone()
             },
-            value_kind: if mask.value_kind {
-                o.value_kind.intersect(&f.value_kind)
+            value_kinds: if mask.value_kinds {
+                o.value_kinds.intersect(&f.value_kinds)
             } else {
-                o.value_kind.clone()
+                o.value_kinds.clone()
             },
         }),
         (from, onto) => onto.project_common(&from.common(), mask),
@@ -871,11 +900,11 @@ impl Constraint {
         Constraint::Derived {
             input,
             passthrough: FieldMask {
-                value_kind: false,
+                value_kinds: false,
                 ..FieldMask::ALL
             },
             output: CapsPattern::Raster(RasterPattern {
-                value_kind: SetField::one(value_kind),
+                value_kinds: SetField::one(BandKinds::from(value_kind)),
                 ..RasterPattern::default()
             }),
         }
@@ -895,7 +924,7 @@ impl Constraint {
                         crs: coupled.crs || member.crs,
                         resolution: coupled.resolution || member.resolution,
                         chunk_px: coupled.chunk_px || member.chunk_px,
-                        value_kind: coupled.value_kind || member.value_kind,
+                        value_kinds: coupled.value_kinds || member.value_kinds,
                     })
                 },
             ),

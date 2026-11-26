@@ -1,4 +1,4 @@
-use crate::caps::{Caps, Constraint, ValueKind};
+use crate::caps::{BandKinds, Caps, Constraint, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
 use crate::elements::raster_vector::one_band;
@@ -103,7 +103,7 @@ impl Transform for Viewshed {
             &out.bbox,
             columns,
             rows,
-            ValueKind::Categorical,
+            &BandKinds::from(ValueKind::Categorical),
         )))
     }
 }

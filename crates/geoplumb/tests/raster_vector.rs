@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::future::BoxFuture;
-use geoplumb::caps::{CapsPattern, CapsSet, Constraint, RasterPattern, SetField, ValueKind};
+use geoplumb::caps::{
+    BandKinds, CapsPattern, CapsSet, Constraint, RasterPattern, SetField, ValueKind,
+};
 use geoplumb::element::{Source, Transform};
 use geoplumb::elements::{Contours, Polygonize, RasterSrc, Viewshed};
 use geoplumb::window::{ChunkKey, GridSpec};
@@ -568,7 +570,7 @@ fn polygonize_refuses_a_continuous_raster_naming_value_kind() {
         .err()
         .expect("polygonize solved over a continuous raster");
     assert!(
-        err.to_string().contains("no common value for value_kind"),
+        err.to_string().contains("no common value for value_kinds"),
         "{err}"
     );
 }
@@ -617,8 +619,8 @@ async fn viewshed_hides_what_the_wall_hides_pulled_whole_or_chunked() {
     for chunk_px in [None, Some(16)] {
         let (engine, node) = engine_over(wall_source(), chunk_px, Box::new(wall_viewshed()));
         assert_eq!(
-            engine.caps(node).raster().value_kind,
-            ValueKind::Categorical
+            engine.caps(node).raster().value_kinds,
+            BandKinds::from(ValueKind::Categorical)
         );
         pulled.push(pull(&engine, node, bbox, CELL).await.into_raster().unwrap());
     }

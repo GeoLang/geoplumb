@@ -189,7 +189,7 @@ impl Source for ClockSrc {
             crs: SetField::one(Crs::WGS84),
             resolution: ResRange::at_least(CELL),
             chunk_px: SetField::Any,
-            value_kind: SetField::Any,
+            value_kinds: SetField::Any,
         })))
     }
 

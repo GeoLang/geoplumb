@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::caps::{
-    Caps, CapsPattern, CapsSet, Constraint, FieldMask, RasterPattern, SetField, ValueKind,
-    VectorPattern,
+    BandKinds, Caps, CapsPattern, CapsSet, Constraint, FieldMask, RasterPattern, SetField,
+    ValueKind, VectorPattern,
 };
 use crate::chunk::{Chunk, VectorChunk, VectorFeature, clip_geometry};
 use crate::element::Transform;
@@ -16,7 +16,7 @@ use topoi_core::{Coord, LineString, MultiLineString, MultiPolygon, Polygon, Ring
 pub(crate) fn one_band(value_kind: ValueKind) -> CapsSet {
     CapsSet::one(CapsPattern::Raster(RasterPattern {
         bands: SetField::one(1),
-        value_kind: SetField::one(value_kind),
+        value_kinds: SetField::one(BandKinds::from(value_kind)),
         ..RasterPattern::default()
     }))
 }
@@ -30,7 +30,7 @@ fn raster_to_features(value_kind: ValueKind) -> Constraint {
             chunk_px: true,
             dtype: false,
             bands: false,
-            value_kind: false,
+            value_kinds: false,
         },
         output: CapsPattern::Vector(VectorPattern::default()),
     }
