@@ -323,11 +323,14 @@ only after a proof script passes on real input, recorded in
       format parsing. Real data: NOAA OISST v2.1 NetCDF classic from
       CoastWatch ERDDAP, JMA GSM GRIB2 (simple packing, 103 fields).
 
-- [ ] 8.1b Value kind per band. `value_kind` is a link field, so a STAC
-      source naming `["red", "scl"]` resamples its SCL quality codes like
-      reflectance. Below native zoom the codes blend (4.5) and `QualityMask`'s
-      exact match drops the pixel, which the `s2-red-clear` example layer
-      hits. Needs a kind per band in raster caps and chunks, not per link.
+- [x] 8.1b Value kind per band. Raster caps carry `value_kinds`, one kind
+      per band, and a `stac` source declares kinds per asset
+      (`value_kind = { scl = "categorical" }`), so SCL quality codes resample
+      by mode and nearest while reflectance averages. Chunks carry no kind,
+      every resampling site reads the negotiated caps. Proof: Sentinel-2 L2A
+      `nir08` with `scl` from Earth Search at z7 to z12 holds only SCL codes
+      where a continuous control blends 348,982 pixels, and the categorical
+      mask keeps 28,332 clear pixels the control drops.
 
 ### Wave 2
 
