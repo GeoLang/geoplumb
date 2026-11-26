@@ -31,6 +31,7 @@ use crate::elements::cog::{HttpRange, band_count, read_chunk};
 use crate::elements::reproject::{inverse_window, local_scale, warp_to_grid};
 use crate::engine::align_outward;
 use crate::error::{Error, Result};
+use crate::resample::resample_to_grid;
 use crate::window::{Bbox, GridSpec, TimeInterval, WindowReq};
 use futures::future::BoxFuture;
 use terrano_core::CogReader;
@@ -445,6 +446,7 @@ struct Inner {
     client: reqwest::blocking::Client,
     /// the anchor item's crs, which every pull comes back on
     crs: Crs,
+    base_resolution: f64,
     /// per-asset band counts of the anchor item's cogs, which every kept
     /// item shares
     asset_bands: Vec<u16>,
@@ -468,7 +470,6 @@ pub struct StacSrc {
     inner: Arc<Inner>,
     origin_x: f64,
     origin_y: f64,
-    base_resolution: f64,
     bands: u16,
     crs: Crs,
     value_kinds: BandKinds,
@@ -635,17 +636,12 @@ impl StacSrc {
             .iter()
             .map(|href| CogReader::open(HttpRange::new(href)))
             .collect::<core::result::Result<Vec<_>, _>>()?;
-        let meta = readers[0].meta().clone();
-        for (reader, asset) in readers.iter().zip(&search.assets) {
-            let res = reader.meta().pixel_width;
-            if res != meta.pixel_width {
-                return Err(Error::Source(format!(
-                    "asset {asset} has pixel size {res}, asset {} has {}: \
-                     assets on different resolutions cannot stack into one raster",
-                    search.assets[0], meta.pixel_width
-                )));
-            }
-        }
+        let finest = readers
+            .iter()
+            .map(|reader| reader.meta())
+            .min_by(|a, b| a.pixel_width.total_cmp(&b.pixel_width))
+            .cloned()
+            .expect("a search names at least one asset");
         let asset_bands = readers
             .iter()
             .map(band_count)
@@ -670,6 +666,7 @@ impl StacSrc {
             search: search.clone(),
             client,
             crs,
+            base_resolution: finest.pixel_width,
             asset_bands,
             asset_value_kinds,
             bands,
@@ -698,9 +695,8 @@ impl StacSrc {
         }
         Ok(StacSrc {
             inner: Arc::new(inner),
-            origin_x: meta.origin_x,
-            origin_y: meta.origin_y,
-            base_resolution: meta.pixel_width,
+            origin_x: finest.origin_x,
+            origin_y: finest.origin_y,
             bands,
             crs,
             value_kinds,
@@ -914,6 +910,9 @@ impl Inner {
         }
         let value_kinds = BandKinds::from(self.asset_value_kinds[k]);
         match &item.reprojection {
+            None if meta.pixel_width > self.base_resolution => {
+                read_resampled(reader, req, self.crs, &value_kinds)
+            }
             None => read_chunk(
                 reader,
                 req,
@@ -980,6 +979,34 @@ impl Inner {
         items.sort_by(|a, b| b.datetime.cmp(&a.datetime));
         Ok(items)
     }
+}
+
+fn read_resampled(
+    reader: &CogReader<HttpRange>,
+    req: &WindowReq,
+    crs: Crs,
+    value_kinds: &BandKinds,
+) -> Result<RasterChunk> {
+    let (origin_x, origin_y) = (reader.meta().origin_x, reader.meta().origin_y);
+    let level_resolution = reader.levels()[reader.select_level(req.resolution)].pixel_width;
+    let resolution = (req.resolution / level_resolution).round().max(1.0) * level_resolution;
+    let region = align_outward(
+        &req.bbox.expand(2.0 * resolution),
+        origin_x,
+        origin_y,
+        resolution,
+    );
+    let chunk = read_chunk(
+        reader,
+        &req.with_window(region, resolution),
+        origin_x,
+        origin_y,
+        crs,
+        value_kinds,
+    )?;
+    let cols = (req.bbox.width() / req.resolution).round() as usize;
+    let rows = (req.bbox.height() / req.resolution).round() as usize;
+    Ok(resample_to_grid(&chunk, &req.bbox, cols, rows, value_kinds))
 }
 
 /// one asset of an item whose crs is not the anchor's: read the region
@@ -1518,7 +1545,7 @@ impl Source for StacSrc {
             dtype: SetField::one(Dtype::F64),
             bands: SetField::one(self.bands),
             crs: SetField::one(self.crs),
-            resolution: ResRange::at_least(self.base_resolution),
+            resolution: ResRange::at_least(self.inner.base_resolution),
             chunk_px: SetField::Any,
             value_kinds: SetField::one(self.value_kinds.clone()),
         })))
@@ -1528,7 +1555,7 @@ impl Source for StacSrc {
         GridSpec {
             origin_x: self.origin_x,
             origin_y: self.origin_y,
-            base_resolution: self.base_resolution,
+            base_resolution: self.inner.base_resolution,
             chunk_px: 256,
         }
     }

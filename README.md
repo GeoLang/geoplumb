@@ -26,7 +26,7 @@ A served layer file can name these:
 
 Source behaviour:
 
-- `stac` searches items per pulled window and follows `next` links to the end of the results. The `composite` key picks how the items combine band by band: `latest` (the default, newest item first), `mean`, `median`, `min`, `max`, `percentile`, `stddev` or `count`. `mean`, `min`, `max`, `stddev` and `count` fold item by item, so peak memory is one batch of parallel item reads however many the search returns. `median` and `percentile` need every value at a pixel at once, so they read the window in horizontal strips under a fixed value budget. See `examples/stac_tiles.rs` for Copernicus DEM hillshade.
+- `stac` searches items per pulled window and follows `next` links to the end of the results. The `composite` key picks how the items combine band by band: `latest` (the default, newest item first), `mean`, `median`, `min`, `max`, `percentile`, `stddev` or `count`. `mean`, `min`, `max`, `stddev` and `count` fold item by item, so peak memory is one batch of parallel item reads however many the search returns. `median` and `percentile` need every value at a pixel at once, so they read the window in horizontal strips under a fixed value budget. The `assets` may differ in pixel size, like Sentinel-2's 10 m `red` and 20 m `scl`. The layer's grid is then the finest asset's, and each item's coarser assets are resampled onto it before the composite, nearest for a categorical asset and bilinear for a continuous one. See `examples/stac_tiles.rs` for Copernicus DEM hillshade.
 - `cog` fetches only the tiles a pull touches, from the file overview nearest the request, single- or multi-band.
 - `gdal` reads only the window a pull touches, from the file overview nearest the request, every band as f64. It refuses a rotated or sheared geotransform and a CRS without an EPSG code at startup. GDAL's own `AVERAGE` overviews count NaN as a value unless the file declares NaN as nodata.
 - `geojson` reads a feature collection whole at startup, then simplifies it per level and clips it to the pulled window.
@@ -97,7 +97,7 @@ curl -o dem.tif 'localhost:3000/export/dem?bbox=380000,5170000,400000,5190000&cr
 
 Endpoints are public, the same as the rest of the public tile path. Tagged releases publish `ghcr.io/geolang/geoplumb`.
 
-The `ndvi` layer in the example file is a Sentinel-2 median composite with no cloud masking, which is not what you would deploy. Add a `mask` op over the SCL band ahead of the `bandmath` and list `scl` among the search assets, as the `s2-red-clear` layer in the same file does.
+The `ndvi` layer in the example file masks clouds: it lists `scl` among the search assets as categorical and runs a `mask` op keeping SCL classes 4, 5 and 6 ahead of the `bandmath`, so a pixel of cloud, cloud shadow or snow in the newest item is transparent. Its composite is `latest`, since the layer file refuses `median` over a categorical asset. The mask runs after the composite, so a pixel cloudy in the newest item is not filled from an older one.
 
 ```toml
 # the smallest useful layer file: hillshade over a public collection

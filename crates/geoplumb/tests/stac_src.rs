@@ -824,50 +824,6 @@ async fn per_asset_cogs_stack_in_asset_order() {
     assert!(in_hole > 1000, "the window missed the red hole");
 }
 
-/// assets at different resolutions cannot stack, the open fails loud
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn assets_on_different_grids_fail_at_open() {
-    let (base, _mock) = start_mock_with(|base| {
-        let mut cogs = std::collections::HashMap::new();
-        cogs.insert("fine.tif".into(), cog(0, 300, 400, 0.0, false));
-        let coarse = {
-            let mut data = Vec::with_capacity(150 * 200);
-            for row in 0..200 {
-                for col in 0..150 {
-                    let lon = ORIGIN_X + col as f64 * 2.0 * CELL + CELL;
-                    let lat = ORIGIN_Y - row as f64 * 2.0 * CELL - CELL;
-                    data.push(elevation(lon, lat));
-                }
-            }
-            let raster = Raster::from_vec(150, 200, data, 2.0 * CELL, f64::NAN).unwrap();
-            let mut params = params(0);
-            params.pixel_width = 2.0 * CELL;
-            params.pixel_height = 2.0 * CELL;
-            let mut buf = std::io::Cursor::new(Vec::new());
-            write_cog(&raster, &params, &mut buf).unwrap();
-            buf.into_inner()
-        };
-        cogs.insert("coarse.tif".into(), coarse);
-        let features = vec![asset_item(
-            "mixed",
-            "2024-06-01T00:00:00Z",
-            &[
-                ("red", format!("{base}/cog/fine.tif")),
-                ("nir", format!("{base}/cog/coarse.tif")),
-            ],
-            [7.0, 46.6, 7.3, 47.0],
-            4326,
-        )];
-        (cogs, features)
-    })
-    .await;
-    let err = match open_assets(&base, &["red", "nir"]).await {
-        Ok(_) => panic!("mixed-resolution assets opened"),
-        Err(e) => e,
-    };
-    assert!(err.to_string().contains("different resolutions"), "{err}");
-}
-
 #[derive(Debug, PartialEq)]
 enum GatedCogEvent {
     NirRequested,
@@ -2645,4 +2601,161 @@ fn a_value_kind_for_no_asset_or_a_blended_categorical_asset_fails() {
         err.to_string().contains("median") && err.to_string().contains("scl"),
         "{err}"
     );
+}
+
+const COARSE_CELL: f64 = 2.0 * CELL;
+
+// a quarter cell keeps every pixel centre of a one, two or four cell pull off a coarse pixel edge
+const OFF_GRID: f64 = 0.25 * CELL;
+
+fn coarse_code(col: usize, row: usize) -> f64 {
+    // a four cell block is two by two coarse pixels, which share one code here
+    CLASS_CODES[(col / 2 + 3 * (row / 2)) % CLASS_CODES.len()]
+}
+
+fn grid_cog(
+    params: &CogParams,
+    cols: usize,
+    rows: usize,
+    value: impl Fn(usize, usize) -> f64,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(cols * rows);
+    for row in 0..rows {
+        for col in 0..cols {
+            data.push(value(col, row));
+        }
+    }
+    let raster = Raster::from_vec(cols, rows, data, params.pixel_width, f64::NAN).unwrap();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    write_cog(&raster, params, &mut buf).unwrap();
+    buf.into_inner()
+}
+
+async fn start_mixed_resolution_mock() -> (String, Arc<Mock>) {
+    start_mock_with(|base| {
+        let coarse = |origin_x: f64, origin_y: f64| CogParams {
+            origin_x,
+            origin_y,
+            pixel_width: COARSE_CELL,
+            pixel_height: COARSE_CELL,
+            ..class_params()
+        };
+        let (coarse_cols, coarse_rows) = (CLASS_COLS / 2, CLASS_ROWS / 2);
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert(
+            "red.tif".into(),
+            grid_cog(&class_params(), CLASS_COLS, CLASS_ROWS, |col, row| {
+                elevation(
+                    ORIGIN_X + (col as f64 + 0.5) * CELL,
+                    ORIGIN_Y - (row as f64 + 0.5) * CELL,
+                )
+            }),
+        );
+        cogs.insert(
+            "scl.tif".into(),
+            grid_cog(
+                &coarse(ORIGIN_X, ORIGIN_Y),
+                coarse_cols,
+                coarse_rows,
+                coarse_code,
+            ),
+        );
+        cogs.insert(
+            "scl_off_grid.tif".into(),
+            grid_cog(
+                &coarse(ORIGIN_X + OFF_GRID, ORIGIN_Y - OFF_GRID),
+                coarse_cols,
+                coarse_rows,
+                coarse_code,
+            ),
+        );
+        let features = vec![asset_item(
+            "mixed",
+            "2024-06-01T00:00:00Z",
+            &[
+                ("red", format!("{base}/cog/red.tif")),
+                ("scl", format!("{base}/cog/scl.tif")),
+                ("scl_off_grid", format!("{base}/cog/scl_off_grid.tif")),
+            ],
+            CLASS_BBOX,
+            4326,
+        )];
+        (cogs, features)
+    })
+    .await
+}
+
+fn class_window(resolution: f64) -> WindowReq {
+    WindowReq {
+        bbox: Bbox::new(CLASS_BBOX[0], CLASS_BBOX[1], CLASS_BBOX[2], CLASS_BBOX[3]),
+        resolution,
+        time: None,
+    }
+}
+
+async fn read_assets(base: &str, assets: &[&str], req: WindowReq) -> (StacSrc, RasterChunk) {
+    let mut search = StacSearch::new(base, "s2", assets[0], CLASS_BBOX);
+    search.assets = assets.iter().map(|asset| asset.to_string()).collect();
+    search.value_kinds = assets
+        .iter()
+        .filter(|asset| asset.starts_with("scl"))
+        .map(|asset| (asset.to_string(), ValueKind::Categorical))
+        .collect();
+    let src = open_search(search).await;
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    (src, chunk)
+}
+
+fn assert_coarse_codes(chunk: &RasterChunk, band: usize, origin_x: f64, origin_y: f64) {
+    each_pixel(chunk, |bi, x, y, got| {
+        if bi != band {
+            return;
+        }
+        let col = ((x - origin_x) / COARSE_CELL).floor() as usize;
+        let row = ((origin_y - y) / COARSE_CELL).floor() as usize;
+        assert_eq!(
+            got,
+            coarse_code(col, row),
+            "({x:.5},{y:.5}) pulled at {}",
+            chunk.resolution
+        );
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_coarser_categorical_asset_takes_the_code_of_its_pixel_under_each_fine_cell() {
+    let (base, _mock) = start_mixed_resolution_mock().await;
+    let req = class_window(CELL);
+    let (src, mixed) = read_assets(&base, &["red", "scl"], req).await;
+    assert_eq!(src.grid().base_resolution, CELL);
+    assert_coarse_codes(&mixed, 1, ORIGIN_X, ORIGIN_Y);
+
+    let (_, red_only) = read_assets(&base, &["red"], req).await;
+    assert_eq!(
+        bits(mixed.bands.band(0).unwrap().data()),
+        bits(red_only.bands.band(0).unwrap().data())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_coarser_categorical_asset_off_the_fine_grid_keeps_its_codes_at_every_resolution() {
+    let (base, _mock) = start_mixed_resolution_mock().await;
+    for resolution in [CELL, 2.0 * CELL, 4.0 * CELL] {
+        let req = class_window(resolution);
+        let (src, mixed) = read_assets(&base, &["scl_off_grid", "red"], req).await;
+        let grid = src.grid();
+        assert_eq!(
+            (grid.origin_x, grid.origin_y, grid.base_resolution),
+            (ORIGIN_X, ORIGIN_Y, CELL),
+            "the source grid is not the finest asset's"
+        );
+        assert_coarse_codes(&mixed, 0, ORIGIN_X + OFF_GRID, ORIGIN_Y - OFF_GRID);
+
+        let (_, red_only) = read_assets(&base, &["red"], req).await;
+        assert_eq!(
+            bits(mixed.bands.band(1).unwrap().data()),
+            bits(red_only.bands.band(0).unwrap().data()),
+            "red pulled at {resolution}"
+        );
+    }
 }

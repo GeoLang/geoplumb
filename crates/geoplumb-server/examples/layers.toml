@@ -18,14 +18,24 @@ kind = "hillshade"
 azimuth = 315.0
 altitude = 45.0
 
-# ndvi from two per-band cogs, median over whatever interval the request
-# asks for with ?t=, or over `datetime` when it asks for none.
+# cloud-masked ndvi from the newest item in whatever interval the request
+# asks for with ?t=, or in `datetime` when it asks for none. red and nir
+# are 10 m and scl is 20 m, so the layer is on the 10 m grid and each 10 m
+# cell takes the scl code of the 20 m pixel under it. the mask keeps scl
+# 4, 5 and 6, vegetation, bare ground and water, and everything else
+# renders transparent. scl is categorical, which rules out a median.
 [[layer]]
 name = "ndvi"
 source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "sentinel-2-l2a", assets = [
     "red",
     "nir",
-], bbox = [7.0, 46.3, 8.0, 46.9], datetime = "2025-06-01T00:00:00Z/2025-09-01T00:00:00Z", composite = "median" }
+    "scl",
+], bbox = [7.0, 46.3, 8.0, 46.9], datetime = "2025-06-01T00:00:00Z/2025-09-01T00:00:00Z", value_kind = { scl = "categorical" } }
+
+[[layer.op]]
+kind = "mask"
+band = 2
+valid_values = [4.0, 5.0, 6.0]
 
 [[layer.op]]
 kind = "bandmath"
@@ -63,7 +73,9 @@ altitude = 45.0
 # band 1 is the second asset, and a pixel of any other code renders
 # transparent. band 0, the red one, is what the png encodes. scl holds
 # class codes, so it is categorical: coarse tiles take the most common
-# code in a block instead of averaging codes into values no class has.
+# code in a block instead of averaging codes into values no class has,
+# and on red's 10 m grid each cell takes the code of the 20 m scl pixel
+# under it.
 [[layer]]
 name = "s2-red-clear"
 source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "sentinel-2-l2a", assets = [
