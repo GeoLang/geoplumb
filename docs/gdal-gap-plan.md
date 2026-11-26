@@ -332,7 +332,7 @@ only after a proof script passes on real input, recorded in
 
 ### Wave 2
 
-- [ ] 8.4 Export. tiletopia's `/api/v1/analysis/export/{op}` pulls three
+- [x] 8.4 Export. tiletopia's `/api/v1/analysis/export/{op}` pulls three
       fixed ops whole into memory as a web mercator COG under a 4096x4096
       cap. geoplumb gets `export::write_cog`: a grid in the node's own crs,
       streamed through terrano's `write_cog_tiles` one tile at a time, the
@@ -341,9 +341,12 @@ only after a proof script passes on real input, recorded in
       `GET /export/{layer}?bbox&crs&resolution&t`, bbox in the target crs as
       gdalwarp's `-te`, building an engine for the layer ending in that crs.
       tiletopia's export route then calls `export::write_cog` and its own
-      grid and encode code is deleted. Proof: an export in EPSG:32632 passes
-      GDAL's `validate_cloud_optimized_geotiff.py --full-check`, and its
-      pixels match the same window pulled from the engine.
+      grid and encode code is deleted, which is still open. The grid is
+      sized as gdalwarp sizes `-te` with `-tr`. Proof: ESA WorldCover exported
+      in EPSG:32632 at 20 m passes `validate_cloud_optimized_geotiff.py
+      --full-check`, holds only class codes at every level where a
+      continuous control blends 233597 pixels, and agrees with `gdalwarp -r
+      near` on 99.39% of base pixels.
 - [x] 8.5 Vector layers. A layer whose chain ends in vector features is
       served as `/tiles/{layer}/{z}/{x}/{y}.mvt` through jung-mvt, with the
       `rasterize` requirement on `geojson` and `gpkg` dropped for it.

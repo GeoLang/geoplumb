@@ -1,0 +1,161 @@
+use std::io::{Seek, Write};
+use std::sync::Arc;
+
+use terrano_core::{CogParams, SampleFormat, write_cog_tiles};
+
+use crate::caps::Caps;
+use crate::chunk::RasterChunk;
+use crate::engine::Engine;
+use crate::error::{Error, Result};
+use crate::graph::NodeId;
+use crate::resample::resample_to_grid;
+use crate::window::{Bbox, TimeInterval, WindowReq};
+
+pub const COG_TILE_PX: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExportGrid {
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub pixel_size: f64,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl ExportGrid {
+    pub fn bbox(&self) -> Bbox {
+        Bbox::new(
+            self.origin_x,
+            self.origin_y - self.rows as f64 * self.pixel_size,
+            self.origin_x + self.cols as f64 * self.pixel_size,
+            self.origin_y,
+        )
+    }
+
+    pub fn level(&self, level: usize) -> ExportGrid {
+        let factor = 1usize << level;
+        ExportGrid {
+            pixel_size: self.pixel_size * factor as f64,
+            cols: self.cols.div_ceil(factor),
+            rows: self.rows.div_ceil(factor),
+            ..*self
+        }
+    }
+
+    fn tile(&self, tile_col: usize, tile_row: usize) -> ExportGrid {
+        let first_col = tile_col * COG_TILE_PX;
+        let first_row = tile_row * COG_TILE_PX;
+        ExportGrid {
+            origin_x: self.origin_x + first_col as f64 * self.pixel_size,
+            origin_y: self.origin_y - first_row as f64 * self.pixel_size,
+            pixel_size: self.pixel_size,
+            cols: (self.cols - first_col).min(COG_TILE_PX),
+            rows: (self.rows - first_row).min(COG_TILE_PX),
+        }
+    }
+}
+
+const MAX_OVERVIEW_LEVELS: f64 = 5.0;
+
+pub fn overview_levels(cols: usize, rows: usize) -> u32 {
+    let max_side = cols.max(rows) as f64;
+    (max_side / COG_TILE_PX as f64)
+        .log2()
+        .ceil()
+        .clamp(0.0, MAX_OVERVIEW_LEVELS) as u32
+}
+
+pub async fn write_cog<W: Write + Seek + Send + 'static>(
+    engine: Arc<Engine>,
+    node: NodeId,
+    grid: ExportGrid,
+    time: Option<TimeInterval>,
+    mut writer: W,
+) -> Result<W> {
+    let Caps::Raster(caps) = engine.caps(node) else {
+        return Err(Error::Kind("raster"));
+    };
+    let epsg = u16::try_from(caps.crs.0).map_err(|_| {
+        terrano_core::Error::InvalidInput(format!(
+            "{} does not fit the 16 bit epsg key of a geotiff",
+            caps.crs
+        ))
+    })?;
+    let bands = usize::from(caps.bands);
+    let value_kind = caps.value_kind;
+    let params = CogParams {
+        tile_width: COG_TILE_PX as u32,
+        tile_height: COG_TILE_PX as u32,
+        overview_levels: overview_levels(grid.cols, grid.rows),
+        epsg,
+        origin_x: grid.origin_x,
+        origin_y: grid.origin_y,
+        pixel_width: grid.pixel_size,
+        pixel_height: grid.pixel_size,
+        deflate: true,
+        format: SampleFormat::F64,
+        nodata: None,
+    };
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || -> Result<W> {
+        let mut failed_pull = None;
+        let written = write_cog_tiles(
+            grid.cols,
+            grid.rows,
+            bands,
+            &params,
+            |level, tile_col, tile_row| {
+                let tile = grid.level(level).tile(tile_col, tile_row);
+                let bbox = tile.bbox();
+                let request = WindowReq {
+                    bbox,
+                    resolution: tile.pixel_size,
+                    time,
+                };
+                let exact = runtime
+                    .block_on(engine.pull(node, request))
+                    .and_then(|chunk| {
+                        let raster = chunk.raster()?;
+                        Ok(resample_to_grid(
+                            raster, &bbox, tile.cols, tile.rows, value_kind,
+                        ))
+                    });
+                match exact {
+                    Ok(exact) => Ok(padded_tile_samples(&exact)),
+                    Err(error) => {
+                        let message = error.to_string();
+                        failed_pull = Some(error);
+                        Err(terrano_core::Error::InvalidInput(message))
+                    }
+                }
+            },
+            &mut writer,
+        );
+        if let Some(error) = failed_pull {
+            return Err(error);
+        }
+        written?;
+        Ok(writer)
+    })
+    .await
+    .expect("cog export task panicked")
+}
+
+fn padded_tile_samples(exact: &RasterChunk) -> Vec<u8> {
+    let bands = exact.bands.bands();
+    let sample_bytes = SampleFormat::F64.bytes() as usize;
+    let mut samples = Vec::with_capacity(COG_TILE_PX * COG_TILE_PX * bands.len() * sample_bytes);
+    for row in 0..COG_TILE_PX {
+        for col in 0..COG_TILE_PX {
+            for band in bands {
+                // terrano pads float cogs that declare no nodata with nan past the image edge
+                let value = band
+                    .get(row, col)
+                    .filter(|value| !band.is_nodata(*value))
+                    .unwrap_or(f64::NAN);
+                SampleFormat::F64.encode(value, &mut samples);
+            }
+        }
+    }
+    samples
+}

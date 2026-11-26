@@ -23,6 +23,7 @@ use topoi_core::{
 
 pub struct Reproject {
     to: Crs,
+    output_anchor: Option<GridAnchor>,
     configured: Option<ConfiguredReprojection>,
 }
 
@@ -77,11 +78,30 @@ fn reproject_constraint(crs: SetField<Crs>) -> Constraint {
     ])
 }
 
+#[derive(Clone, Copy)]
+struct GridAnchor {
+    origin_x: f64,
+    origin_y: f64,
+    base_resolution: f64,
+}
+
 impl Reproject {
     pub fn new(to: Crs) -> Self {
         Reproject {
             to,
+            output_anchor: None,
             configured: None,
+        }
+    }
+
+    pub fn onto_grid(to: Crs, origin_x: f64, origin_y: f64, base_resolution: f64) -> Self {
+        Reproject {
+            output_anchor: Some(GridAnchor {
+                origin_x,
+                origin_y,
+                base_resolution,
+            }),
+            ..Reproject::new(to)
         }
     }
 
@@ -226,7 +246,13 @@ fn canonical_origin(crs: Crs, projected_input_origin: (f64, f64)) -> (f64, f64) 
 
 impl Transform for Reproject {
     fn identity(&self) -> String {
-        format!("Reproject to={}", self.to)
+        match self.output_anchor {
+            None => format!("Reproject to={}", self.to),
+            Some(anchor) => format!(
+                "Reproject to={} grid={},{},{}",
+                self.to, anchor.origin_x, anchor.origin_y, anchor.base_resolution
+            ),
+        }
     }
 
     fn constraint(&self) -> Constraint {
@@ -260,6 +286,14 @@ impl Transform for Reproject {
     }
 
     fn output_grid(&self, input: &GridSpec) -> GridSpec {
+        if let Some(anchor) = self.output_anchor {
+            return GridSpec {
+                origin_x: anchor.origin_x,
+                origin_y: anchor.origin_y,
+                base_resolution: anchor.base_resolution,
+                chunk_px: input.chunk_px,
+            };
+        }
         let configured = self.configured();
         // a vector base resolution is a segment length and can be degrees
         // wide, so a thousand-cell probe walks off the projection's domain

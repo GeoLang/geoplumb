@@ -587,6 +587,7 @@ dependencies = [
  "axum",
  "copc-core",
  "copc-writer",
+ "futures",
  "geoplumb",
  "jung-mvt",
  "nubis-core",

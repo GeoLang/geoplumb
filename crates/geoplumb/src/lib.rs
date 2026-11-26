@@ -13,6 +13,7 @@ pub mod elements;
 pub mod encode;
 pub mod engine;
 pub mod error;
+pub mod export;
 #[cfg(feature = "wgpu")]
 pub mod gpu;
 pub mod graph;

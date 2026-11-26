@@ -16,6 +16,8 @@ projicio-core.workspace = true
 jung-mvt.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = [
+    "fs",
+    "io-util",
     "macros",
     "net",
     "rt-multi-thread",
@@ -29,6 +31,8 @@ reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "rustls-tls",
 ] }
+futures = "0.3"
+tempfile = "3"
 
 [features]
 gdal = ["geoplumb/gdal"]
@@ -38,7 +42,6 @@ nubis-core.workspace = true
 tokio = { version = "1", features = ["test-util"] }
 png = "0.17"
 rusqlite = { version = "0.39", features = ["bundled"] }
-tempfile = "3"
 copc-writer = "0.9"
 copc-core = "0.9"
 tower = { version = "0.5", features = ["util"] }

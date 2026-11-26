@@ -26,7 +26,7 @@ async fn run() -> Result<(), String> {
     // opening sources is blocking: a stac layer searches its anchor bbox
     // and a cog layer reads a file header
     let layers =
-        tokio::task::spawn_blocking(move || Layer::build_all(&config, budget, disk.as_deref()))
+        tokio::task::spawn_blocking(move || Layer::build_all(config, budget, disk.as_deref()))
             .await
             .expect("layer build panicked")?;
 

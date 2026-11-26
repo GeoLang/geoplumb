@@ -12,6 +12,7 @@
 #![recursion_limit = "256"]
 
 pub mod config;
+mod export;
 mod mvt;
 mod zonal;
 
@@ -56,6 +57,9 @@ pub struct Layer {
     node: NodeId,
     output: LayerOutput,
     info: LayerInfo,
+    config: LayerConfig,
+    chain_crs: Crs,
+    budget_bytes: usize,
 }
 
 enum LayerOutput {
@@ -88,27 +92,27 @@ impl Layer {
     /// stac layer searches its anchor bbox and a cog layer reads a file
     /// header, so callers under a runtime want `spawn_blocking`
     pub fn build_all(
-        config: &Config,
+        config: Config,
         budget_bytes: usize,
         disk: Option<&Path>,
     ) -> Result<Vec<Layer>, String> {
         config
             .layers
-            .iter()
+            .into_iter()
             .map(|layer| {
-                Layer::build(layer, budget_bytes, disk)
-                    .map_err(|e| format!("layer {}: {e}", layer.name))
+                let name = layer.name.clone();
+                Layer::build(layer, budget_bytes, disk).map_err(|e| format!("layer {name}: {e}"))
             })
             .collect()
     }
 
-    fn build(cfg: &LayerConfig, budget_bytes: usize, disk: Option<&Path>) -> Result<Layer, String> {
+    fn build(cfg: LayerConfig, budget_bytes: usize, disk: Option<&Path>) -> Result<Layer, String> {
         let LayerGraph {
             mut graph,
-            node,
+            node: chain_tip,
             info,
-        } = build_layer_graph(cfg)?;
-        let node = graph.add_transform(node, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
+        } = build_layer_graph(&cfg)?;
+        let node = graph.add_transform(chain_tip, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
         let engine = match disk {
             None => Engine::new(graph, budget_bytes),
             Some(dir) => {
@@ -130,11 +134,15 @@ impl Layer {
                 unreachable!("a reproject outputs raster or vector caps")
             }
         };
+        let chain_crs = engine.caps(chain_tip).crs();
         Ok(Layer {
             engine,
             node,
             output,
             info,
+            config: cfg,
+            chain_crs,
+            budget_bytes,
         })
     }
 
@@ -501,17 +509,19 @@ pub fn parse_time(t: Option<&str>) -> Result<Option<TimeInterval>, String> {
     })
 }
 
-/// what every handler shares: the built layers, and the reduction slots the
-/// zonal endpoints take one of each
+/// what every handler shares: the built layers, the reduction slots the
+/// zonal endpoints take one of each, and the export slots
 struct ServerState {
     layers: Vec<Layer>,
     reductions: Arc<Semaphore>,
+    exports: Arc<Semaphore>,
 }
 
 pub fn router(layers: Vec<Layer>) -> Router {
     let state = Arc::new(ServerState {
         layers,
         reductions: Arc::new(Semaphore::new(zonal::MAX_CONCURRENT_REDUCTIONS)),
+        exports: Arc::new(Semaphore::new(export::MAX_CONCURRENT_EXPORTS)),
     });
     Router::new()
         .route("/health", get(health))
@@ -519,6 +529,7 @@ pub fn router(layers: Vec<Layer>) -> Router {
         .route("/tiles/{layer}/{z}/{x}/{y}", get(tile))
         .route("/zonal/{layer}", post(zonal::statistics))
         .route("/zonal/{layer}/series", post(zonal::series))
+        .route("/export/{layer}", get(export::cog))
         .with_state(state)
 }
 

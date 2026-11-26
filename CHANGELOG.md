@@ -14,6 +14,9 @@
 - `Reproject` takes vector links as well as raster ones, and `VecReproject` is gone. Its constraint is the new `Constraint::AnyOf`, a union of one `Derived` per kind, and `configure` picks the raster warp or the vector vertex projection from the fixated caps. One `Reproject::adapter()` bridges crs on links of either kind. Its `identity()` is `Reproject to=<crs>` for both kinds, so a raster layer's disk cache keeps its directory. From a geographic crs to EPSG:3857 vector fragments are clipped to EPSG:3857's latitude band, ±85.0511287798, before projecting, since projicio refuses the poles and a z0 pull reads lon/lat windows past -90
 - every server layer ends in `Reproject` to web mercator, and the engine's caps on it say whether the layer is raster or vector
 - jung-mvt is a git dependency on jung master
+- `export::write_cog` writes a raster node over an `ExportGrid` in the node's crs as a deflate f64 COG through terrano's `write_cog_tiles`, one 512 px tile in memory at a time, each tile of each level pulled from the engine at that level's resolution and resampled by value kind, so overviews are not averaged. `export::overview_levels` holds the overview count rule tiletopia's export used
+- `GET /export/{layer}?bbox=minx,miny,maxx,maxy&crs=EPSG:<code>&resolution=<units>&t=<interval>` on `geoplumb-server` streams that COG in any crs projicio knows, bbox and resolution in that crs. It builds an engine per request ending in the new `Reproject::onto_grid` on the export grid, refuses a bad bbox, crs or resolution and anything past 16384 x 16384 values with 400, runs two at a time with 503 for a third, and answers 504 after four minutes
+- `Layer::build_all` takes the `Config` by value, each `Layer` keeping its `LayerConfig` and cache budget to build export engines from
 
 ## 2026-11-04
 

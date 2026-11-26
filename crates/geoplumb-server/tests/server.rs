@@ -283,7 +283,7 @@ altitude = 45.0
 
 fn app(text: &str) -> Router {
     let config = Config::parse(text).expect("the layer file must parse");
-    let layers = Layer::build_all(&config, 64 << 20, None).expect("the layers must build");
+    let layers = Layer::build_all(config, 64 << 20, None).expect("the layers must build");
     router(layers)
 }
 
@@ -2435,7 +2435,7 @@ fn a_vector_layer_takes_no_gray_and_a_burned_one_still_needs_one() {
     let dir = tempfile::tempdir().unwrap();
     let vector = vector_layer_file(dir.path());
     let config = Config::parse(&vector).expect("a vector layer needs no gray");
-    Layer::build_all(&config, 64 << 20, None).expect("a vector layer builds without gray");
+    Layer::build_all(config, 64 << 20, None).expect("a vector layer builds without gray");
 
     let with_gray = vector.replacen(
         "name = \"parcel-features\"",
@@ -2443,7 +2443,7 @@ fn a_vector_layer_takes_no_gray_and_a_burned_one_still_needs_one() {
         1,
     );
     let config = Config::parse(&with_gray).unwrap();
-    let error = match Layer::build_all(&config, 64 << 20, None) {
+    let error = match Layer::build_all(config, 64 << 20, None) {
         Ok(_) => panic!("a vector layer took a gray range"),
         Err(error) => error,
     };

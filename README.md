@@ -68,10 +68,17 @@ curl localhost:3000/layers
 | `GET /tiles/{layer}/{z}/{x}/{y}.mvt` | a vector layer's features as a Mapbox Vector Tile, one MVT layer named after the layer |
 | `POST /zonal/{layer}` | count, sum, min, max and mean per zone, raster layers only |
 | `POST /zonal/{layer}/series` | the same per time step |
+| `GET /export/{layer}?bbox=&crs=&resolution=` | a cloud optimized GeoTIFF of the layer over that window, every band as f64 |
 | `GET /layers` | each layer's `kind` (`raster` or `vector`), source kind, collection, default datetime and temporal extent |
 | `GET /health` | `{"status":"ok"}` |
 
 A raster layer answers `.mvt` with 400, and a vector layer answers PNG and `.tif` with 400. An MVT tile holds the features in the tile plus a 64 unit buffer of its 4096 extent, and a feature the engine's chunk seams cut apart comes back as one MVT feature. The MVT id is the feature's position among a geojson file's features that have a geometry, counting from 0, or its primary key in a gpkg table. A geometry collection goes out as one MVT feature per geometry type, all with the same id. Null properties are left out, and arrays and objects go out as JSON text. Tiles take `?t=2024-06-01T00:00:00Z/2024-07-01T00:00:00Z` to render at that interval instead of the source's own `datetime`. A zonal body is a GeoJSON FeatureCollection of zones in lon/lat plus `resolution` (web mercator metres) and optional `bbox` and `t`. A series body takes `steps`, a list of intervals, in place of `t`. Four reductions run at once, a fifth is refused with 503, and one that takes over four minutes answers 504.
+
+An export takes `bbox` and `resolution` in the units of `crs`, like gdalwarp's `-te` and `-tr`, and `crs` as `EPSG:<code>`, with no default. The grid starts at the bbox's west and north edges, and its pixel counts are the bbox's width and height over `resolution`, rounded and at least one, as gdalwarp counts them. Overviews are pulled at their own resolution, not averaged, so a categorical layer keeps its codes at every level. NaN marks nodata. `t` works as on tiles. Two exports run at once, a third is refused with 503, one over four minutes answers 504, and one past 16384 x 16384 values (counted over whole 512 px tiles and every band) is refused with 400.
+
+```sh
+curl -o dem.tif 'localhost:3000/export/dem?bbox=380000,5170000,400000,5190000&crs=EPSG:32632&resolution=20'
+```
 
 | Variable | Default | Sets |
 |---|---|---|
