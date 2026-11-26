@@ -357,7 +357,7 @@ only after a proof script passes on real input, recorded in
       served Natural Earth tiles at z0, z2 and z5, every required country is
       present, a `vec_filter` lets only its continent through, `mvt_id` is the
       source index and every polygon winds exterior positive, holes negative.
-- [ ] 8.6 Raster to vector elements. `Contours` and `Polygonize` over
+- [x] 8.6 Raster to vector elements. `Contours` and `Polygonize` over
       terrano's kernels as cross-kind transforms, seam-consistent across
       tiles, servable through 8.5. `Viewshed` as a transform whose plan is
       the observer's radius, not the output window. terrano's `contours`
@@ -376,9 +376,13 @@ only after a proof script passes on real input, recorded in
       and a symmetric difference under 1e-5 cells. That needed terrano's
       pinch turn fixed (7ed5e85), topoi's union made OGC-valid on an i64
       grid with a hole re-binding that stands in for iOverlay#104 (4d791e9),
-      and `dissolve` unioning each id in one call. `Viewshed` still needs a
-      proof on real input. Left
-      open: tiles wholly outside a viewshed's disc still pull the whole
+      and `dissolve` unioning each id in one call. `Viewshed` is proven: a
+      10 km disc on Copernicus GLO-30 warped to UTM 32N at 30 m, exported
+      through `/export`, equals its four quadrant exports bit for bit and
+      agrees with `gdal_viewshed -cc 0` on 99.4% of the cells inside the
+      disc, the rest split both ways between the two line of sight
+      methods. GDAL-written LZW COGs fail to open in `CogSrc`, so the proof
+      writes the DEM with deflate. Left open: tiles wholly outside a viewshed's disc still pull the whole
       disc, and `align_outward`'s 1e-9 cell tolerance is below the rounding
       of web mercator coordinates near the antimeridian at resolutions
       under about 2 m.
