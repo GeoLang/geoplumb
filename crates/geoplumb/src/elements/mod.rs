@@ -37,7 +37,7 @@ pub use points::{IdwGrid, LasSrc};
 pub use raster_vector::{Contours, Polygonize};
 pub use reproject::Reproject;
 pub use source::RasterSrc;
-pub use stac::{Composite, StacSearch, StacSrc};
+pub use stac::{Composite, ItemMask, StacSearch, StacSrc};
 pub use tensor::{TensorConv, ToRaster, ToTensor};
 pub use vec_ops::{VecClip, VecFilter, VecSchema};
 pub use vector::{Burn, Rasterize, VecSrc};

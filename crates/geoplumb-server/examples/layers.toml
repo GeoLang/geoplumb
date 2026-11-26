@@ -18,24 +18,20 @@ kind = "hillshade"
 azimuth = 315.0
 altitude = 45.0
 
-# cloud-masked ndvi from the newest item in whatever interval the request
-# asks for with ?t=, or in `datetime` when it asks for none. red and nir
-# are 10 m and scl is 20 m, so the layer is on the 10 m grid and each 10 m
-# cell takes the scl code of the 20 m pixel under it. the mask keeps scl
-# 4, 5 and 6, vegetation, bare ground and water, and everything else
-# renders transparent. scl is categorical, which rules out a median.
+# cloud-free ndvi, the median of every item in whatever interval the
+# request asks for with ?t=, or in `datetime` when it asks for none. each
+# item's red and nir count only where that item's scl is 4, 5 or 6,
+# vegetation, bare ground and water, so a pixel cloudy in one item takes
+# the median of the others, and a pixel no item sees clear renders
+# transparent. scl is 20 m against 10 m red and nir, so each 10 m cell takes
+# the code of the 20 m scl pixel under it. scl is not a band of the layer,
+# so b0 is red and b1 is nir.
 [[layer]]
 name = "ndvi"
 source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "sentinel-2-l2a", assets = [
     "red",
     "nir",
-    "scl",
-], bbox = [7.0, 46.3, 8.0, 46.9], datetime = "2025-06-01T00:00:00Z/2025-09-01T00:00:00Z", value_kind = { scl = "categorical" } }
-
-[[layer.op]]
-kind = "mask"
-band = 2
-valid_values = [4.0, 5.0, 6.0]
+], bbox = [7.0, 46.3, 8.0, 46.9], datetime = "2025-06-01T00:00:00Z/2025-09-01T00:00:00Z", composite = "median", item_mask = { asset = "scl", valid_values = [4.0, 5.0, 6.0] } }
 
 [[layer.op]]
 kind = "bandmath"

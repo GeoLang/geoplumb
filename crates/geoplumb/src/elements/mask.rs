@@ -25,6 +25,38 @@ impl QualityMask {
     }
 }
 
+pub(crate) fn mask_by_quality(
+    bands: &[Raster],
+    quality: &Raster,
+    valid_values: &[f64],
+    resolution: f64,
+) -> Vec<Raster> {
+    let keep: Vec<bool> = quality
+        .data()
+        .iter()
+        .map(|v| !quality.is_nodata(*v) && valid_values.contains(v))
+        .collect();
+    bands
+        .iter()
+        .map(|band| {
+            let data: Vec<f64> = band
+                .data()
+                .iter()
+                .zip(&keep)
+                .map(|(v, keep)| {
+                    if *keep && !band.is_nodata(*v) {
+                        *v
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect();
+            Raster::from_vec(band.width(), band.height(), data, resolution, f64::NAN)
+                .expect("mask dims")
+        })
+        .collect()
+}
+
 impl Transform for QualityMask {
     fn identity(&self) -> String {
         format!(
@@ -48,32 +80,12 @@ impl Transform for QualityMask {
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let input = input.raster()?.crop_to(&out.bbox);
         let quality = input.bands.band(self.band).expect("negotiated bands");
-        let keep: Vec<bool> = quality
-            .data()
-            .iter()
-            .map(|v| !quality.is_nodata(*v) && self.valid_values.contains(v))
-            .collect();
-        let (cols, rows) = (input.width(), input.height());
-        let bands: Vec<Raster> = input
-            .bands
-            .bands()
-            .iter()
-            .map(|band| {
-                let data: Vec<f64> = band
-                    .data()
-                    .iter()
-                    .zip(&keep)
-                    .map(|(v, keep)| {
-                        if *keep && !band.is_nodata(*v) {
-                            *v
-                        } else {
-                            f64::NAN
-                        }
-                    })
-                    .collect();
-                Raster::from_vec(cols, rows, data, input.resolution, f64::NAN).expect("mask dims")
-            })
-            .collect();
+        let bands = mask_by_quality(
+            input.bands.bands(),
+            quality,
+            &self.valid_values,
+            input.resolution,
+        );
         Ok(Chunk::Raster(RasterChunk {
             bands: BandedRaster::new(bands).map_err(Error::Terrano)?,
             bbox: input.bbox,

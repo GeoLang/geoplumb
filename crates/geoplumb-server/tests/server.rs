@@ -959,6 +959,30 @@ fn the_shipped_example_layer_file_parses() {
 }
 
 #[test]
+fn the_example_ndvi_layer_takes_a_median_under_an_item_mask() {
+    let config = Config::parse(include_str!("../examples/layers.toml")).unwrap();
+    let ndvi = config
+        .layers
+        .iter()
+        .find(|layer| layer.name == "ndvi")
+        .expect("an ndvi layer");
+    let search = source_of(ndvi).stac_search().expect("a stac source");
+    assert_eq!(search.assets, ["red", "nir"]);
+    assert_eq!(search.composite, geoplumb::elements::Composite::Median);
+    assert_eq!(
+        search.item_mask,
+        Some(geoplumb::elements::ItemMask {
+            asset: "scl".into(),
+            valid_values: vec![4.0, 5.0, 6.0],
+        })
+    );
+    assert_eq!(
+        search.asset_value_kinds().unwrap(),
+        [ValueKind::Continuous, ValueKind::Continuous]
+    );
+}
+
+#[test]
 fn a_unary_op_takes_its_constant_where_it_has_one() {
     let text = r#"
 [[layer]]

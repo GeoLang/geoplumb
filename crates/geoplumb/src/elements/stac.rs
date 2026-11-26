@@ -28,6 +28,7 @@ use crate::caps::{
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
 use crate::elements::cog::{HttpRange, band_count, read_chunk};
+use crate::elements::mask::mask_by_quality;
 use crate::elements::reproject::{inverse_window, local_scale, warp_to_grid};
 use crate::engine::align_outward;
 use crate::error::{Error, Result};
@@ -261,6 +262,12 @@ impl Composite {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ItemMask {
+    pub asset: String,
+    pub valid_values: Vec<f64>,
+}
+
 #[derive(Clone)]
 pub struct StacSearch {
     /// stac api root, e.g. `https://earth-search.aws.element84.com/v1`
@@ -281,6 +288,7 @@ pub struct StacSearch {
     /// what a pull does with the items covering one window
     pub composite: Composite,
     pub value_kinds: BTreeMap<String, ValueKind>,
+    pub item_mask: Option<ItemMask>,
 }
 
 impl StacSearch {
@@ -294,7 +302,16 @@ impl StacSearch {
             limit: 100,
             composite: Composite::default(),
             value_kinds: BTreeMap::new(),
+            item_mask: None,
         }
+    }
+
+    fn item_assets(&self) -> Vec<String> {
+        self.assets
+            .iter()
+            .chain(self.item_mask.iter().map(|mask| &mask.asset))
+            .cloned()
+            .collect()
     }
 
     pub fn asset_value_kinds(&self) -> Result<Vec<ValueKind>> {
@@ -447,11 +464,8 @@ struct Inner {
     /// the anchor item's crs, which every pull comes back on
     crs: Crs,
     base_resolution: f64,
-    /// per-asset band counts of the anchor item's cogs, which every kept
-    /// item shares
     asset_bands: Vec<u16>,
     asset_value_kinds: Vec<ValueKind>,
-    /// their sum, the band count a pull produces
     bands: u16,
     /// lon/lat to the anchor crs for item footprints, `None` when it is 4326
     to_native: Option<projicio_core::Transform>,
@@ -506,6 +520,7 @@ fn search_page(
         url.push_str(&format!("&datetime={dt}"));
     }
 
+    let item_assets = search.item_assets();
     let mut found = Vec::new();
     let mut seen = 0usize;
     loop {
@@ -529,7 +544,7 @@ fn search_page(
             )));
         }
         for f in features {
-            if let Some(item) = parse_found(f, &search.assets) {
+            if let Some(item) = parse_found(f, &item_assets) {
                 found.push(item);
             }
         }
@@ -606,7 +621,7 @@ impl StacSrc {
         if found.is_empty() {
             return Err(Error::Source(format!(
                 "stac search matched no items with assets {:?}",
-                search.assets
+                search.item_assets()
             )));
         }
         // most recent first, so it anchors crs and grid
@@ -636,7 +651,8 @@ impl StacSrc {
             .iter()
             .map(|href| CogReader::open(HttpRange::new(href)))
             .collect::<core::result::Result<Vec<_>, _>>()?;
-        let finest = readers
+        let output_assets = search.assets.len();
+        let finest = readers[..output_assets]
             .iter()
             .map(|reader| reader.meta())
             .min_by(|a, b| a.pixel_width.total_cmp(&b.pixel_width))
@@ -646,11 +662,19 @@ impl StacSrc {
             .iter()
             .map(band_count)
             .collect::<Result<Vec<u16>>>()?;
-        let bands = asset_bands.iter().sum();
+        if let Some(mask) = &search.item_mask
+            && asset_bands[output_assets] != 1
+        {
+            return Err(Error::Source(format!(
+                "item_mask asset {} has {} bands, a mask reads one",
+                mask.asset, asset_bands[output_assets]
+            )));
+        }
+        let bands = asset_bands[..output_assets].iter().sum();
         let value_kinds = BandKinds::per_band(
             asset_value_kinds
                 .iter()
-                .zip(&asset_bands)
+                .zip(&asset_bands[..output_assets])
                 .flat_map(|(kind, asset_band_count)| {
                     let served = search
                         .composite
@@ -668,7 +692,10 @@ impl StacSrc {
             crs,
             base_resolution: finest.pixel_width,
             asset_bands,
-            asset_value_kinds,
+            asset_value_kinds: asset_value_kinds
+                .into_iter()
+                .chain(search.item_mask.iter().map(|_| ValueKind::Categorical))
+                .collect(),
             bands,
             to_native,
             to_lonlat,
@@ -1083,11 +1110,33 @@ async fn read_item(
             crate::engine::offload(move || inner.read_asset(&item, k, &req, &scale_window)).await
         }
     });
-    let chunks = futures::future::try_join_all(reads).await?;
-    let bands = chunks
-        .into_iter()
-        .flat_map(|chunk| chunk.bands.into_bands())
-        .collect();
+    let mut chunks = futures::future::try_join_all(reads).await?;
+    let bands: Vec<terrano_core::Raster> = match inner.search.item_mask.clone() {
+        None => chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.bands.into_bands())
+            .collect(),
+        Some(item_mask) => {
+            let resolution = req.resolution;
+            crate::engine::offload(move || {
+                let quality = chunks.pop().expect("the item mask asset is read last");
+                let bands: Vec<_> = chunks
+                    .into_iter()
+                    .flat_map(|chunk| chunk.bands.into_bands())
+                    .collect();
+                mask_by_quality(
+                    &bands,
+                    quality
+                        .bands
+                        .band(0)
+                        .expect("open checks the mask has one band"),
+                    &item_mask.valid_values,
+                    resolution,
+                )
+            })
+            .await
+        }
+    };
     Ok(RasterChunk {
         bands: terrano_core::BandedRaster::new(bands).map_err(Error::Terrano)?,
         bbox: req.bbox,
@@ -1527,7 +1576,7 @@ impl Source for StacSrc {
         // there is to name
         let search = &self.inner.search;
         format!(
-            "StacSrc api={:?} collection={:?} assets={:?} bbox={:?} datetime={:?} composite={:?} value_kinds={:?} crs={} bands={}",
+            "StacSrc api={:?} collection={:?} assets={:?} bbox={:?} datetime={:?} composite={:?} value_kinds={:?} item_mask={:?} crs={} bands={}",
             search.api,
             search.collection,
             search.assets,
@@ -1535,6 +1584,7 @@ impl Source for StacSrc {
             search.datetime,
             search.composite,
             search.value_kinds,
+            search.item_mask,
             self.crs,
             self.bands
         )

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use geoplumb::TimeInterval;
 use geoplumb::caps::ValueKind;
-use geoplumb::elements::{Burn, Composite, FocalOp, StacSearch};
+use geoplumb::elements::{Burn, Composite, FocalOp, ItemMask, StacSearch};
 use serde::Deserialize;
 use serde_json::Value;
 use terrano_core::{BinaryOp, UnaryOp};
@@ -117,6 +117,7 @@ pub enum SourceConfig {
         composite: Option<CompositeConfig>,
         #[serde(default)]
         value_kind: AssetValueKindsConfig,
+        item_mask: Option<ItemMaskConfig>,
     },
     Cog {
         path: PathBuf,
@@ -196,6 +197,13 @@ impl Default for AssetValueKindsConfig {
     fn default() -> Self {
         AssetValueKindsConfig::EveryAsset(ValueKindConfig::Continuous)
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemMaskConfig {
+    pub asset: String,
+    pub valid_values: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -681,11 +689,16 @@ impl SourceConfig {
                 datetime,
                 composite,
                 value_kind,
+                item_mask,
             } => {
                 let mut search = StacSearch::new(api, collection, &assets[0], *bbox);
                 search.assets = assets.clone();
                 search.datetime = datetime.clone();
                 search.composite = composite.map(Composite::from).unwrap_or_default();
+                search.item_mask = item_mask.as_ref().map(|mask| ItemMask {
+                    asset: mask.asset.clone(),
+                    valid_values: mask.valid_values.clone(),
+                });
                 search.value_kinds = match value_kind {
                     AssetValueKindsConfig::EveryAsset(kind) => assets
                         .iter()

@@ -14,7 +14,7 @@ use axum::routing::get;
 use geoplumb::caps::{BandKinds, ValueKind};
 use geoplumb::element::Source;
 use geoplumb::elements::{
-    Composite, StacSearch, StacSrc,
+    Composite, ItemMask, StacSearch, StacSrc,
     stac::{STACK_VALUE_BUDGET, s3_to_https},
 };
 use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, TimeInterval, WindowReq};
@@ -2758,4 +2758,222 @@ async fn a_coarser_categorical_asset_off_the_fine_grid_keeps_its_codes_at_every_
             "red pulled at {resolution}"
         );
     }
+}
+
+const MASKED_COLS: usize = 70;
+const MASKED_ROWS: usize = 40;
+const MASKED_BBOX: [f64; 4] = [
+    ORIGIN_X,
+    ORIGIN_Y - MASKED_ROWS as f64 * CELL,
+    ORIGIN_X + MASKED_COLS as f64 * CELL,
+    ORIGIN_Y,
+];
+const CLEAR_CODE: f64 = 4.0;
+const CLOUD_CODE: f64 = 9.0;
+// cloud values sit far above every item's shifted scene values
+const CLOUD_VALUE: f64 = 9000.0;
+
+struct MaskedItem {
+    id: &'static str,
+    datetime: &'static str,
+    shift: f64,
+    clouded_spans: &'static [(usize, usize)],
+}
+
+// newest first, cloud edges on even columns, which are coarse pixel edges too
+static MASKED_ITEMS: [MaskedItem; 3] = [
+    MaskedItem {
+        id: "newest",
+        datetime: "2024-06-03T00:00:00Z",
+        shift: 0.0,
+        clouded_spans: &[(0, 30)],
+    },
+    MaskedItem {
+        id: "middle",
+        datetime: "2024-06-02T00:00:00Z",
+        shift: 100.0,
+        clouded_spans: &[(20, 50)],
+    },
+    MaskedItem {
+        id: "oldest",
+        datetime: "2024-06-01T00:00:00Z",
+        shift: 1000.0,
+        clouded_spans: &[(20, 30), (40, 60)],
+    },
+];
+
+impl MaskedItem {
+    fn clouded(&self, col: usize) -> bool {
+        self.clouded_spans
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&col))
+    }
+}
+
+struct MaskedColumns {
+    cols: std::ops::Range<usize>,
+    latest: Option<f64>,
+    median: Option<f64>,
+    count: Option<f64>,
+}
+
+// worked out by hand from the items clear in each column range, latest and median as shifts on the scene
+static MASKED_EXPECTED: [MaskedColumns; 6] = [
+    MaskedColumns {
+        cols: 0..20,
+        latest: Some(100.0),
+        median: Some(550.0),
+        count: Some(2.0),
+    },
+    MaskedColumns {
+        cols: 20..30,
+        latest: None,
+        median: None,
+        count: None,
+    },
+    MaskedColumns {
+        cols: 30..40,
+        latest: Some(0.0),
+        median: Some(500.0),
+        count: Some(2.0),
+    },
+    MaskedColumns {
+        cols: 40..50,
+        latest: Some(0.0),
+        median: Some(0.0),
+        count: Some(1.0),
+    },
+    MaskedColumns {
+        cols: 50..60,
+        latest: Some(0.0),
+        median: Some(50.0),
+        count: Some(2.0),
+    },
+    MaskedColumns {
+        cols: 60..70,
+        latest: Some(0.0),
+        median: Some(100.0),
+        count: Some(3.0),
+    },
+];
+
+async fn start_masked_mock() -> (String, Arc<Mock>) {
+    start_mock_with(|base| {
+        let coarse = CogParams {
+            pixel_width: COARSE_CELL,
+            pixel_height: COARSE_CELL,
+            ..class_params()
+        };
+        let mut cogs = std::collections::HashMap::new();
+        let mut features = Vec::new();
+        for item in &MASKED_ITEMS {
+            let data = grid_cog(&class_params(), MASKED_COLS, MASKED_ROWS, |col, row| {
+                let ground = elevation(
+                    ORIGIN_X + (col as f64 + 0.5) * CELL,
+                    ORIGIN_Y - (row as f64 + 0.5) * CELL,
+                );
+                match item.clouded(col) {
+                    true => ground + CLOUD_VALUE,
+                    false => ground + item.shift,
+                }
+            });
+            let code = |col: usize| match item.clouded(col) {
+                true => CLOUD_CODE,
+                false => CLEAR_CODE,
+            };
+            let mask = grid_cog(&class_params(), MASKED_COLS, MASKED_ROWS, |col, _| {
+                code(col)
+            });
+            let coarse_mask = grid_cog(&coarse, MASKED_COLS / 2, MASKED_ROWS / 2, |col, _| {
+                code(2 * col)
+            });
+            let names =
+                ["data", "mask", "mask_coarse"].map(|asset| format!("{}_{asset}.tif", item.id));
+            for (name, bytes) in names.iter().zip([data, mask, coarse_mask]) {
+                cogs.insert(name.clone(), bytes);
+            }
+            features.push(asset_item(
+                item.id,
+                item.datetime,
+                &[
+                    ("data", format!("{base}/cog/{}", names[0])),
+                    ("mask", format!("{base}/cog/{}", names[1])),
+                    ("mask_coarse", format!("{base}/cog/{}", names[2])),
+                ],
+                MASKED_BBOX,
+                4326,
+            ));
+        }
+        (cogs, features)
+    })
+    .await
+}
+
+async fn read_masked(base: &str, mask_asset: &str, composite: Composite) -> RasterChunk {
+    let mut search = StacSearch::new(base, "s2", "data", MASKED_BBOX);
+    search.composite = composite;
+    search.item_mask = Some(ItemMask {
+        asset: mask_asset.into(),
+        valid_values: vec![CLEAR_CODE],
+    });
+    let src = open_search(search).await;
+    assert_eq!(src.bands(), 1, "the mask asset became a band");
+    assert_eq!(src.grid().base_resolution, CELL);
+    let req = WindowReq {
+        bbox: Bbox::new(
+            MASKED_BBOX[0],
+            MASKED_BBOX[1],
+            MASKED_BBOX[2],
+            MASKED_BBOX[3],
+        ),
+        resolution: CELL,
+        time: None,
+    };
+    let chunk = src.read(&req).await.unwrap().into_raster().unwrap();
+    assert_eq!(chunk.bands.band_count(), 1, "the mask asset became a band");
+    chunk
+}
+
+type ExpectedForComposite = fn(&MaskedColumns) -> Option<f64>;
+
+async fn assert_item_mask_composites(mask_asset: &str) {
+    let (base, _mock) = start_masked_mock().await;
+    let cases: [(Composite, ExpectedForComposite); 3] = [
+        (Composite::Latest, |columns| columns.latest),
+        (Composite::Median, |columns| columns.median),
+        (Composite::Count, |columns| columns.count),
+    ];
+    for (composite, expected_in) in cases {
+        let chunk = read_masked(&base, mask_asset, composite).await;
+        let mut bare = 0;
+        each_pixel(&chunk, |_, x, y, got| {
+            let col = ((x - ORIGIN_X) / CELL).floor() as usize;
+            let columns = MASKED_EXPECTED
+                .iter()
+                .find(|columns| columns.cols.contains(&col))
+                .expect("every column has a case");
+            match (expected_in(columns), composite) {
+                (None, _) => {
+                    bare += 1;
+                    assert!(
+                        got.is_nan(),
+                        "{composite:?} {mask_asset} col {col}: {got}, every item is clouded"
+                    );
+                }
+                (Some(count), Composite::Count) => close(got, count, (x, y)),
+                (Some(shift), _) => close(got, elevation(x, y) + shift, (x, y)),
+            }
+        });
+        assert_eq!(bare, 10 * MASKED_ROWS, "{composite:?} {mask_asset}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_item_mask_drops_each_items_clouded_pixels_before_the_composite() {
+    assert_item_mask_composites("mask").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_coarser_item_mask_masks_each_fine_cell_by_the_code_under_it() {
+    assert_item_mask_composites("mask_coarse").await;
 }
