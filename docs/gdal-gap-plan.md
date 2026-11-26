@@ -22,8 +22,8 @@ Where GDAL still is today, across the org:
   off in the default build (section 1). Its other layer sources, `stac`,
   `cog`, `geojson`, `gpkg`, `las` and `copc`, use no GDAL.
 
-Pure-Rust coverage today: terrano reads and writes COGs (deflate and raw,
-horizontal and floating-point predictors, u8 through f64, multi-band pixel
+Pure-Rust coverage today: terrano reads COGs compressed with deflate or LZW or
+uncompressed and writes deflate or uncompressed ones (horizontal and floating-point predictors, u8 through f64, multi-band pixel
 interleaved), GRIB2 simple packing, NetCDF classic and 64-bit offset. geodukt
 reads and writes GeoJSON, GeoPackage, Shapefile and CSV. projicio covers 5935
 EPSG codes with Helmert and NTv2 grid shifts. nubis reads LAS and has an
@@ -216,8 +216,7 @@ with opens gets a pure-Rust reader, most opens first, and when the counter
 has been zero for a year the feature is deleted. What that porting list looks
 like today, by what the org already touches:
 
-- COG tile compressions beyond deflate: LZW (`weezl`, pure Rust), JPEG and
-  WebP tiles (`image` crates), ZSTD (`ruzstd` for decode, pure Rust). LERC
+- COG tile compressions beyond deflate and LZW: JPEG and WebP tiles (`image` crates), ZSTD (`ruzstd` for decode, pure Rust). LERC
   has a C binding crate and no pure-Rust decoder that I know of. Each is one
   to two weeks in terrano including predictor and band interleave cases.
 - BigTIFF and striped GeoTIFF in `CogReader`, one week.
@@ -242,8 +241,8 @@ panoptes, which is where the design doc sends inference. `wgpu` and Vello
 in fenestra and jung for rendering, no compute path. `object_store` in
 tiletopia behind its `martin` feature only. tiletopia consumes terrano's
 `CogReader` for its `/api/v1/cog` window route and geoplumb's STAC source
-for its analysis tiles, so neither is duplicated there. No Zarr, HDF5,
-LZW or LERC anywhere.
+for its analysis tiles, so neither is duplicated there. No Zarr, HDF5
+or LERC anywhere.
 - Coordinate transforms: projicio already covers EPSG codes, Helmert and
   NTv2. What PROJ still has is geoid and vertical grids, time-dependent
   transforms and the CDN grid fetch. Each is weeks, none is blocking.
@@ -381,11 +380,8 @@ only after a proof script passes on real input, recorded in
       through `/export`, equals its four quadrant exports bit for bit and
       agrees with `gdal_viewshed -cc 0` on 99.4% of the cells inside the
       disc, the rest split both ways between the two line of sight
-      methods. GDAL-written LZW COGs fail to open in `CogSrc`, so the proof
-      writes the DEM with deflate. Left open: tiles wholly outside a viewshed's disc still pull the whole
-      disc, and `align_outward`'s 1e-9 cell tolerance is below the rounding
-      of web mercator coordinates near the antimeridian at resolutions
-      under about 2 m.
+      methods. A tile wholly outside the disc answers nodata without
+      reading the DEM.
 
 ### Wave 3
 
@@ -403,6 +399,63 @@ only after a proof script passes on real input, recorded in
       (terrano or a geoplumb chunk), and what compute does with it.
 - [ ] 8.10 Colour ramps on png tiles, dogfooding `jung-core`'s `ColorRamp`,
       and CRS input beyond EPSG codes in projicio.
+
+## 9. Routine use: what makes a user pick geoplumb over GDAL
+
+Routine GDAL work is a one-line command on a file: `gdalwarp`,
+`gdal_translate`, `gdaldem`, `gdal_calc`, `ogr2ogr`. GDAL 3.11 added
+`gdal raster pipeline` and 3.12 added `gdal pipeline`, which chain steps into a
+graph from the shell. geoplumb is reachable only through a layer file served
+by `geoplumb-server`, the Rust library and four examples, so a user who wants
+a reprojected, clipped file on disk has no command to run. The items are in
+the order a first-time user meets them. 9.1 to 9.3 come first: a command
+that opens the user's file and writes it back in its own dtype.
+
+- [ ] 9.1 A `geoplumb` command that reads the layer TOML `geoplumb-server`
+      reads (`config::Config`) and writes to disk instead of serving.
+      `geoplumb run <layers.toml> <layer> --bbox --crs --resolution [--t] -o
+      out.tif` writes a COG through `export::write_cog`. A vector layer writes
+      `-o out.geojson` or `out.gpkg` through geodukt. `geoplumb pyramid`
+      writes what the `pyramid` example writes. `geoplumb info <file>` prints
+      size, bands, dtype, CRS, geotransform, overviews, nodata and compression,
+      in place of `gdalinfo`. The server's four-minute timeout and export pixel
+      cap protect a shared process and do not apply on the command line.
+      Open: a binary in `geoplumb-server`, which holds `config.rs`, or the
+      config moved into a crate both use. Open: whether one-step jobs take
+      the source and ops as flags or always go through a TOML file.
+- [ ] 9.2 Open every GeoTIFF GDAL writes with its defaults. Left: ZSTD, JPEG and WebP tiles, striped GeoTIFF and BigTIFF in
+      `CogReader` (section 7 sizes each). A CRS given as WKT or PROJ JSON is
+      8.10. Vector: shapefile and CSV as layer sources through geodukt, which
+      reads both, then FlatGeobuf and GeoParquet (section 7).
+- [ ] 9.3 Native dtype on output, which is 8.9. A byte raster exported today
+      comes back as f64: the deflated base level of the 8.4 WorldCover export
+      is 154,948 bytes as Float64 against 96,586 as Byte.
+- [ ] 9.4 GDAL operators with no geoplumb element. Nothing in geoplumb or
+      terrano clips a raster to a polygon as `gdalwarp -cutline` does
+      (`vec_clip` clips features only), fills nodata (`gdal_fillnodata`),
+      sieves (`gdal_sieve`), computes proximity (`gdal_proximity`), colours
+      by elevation (`gdaldem color-relief`, part of 8.10), computes TRI, TPI or
+      roughness (`gdaldem`), or resamples cubic or lanczos (`gdalwarp -r`).
+      Cutline clip and colour relief first, the rest by demand.
+- [ ] 9.5 A parity table users can read and rerun. The measured agreement
+      with GDAL is in 8.4 and 8.6 of this file, and the proof scripts that
+      produced it are outside the repo. Move them into `geoplumb/proofs/`
+      with the steps that fetch their public inputs, and publish
+      `docs/gdal-parity.md`: one row per operator with the GDAL command it was
+      compared to, the input, the measure and the result.
+- [ ] 9.6 A benchmark against GDAL. None exists. A bench script timing wall
+      clock and peak memory for hillshade, warp, contours and export on the
+      proof inputs, geoplumb against the GDAL command from 9.5.
+- [ ] 9.7 The case GDAL handles worst, as the first example in the docs: a
+      cloud-free Sentinel-2 median over a bbox written as a COG by one
+      `geoplumb run` over a `stac` layer with a `mask` over SCL and the
+      `median` composite, pulled window by window without downloading whole
+      scenes. Before claiming the advantage, write the same job with GDAL
+      3.12 (the STACIT driver and whatever median it offers) and put both
+      side by side.
+
+geoplumb is AGPL and GDAL is MIT. That does not matter for command line use,
+it does for anyone linking the crate. It is a licence decision, not a task.
 
 ## Order
 
