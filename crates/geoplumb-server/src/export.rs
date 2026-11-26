@@ -13,7 +13,10 @@ use projicio_core::Transform;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-use crate::{Layer, LayerGraph, ServerState, bad_request, build_layer_graph, parse_time};
+use crate::config::parse_epsg;
+use crate::{
+    Layer, LayerGraph, ServerState, bad_request, build_layer_graph, engine_failure, parse_time,
+};
 
 pub(crate) const MAX_CONCURRENT_EXPORTS: usize = 2;
 
@@ -137,6 +140,7 @@ pub(crate) async fn cog(
 
     let exporting = async move {
         let _slot = slot;
+        let internal = |reason: String| (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response();
         let built = tokio::task::spawn_blocking(move || {
             let layer = &state.layers[index];
             let layer_graph = build_layer_graph(&layer.config)?;
@@ -150,12 +154,12 @@ pub(crate) async fn cog(
             Ok::<_, String>((engine, node, file))
         })
         .await
-        .map_err(|_| "the export engine build did not finish".to_string())?;
-        let (engine, node, file) = built?;
+        .map_err(|_| internal("the export engine build did not finish".to_string()))?;
+        let (engine, node, file) = built.map_err(internal)?;
         let file = write_cog(Arc::new(engine), node, plan.grid, plan.time, file)
             .await
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>(file)
+            .map_err(|e| engine_failure(&e))?;
+        Ok::<_, Response>(file)
     };
     let file = match tokio::time::timeout(EXPORT_TIMEOUT, exporting).await {
         Err(_) => {
@@ -168,9 +172,7 @@ pub(crate) async fn cog(
             )
                 .into_response();
         }
-        Ok(Err(reason)) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response();
-        }
+        Ok(Err(failure)) => return failure,
         Ok(Ok(file)) => file,
     };
 
@@ -246,12 +248,7 @@ fn parse_bbox(text: &str) -> Result<Bbox, String> {
 }
 
 fn parse_crs(text: &str, layer_crs: Crs) -> Result<Crs, String> {
-    let crs = text
-        .split_once(':')
-        .filter(|(authority, _)| authority.eq_ignore_ascii_case("EPSG"))
-        .and_then(|(_, code)| code.parse::<u32>().ok())
-        .map(Crs)
-        .ok_or_else(|| format!("crs {text:?} is not EPSG:<code>"))?;
+    let crs = parse_epsg(text)?;
     Transform::new(&layer_crs.authority(), &crs.authority())
         .map_err(|error| format!("crs {crs} is unknown to projicio: {error}"))?;
     Ok(crs)

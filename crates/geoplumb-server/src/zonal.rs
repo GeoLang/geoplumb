@@ -32,7 +32,7 @@ use geoplumb::{
 use topoi_core::geojson::FeatureGeometry;
 use topoi_core::{Coord, Envelope, MultiPolygon, Polygon, Ring};
 
-use crate::{Layer, LayerOutput, ServerState, bad_request, parse_time};
+use crate::{Layer, LayerOutput, ServerState, bad_request, engine_failure, parse_time};
 
 /// reductions the service runs at once. one holds a blocking thread for its
 /// whole run and pulls the tiles the tile path wants, so a burst of them is
@@ -337,10 +337,7 @@ async fn offload<T: Send + 'static>(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the reduction did not finish".to_string(),
         ))),
-        Ok(Ok(Err(error))) => Err(Box::new(fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error.to_string(),
-        ))),
+        Ok(Ok(Err(error))) => Err(Box::new(engine_failure(&error))),
         Ok(Ok(Ok(value))) => Ok(value),
     }
 }

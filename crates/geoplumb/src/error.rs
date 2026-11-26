@@ -29,6 +29,15 @@ pub enum Error {
     Gpu(String),
     #[error("pull covers {tiles} tiles, over the {cap} cap")]
     PullTooLarge { tiles: i128, cap: i128 },
+    #[error(
+        "region is {pixels} pixels at {resolution} per pixel, over the {cap} pixel cap, the finest resolution that fits is {finest_resolution}"
+    )]
+    RegionTooLarge {
+        pixels: u64,
+        cap: u64,
+        resolution: f64,
+        finest_resolution: f64,
+    },
     #[error(transparent)]
     Terrano(#[from] terrano_core::Error),
 }

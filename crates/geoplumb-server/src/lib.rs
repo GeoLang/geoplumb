@@ -35,13 +35,13 @@ use geoplumb::elements::GdalSrc;
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::stac::format_rfc3339;
 use geoplumb::elements::{
-    Aspect, BandMath, CogSrc, Combine, Contours, CopcSrc, Focal, GpkgSrc, Hillshade, IdwGrid,
-    LasSrc, MapAlgebra, Mosaic, NetcdfSrc, Polygonize, QualityMask, RasterSrc, Rasterize,
-    Reproject, Slope, StacSrc, TensorConv, ToRaster, ToTensor, VecClip, VecFilter, VecSchema,
-    VecSrc, Viewshed,
+    Aspect, BandMath, CogSrc, Combine, Contours, CopcSrc, FlowAccumulation, FlowDirection, Focal,
+    GpkgSrc, Hillshade, IdwGrid, LasSrc, MapAlgebra, Mosaic, NetcdfSrc, Polygonize, QualityMask,
+    RasterSrc, Rasterize, Reproject, Slope, StacSrc, StreamOrder, TensorConv, ToRaster, ToTensor,
+    VecClip, VecFilter, VecSchema, VecSrc, Viewshed, Watershed,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
-use geoplumb::{Caps, CapsSet, Crs, Engine, Graph, NodeId, Source, TimeInterval};
+use geoplumb::{Bbox, Caps, CapsSet, Crs, Engine, Graph, NodeId, Source, TimeInterval};
 
 use config::{Config, FaninConfig, LayerConfig, LayerShape, OpConfig, SourceConfig};
 
@@ -181,9 +181,10 @@ pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
                 let (source, info) = open_source(&layer.name, &input.source)?;
                 let crs = source_crs(source.as_ref())?;
                 let head = graph.add_source(source);
-                tips.push(add_ops(&mut graph, head, &input.ops, crs)?);
+                let (tip, tip_crs) = add_ops(&mut graph, head, &input.ops, crs)?;
+                tips.push(tip);
                 infos.push(info);
-                input_crs.push(crs);
+                input_crs.push(tip_crs);
             }
             let joined = match fanin {
                 FaninConfig::Mosaic => graph.add_fanin(&tips, Box::new(Mosaic::default())),
@@ -195,7 +196,7 @@ pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
             (joined, input_crs[0], composite_info(&layer.name, infos))
         }
     };
-    let node = add_ops(&mut graph, node, &layer.ops, crs)?;
+    let (node, crs) = add_ops(&mut graph, node, &layer.ops, crs)?;
     Ok(LayerGraph {
         graph,
         node,
@@ -213,10 +214,20 @@ fn source_crs(source: &dyn Source) -> Result<Crs, String> {
         .ok_or_else(|| "the source names no crs".to_string())
 }
 
+fn region_bbox([min_x, min_y, max_x, max_y]: [f64; 4]) -> Bbox {
+    Bbox::new(min_x, min_y, max_x, max_y)
+}
+
 /// one op chain over `node`, the translation a layer's own ops and a
 /// fan-in input's both take
-fn add_ops(graph: &mut Graph, node: NodeId, ops: &[OpConfig], crs: Crs) -> Result<NodeId, String> {
+fn add_ops(
+    graph: &mut Graph,
+    node: NodeId,
+    ops: &[OpConfig],
+    crs: Crs,
+) -> Result<(NodeId, Crs), String> {
     let mut node = node;
+    let mut crs = crs;
     for op in ops {
         node = match op {
             OpConfig::Hillshade { azimuth, altitude } => {
@@ -316,9 +327,46 @@ fn add_ops(graph: &mut Graph, node: NodeId, ops: &[OpConfig], crs: Crs) -> Resul
                 };
                 graph.add_transform(node, Box::new(viewshed))
             }
+            OpConfig::FlowDirection { crs: to, region } => {
+                crs = to.0;
+                let element = FlowDirection {
+                    crs,
+                    region: region_bbox(*region),
+                };
+                graph.add_transform(node, Box::new(element))
+            }
+            OpConfig::FlowAccumulation { crs: to, region } => {
+                crs = to.0;
+                let element = FlowAccumulation {
+                    crs,
+                    region: region_bbox(*region),
+                };
+                graph.add_transform(node, Box::new(element))
+            }
+            OpConfig::Watershed { crs: to, region } => {
+                crs = to.0;
+                let element = Watershed {
+                    crs,
+                    region: region_bbox(*region),
+                };
+                graph.add_transform(node, Box::new(element))
+            }
+            OpConfig::StreamOrder {
+                crs: to,
+                region,
+                threshold,
+            } => {
+                crs = to.0;
+                let element = StreamOrder {
+                    crs,
+                    region: region_bbox(*region),
+                    threshold: *threshold,
+                };
+                graph.add_transform(node, Box::new(element))
+            }
         };
     }
-    Ok(node)
+    Ok((node, crs))
 }
 
 /// what `/layers` publishes about a fan-in layer: no collection of its
@@ -682,10 +730,18 @@ async fn tile(
         Ok((content_type, bytes)) => {
             ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => engine_failure(&e),
     }
 }
 
 fn bad_request(message: String) -> Response {
     (StatusCode::BAD_REQUEST, message).into_response()
+}
+
+fn engine_failure(error: &geoplumb::Error) -> Response {
+    let status = match error {
+        geoplumb::Error::RegionTooLarge { .. } => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.to_string()).into_response()
 }

@@ -20,12 +20,15 @@ use crate::error::{Error, Result};
 use crate::graph::{Graph, Node, NodeId};
 use crate::solver;
 use crate::spill::{self, SpillStore, StoredChunk};
-use crate::window::{Bbox, ChunkKey, GridSpec, TimeInterval, WindowReq};
+use crate::window::{Bbox, ChunkKey, GridSpec, MAX_LEVEL, TimeInterval, WindowReq};
 use terrano_core::{BandedRaster, Raster};
 
 /// generous per-pull bound: a million 256 px tiles is far past what
 /// assembly could hold in memory anyway
 const MAX_TILES_PER_PULL: i128 = 1 << 20;
+
+// terrano's fill_sinks, flow_direction and flow_accumulation peak near this many bytes per pixel and band
+const REGION_BYTES_PER_PIXEL: u64 = 60;
 
 enum RtElem {
     Source(Arc<dyn Source>),
@@ -46,6 +49,7 @@ struct RtNode {
     /// this node or anything upstream of it resolves data per pull time,
     /// so its chunks are cached per time
     time_varying: bool,
+    region: Option<Bbox>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,14 +92,18 @@ struct SpillState {
     budget_bytes: usize,
 }
 
-pub struct Engine {
-    nodes: Vec<RtNode>,
-    topo: Vec<usize>,
-    cache: Mutex<CacheState>,
-    events: broadcast::Sender<Invalidation>,
+struct ChunkCache {
+    state: Mutex<CacheState>,
     budget_bytes: usize,
     gpu_budget_bytes: Option<usize>,
     spill: Option<SpillState>,
+}
+
+pub struct Engine {
+    nodes: Vec<RtNode>,
+    topo: Vec<usize>,
+    cache: Arc<ChunkCache>,
+    events: broadcast::Sender<Invalidation>,
 }
 
 impl Engine {
@@ -160,22 +168,29 @@ impl Engine {
                     element.time_varying() || parents.iter().copied().any(up)
                 }
             };
+            let region = match &elem {
+                RtElem::Transform { element, .. } => element.region(),
+                RtElem::Source(_) | RtElem::Fanin { .. } => None,
+            };
             nodes[i] = Some(RtNode {
                 elem,
                 caps: caps[i].clone(),
                 grid,
                 time_varying,
+                region,
             });
         }
         let (events, _) = broadcast::channel(64);
         Ok(Engine {
             nodes: nodes.into_iter().map(|n| n.expect("all built")).collect(),
             topo,
-            cache: Mutex::new(CacheState::default()),
+            cache: Arc::new(ChunkCache {
+                state: Mutex::new(CacheState::default()),
+                budget_bytes,
+                gpu_budget_bytes,
+                spill: None,
+            }),
             events,
-            budget_bytes,
-            gpu_budget_bytes,
-            spill: None,
         })
     }
 
@@ -195,7 +210,9 @@ impl Engine {
             .as_ref()
             .join(format!("geoplumb-{:016x}", engine.graph_identity()));
         let (store, stored) = SpillStore::open(store_dir)?;
-        engine.spill = Some(SpillState {
+        Arc::get_mut(&mut engine.cache)
+            .expect("a new engine's cache has no other owner")
+            .spill = Some(SpillState {
             store,
             budget_bytes: disk_budget_bytes,
         });
@@ -235,9 +252,9 @@ impl Engine {
     /// turns the files a reopened store holds into spilled entries, newest
     /// first up to the disk budget. the rest, and every file of a
     /// time-varying node, is deleted
-    fn restore_spilled(&mut self, mut stored: Vec<StoredChunk>, disk_budget_bytes: usize) {
+    fn restore_spilled(&self, mut stored: Vec<StoredChunk>, disk_budget_bytes: usize) {
         stored.sort_by_key(|c| std::cmp::Reverse(c.modified));
-        let state = self.cache.get_mut().unwrap();
+        let mut state = self.cache.state.lock().unwrap();
         let mut deletions = Vec::new();
         let mut over_budget = false;
         for c in stored {
@@ -260,7 +277,8 @@ impl Engine {
                 },
             );
         }
-        self.delete_spill_files(&deletions);
+        drop(state);
+        self.cache.delete_spill_files(&deletions);
     }
 
     pub fn caps(&self, node: NodeId) -> &Caps {
@@ -276,11 +294,11 @@ impl Engine {
     }
 
     pub fn system_bytes(&self) -> usize {
-        self.cache.lock().unwrap().bytes
+        self.cache.state.lock().unwrap().bytes
     }
 
     pub fn gpu_bytes(&self) -> usize {
-        self.cache.lock().unwrap().gpu_bytes
+        self.cache.state.lock().unwrap().gpu_bytes
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Invalidation> {
@@ -291,6 +309,17 @@ impl Engine {
     /// covering chunks concurrently, mosaic, crop to the aligned window
     pub async fn pull(&self, node: NodeId, req: WindowReq) -> Result<Chunk> {
         self.pull_assembled(node.0, req).await
+    }
+
+    fn coarsest_cached_level(&self, node: usize) -> u8 {
+        let state = self.cache.state.lock().unwrap();
+        state
+            .entries
+            .keys()
+            .filter(|(idx, _)| *idx == node)
+            .map(|(_, k)| k.level)
+            .max()
+            .unwrap_or(0)
     }
 
     /// declare a window of a node dirty: drop overlapping cache entries at
@@ -308,17 +337,7 @@ impl Engine {
             if !from_parents.is_empty() {
                 // spread at the coarsest cached level so a coarse chunk's
                 // wider halo is still covered
-                let max_level = {
-                    let state = self.cache.lock().unwrap();
-                    state
-                        .entries
-                        .keys()
-                        .filter(|(idx, _)| *idx == j)
-                        .map(|(_, k)| k.level)
-                        .max()
-                        .unwrap_or(0)
-                };
-                let res = n.grid.resolution_at(max_level);
+                let res = n.grid.resolution_at(self.coarsest_cached_level(j));
                 for d in from_parents {
                     let spread = match &n.elem {
                         RtElem::Source(_) => unreachable!("sources have no parents"),
@@ -331,9 +350,19 @@ impl Engine {
                     });
                 }
             }
-            let Some(d) = dirty[j] else { continue };
+            let Some(mut d) = dirty[j] else { continue };
+            if let Some(region) = n.region {
+                let region = align_region(&n.grid, &region, self.coarsest_cached_level(j));
+                if !d.intersects(&region) {
+                    dirty[j] = None;
+                    continue;
+                }
+                d = region;
+                dirty[j] = Some(region);
+            }
             let grid = n.grid;
-            let mut state = self.cache.lock().unwrap();
+            let region_node = n.region.is_some();
+            let mut state = self.cache.state.lock().unwrap();
             let mut freed = 0usize;
             let mut freed_disk = 0usize;
             let mut freed_gpu = 0usize;
@@ -342,7 +371,7 @@ impl Engine {
                 if *n_idx != j {
                     return true;
                 }
-                let keep = !grid.chunk_bbox(*key).intersects(&d);
+                let keep = !region_node && !grid.chunk_bbox(*key).intersects(&d);
                 if !keep {
                     match entry {
                         Entry::Ready {
@@ -372,12 +401,40 @@ impl Engine {
             state_bytes_sub(&mut state.disk_bytes, freed_disk);
             state_bytes_sub(&mut state.gpu_bytes, freed_gpu);
             drop(state);
-            self.delete_spill_files(&deletions);
+            self.cache.delete_spill_files(&deletions);
             let _ = self.events.send(Invalidation {
                 node: NodeId(j),
                 bbox: d,
             });
         }
+    }
+
+    fn check_region_size(&self, node: usize, region: &Bbox, level: u8) -> Result<()> {
+        let grid = self.nodes[node].grid;
+        let bands = match &self.nodes[node].caps {
+            Caps::Raster(raster) => raster.bands,
+            Caps::Tensor(tensor) => tensor.channels,
+            Caps::PointCloud(_) | Caps::Vector(_) => 1,
+        };
+        let cap = self.cache.budget_bytes as u64 / (REGION_BYTES_PER_PIXEL * u64::from(bands));
+        let pixels_at = |level: u8| {
+            let window = align_region(&grid, region, level);
+            let res = grid.resolution_at(level);
+            ((window.width() / res).round() * (window.height() / res).round()) as u64
+        };
+        let pixels = pixels_at(level);
+        if pixels <= cap {
+            return Ok(());
+        }
+        let finest_resolution = (level + 1..=MAX_LEVEL)
+            .find(|coarser| pixels_at(*coarser) <= cap)
+            .map_or(f64::INFINITY, |coarser| grid.resolution_at(coarser));
+        Err(Error::RegionTooLarge {
+            pixels,
+            cap,
+            resolution: grid.resolution_at(level),
+            finest_resolution,
+        })
     }
 
     fn pull_assembled<'a>(&'a self, node: usize, req: WindowReq) -> BoxFuture<'a, Result<Chunk>> {
@@ -400,6 +457,22 @@ impl Engine {
                 });
             }
             let time = self.chunk_time(node, req.time);
+            let caps = &self.nodes[node].caps;
+            if let Some(region) = self.nodes[node].region {
+                let region_window = align_region(&grid, &region, level);
+                if !aligned.intersects(&region_window) {
+                    return assemble(&[], &[], &aligned, res, caps);
+                }
+                self.check_region_size(node, &region, level)?;
+                let key = ChunkKey {
+                    level,
+                    ix: 0,
+                    iy: 0,
+                    time,
+                };
+                let chunk = self.chunk(node, key).await?;
+                return assemble_pulled(vec![region_window], vec![chunk], aligned, res, caps).await;
+            }
             let keys: Vec<ChunkKey> = grid
                 .cover(&aligned, level)
                 .into_iter()
@@ -407,16 +480,8 @@ impl Engine {
                 .collect();
             let chunks =
                 futures::future::try_join_all(keys.iter().map(|k| self.chunk(node, *k))).await?;
-            let caps = &self.nodes[node].caps;
-            let on_gpu = chunks
-                .first()
-                .is_some_and(|c| memory_domain(c) == Domain::Wgpu);
-            if !on_gpu {
-                return assemble(&grid, &keys, &chunks, &aligned, res, caps);
-            }
-            // gpu assembly blocks on device calls, which must not sit on a tokio worker
-            let caps = caps.clone();
-            offload(move || assemble(&grid, &keys, &chunks, &aligned, res, &caps)).await
+            let chunk_bboxes = keys.iter().map(|k| grid.chunk_bbox(*k)).collect();
+            assemble_pulled(chunk_bboxes, chunks, aligned, res, caps).await
         })
     }
 
@@ -428,7 +493,7 @@ impl Engine {
         }
         loop {
             let action = {
-                let mut state = self.cache.lock().unwrap();
+                let mut state = self.cache.state.lock().unwrap();
                 state.tick += 1;
                 let tick = state.tick;
                 match state.entries.get_mut(&(node, key)) {
@@ -466,7 +531,7 @@ impl Engine {
                 }
             };
             let guard = |done| PendingGuard {
-                cache: &self.cache,
+                cache: Arc::clone(&self.cache),
                 key: (node, key),
                 done,
             };
@@ -478,6 +543,7 @@ impl Engine {
                 Action::Load => {
                     let guard = guard(false);
                     let store = &self
+                        .cache
                         .spill
                         .as_ref()
                         .expect("spilled entries need a store")
@@ -485,28 +551,93 @@ impl Engine {
                     let path = store.path(node, key);
                     let read = path.clone();
                     return match offload(move || spill::read_chunk(&read)).await {
-                        Ok(chunk) => self.finish_chunk(guard, Ok(chunk), true),
+                        Ok(chunk) => self.cache.finish_chunk(guard, Ok(chunk), true),
                         Err(_) => {
                             let _ = std::fs::remove_file(&path);
-                            let result = self.compute_chunk(node, key).await;
-                            self.finish_and_spill(guard, result, node, key).await
+                            self.compute_and_cache(guard, node, key).await
                         }
                     };
                 }
                 Action::Compute => {
-                    let guard = guard(false);
-                    let result = self.compute_chunk(node, key).await;
-                    return self.finish_and_spill(guard, result, node, key).await;
+                    return self.compute_and_cache(guard(false), node, key).await;
                 }
             }
         }
     }
 
+    fn chunk_time(&self, node: usize, time: Option<TimeInterval>) -> Option<TimeInterval> {
+        if self.nodes[node].time_varying {
+            time
+        } else {
+            None
+        }
+    }
+
+    async fn compute_and_cache(
+        &self,
+        guard: PendingGuard,
+        node: usize,
+        key: ChunkKey,
+    ) -> Result<Arc<Chunk>> {
+        let grid = self.nodes[node].grid;
+        let bbox = match self.nodes[node].region {
+            Some(region) => align_region(&grid, &region, key.level),
+            None => grid.chunk_bbox(key),
+        };
+        let out = WindowReq {
+            bbox,
+            resolution: grid.resolution_at(key.level),
+            time: key.time,
+        };
+        let computed = match &self.nodes[node].elem {
+            RtElem::Source(s) => s.read(&out).await,
+            RtElem::Transform { parent, element } => {
+                // the pull's time is the engine's to carry, not an
+                // element's to rewrite: a plan that dropped it would ask
+                // upstream for the wrong instant
+                let in_req = element.plan(&out).with_time(out.time);
+                let input = self.pull_assembled(*parent, in_req).await?;
+                let element = element.clone();
+                let compute = move || element.compute(&out, &input);
+                if self.nodes[node].region.is_some() {
+                    let cache = Arc::clone(&self.cache);
+                    let task = async move {
+                        let computed = offload(compute).await;
+                        cache.finish_and_spill(guard, computed, node, key).await
+                    };
+                    // tokio runs a spawned task to the end after its JoinHandle is dropped
+                    return match tokio::runtime::Handle::try_current() {
+                        Ok(runtime) => runtime
+                            .spawn(task)
+                            .await
+                            .expect("region compute task panicked"),
+                        Err(_) => task.await,
+                    };
+                }
+                offload(compute).await
+            }
+            RtElem::Fanin { parents, element } => {
+                let inputs =
+                    futures::future::try_join_all(parents.iter().enumerate().map(|(k, p)| {
+                        self.pull_assembled(*p, element.plan(&out, k).with_time(out.time))
+                    }))
+                    .await?;
+                let element = element.clone();
+                offload(move || element.compute(&out, &inputs)).await
+            }
+        };
+        self.cache
+            .finish_and_spill(guard, computed, node, key)
+            .await
+    }
+}
+
+impl ChunkCache {
     /// cache a fresh chunk and write it through to the disk tier, marking
     /// the entry spilled only once the file is safely on disk
     async fn finish_and_spill(
         &self,
-        guard: PendingGuard<'_>,
+        guard: PendingGuard,
         result: Result<Chunk>,
         node: usize,
         key: ChunkKey,
@@ -522,7 +653,7 @@ impl Engine {
                 .await
                 .is_ok()
             {
-                let mut state = self.cache.lock().unwrap();
+                let mut state = self.state.lock().unwrap();
                 if let Some(Entry::Ready { spilled, .. }) = state.entries.get_mut(&(node, key)) {
                     *spilled = true;
                 } else {
@@ -538,7 +669,7 @@ impl Engine {
 
     fn finish_chunk(
         &self,
-        mut guard: PendingGuard<'_>,
+        mut guard: PendingGuard,
         result: Result<Chunk>,
         spilled: bool,
     ) -> Result<Arc<Chunk>> {
@@ -546,7 +677,7 @@ impl Engine {
         guard.done = true;
         let bytes = chunk.byte_size();
         let domain = memory_domain(&chunk);
-        let mut state = self.cache.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         state.tick += 1;
         let tick = state.tick;
         if let Some(Entry::Pending { waiters }) = state.entries.insert(
@@ -585,63 +716,20 @@ impl Engine {
             }
         }
     }
-
-    /// the time a node's chunks are keyed by: the pull's where anything
-    /// upstream resolves per time, the source's own otherwise
-    fn chunk_time(&self, node: usize, time: Option<TimeInterval>) -> Option<TimeInterval> {
-        if self.nodes[node].time_varying {
-            time
-        } else {
-            None
-        }
-    }
-
-    async fn compute_chunk(&self, node: usize, key: ChunkKey) -> Result<Chunk> {
-        let grid = self.nodes[node].grid;
-        let out = WindowReq {
-            bbox: grid.chunk_bbox(key),
-            resolution: grid.resolution_at(key.level),
-            time: key.time,
-        };
-        match &self.nodes[node].elem {
-            RtElem::Source(s) => s.read(&out).await,
-            RtElem::Transform { parent, element } => {
-                if let Some(chunk) = element.output_without_input(&out, &self.nodes[node].caps) {
-                    return Ok(chunk);
-                }
-                // the pull's time is the engine's to carry, not an
-                // element's to rewrite: a plan that dropped it would ask
-                // upstream for the wrong instant
-                let in_req = element.plan(&out).with_time(out.time);
-                let input = self.pull_assembled(*parent, in_req).await?;
-                let element = element.clone();
-                offload(move || element.compute(&out, &input)).await
-            }
-            RtElem::Fanin { parents, element } => {
-                let inputs =
-                    futures::future::try_join_all(parents.iter().enumerate().map(|(k, p)| {
-                        self.pull_assembled(*p, element.plan(&out, k).with_time(out.time))
-                    }))
-                    .await?;
-                let element = element.clone();
-                offload(move || element.compute(&out, &inputs)).await
-            }
-        }
-    }
 }
 
-struct PendingGuard<'a> {
-    cache: &'a Mutex<CacheState>,
+struct PendingGuard {
+    cache: Arc<ChunkCache>,
     key: (usize, ChunkKey),
     done: bool,
 }
 
-impl Drop for PendingGuard<'_> {
+impl Drop for PendingGuard {
     fn drop(&mut self) {
         if self.done {
             return;
         }
-        let mut state = self.cache.lock().unwrap();
+        let mut state = self.cache.state.lock().unwrap();
         if let Some(Entry::Pending { waiters }) = state.entries.remove(&self.key) {
             drop(waiters);
         }
@@ -774,10 +862,36 @@ pub(crate) fn align_outward(bbox: &Bbox, origin_x: f64, origin_y: f64, res: f64)
     }
 }
 
+fn align_region(grid: &GridSpec, region: &Bbox, level: u8) -> Bbox {
+    align_outward(
+        region,
+        grid.origin_x,
+        grid.origin_y,
+        grid.resolution_at(level),
+    )
+}
+
+async fn assemble_pulled(
+    chunk_bboxes: Vec<Bbox>,
+    chunks: Vec<Arc<Chunk>>,
+    window: Bbox,
+    res: f64,
+    caps: &Caps,
+) -> Result<Chunk> {
+    let on_gpu = chunks
+        .first()
+        .is_some_and(|c| memory_domain(c) == Domain::Wgpu);
+    if !on_gpu {
+        return assemble(&chunk_bboxes, &chunks, &window, res, caps);
+    }
+    // gpu assembly blocks on device calls, which must not sit on a tokio worker
+    let caps = caps.clone();
+    offload(move || assemble(&chunk_bboxes, &chunks, &window, res, &caps)).await
+}
+
 /// stitch same-level chunks into one chunk covering `window`, per kind
 fn assemble(
-    grid: &GridSpec,
-    keys: &[ChunkKey],
+    chunk_bboxes: &[Bbox],
     chunks: &[Arc<Chunk>],
     window: &Bbox,
     res: f64,
@@ -788,7 +902,11 @@ fn assemble(
             let rasters: Vec<&RasterChunk> =
                 chunks.iter().map(|c| c.raster()).collect::<Result<_>>()?;
             Ok(Chunk::Raster(assemble_raster(
-                grid, keys, &rasters, window, res, caps,
+                chunk_bboxes,
+                &rasters,
+                window,
+                res,
+                caps,
             )))
         }
         Caps::PointCloud(p) => {
@@ -835,7 +953,11 @@ fn assemble(
             let tensors: Vec<&TensorChunk> =
                 chunks.iter().map(|c| c.tensor()).collect::<Result<_>>()?;
             Ok(Chunk::Tensor(assemble_tensor(
-                grid, keys, &tensors, window, res, t,
+                chunk_bboxes,
+                &tensors,
+                window,
+                res,
+                t,
             )?))
         }
     }
@@ -843,8 +965,7 @@ fn assemble(
 
 /// mosaic same-level raster chunks into one raster covering `window`
 fn assemble_raster(
-    grid: &GridSpec,
-    keys: &[ChunkKey],
+    chunk_bboxes: &[Bbox],
     chunks: &[&RasterChunk],
     window: &Bbox,
     res: f64,
@@ -861,8 +982,7 @@ fn assemble_raster(
         .and_then(|c| c.bands.band(0).map(|b| b.nodata))
         .unwrap_or(f64::NAN);
     let mut bands: Vec<Vec<f64>> = vec![vec![nodata; cols * rows]; band_count];
-    for (key, chunk) in keys.iter().zip(chunks) {
-        let cb = grid.chunk_bbox(*key);
+    for (cb, chunk) in chunk_bboxes.iter().zip(chunks) {
         for (bi, band) in chunk.bands.bands().iter().enumerate() {
             let w = chunk.width();
             for row in 0..chunk.height() {
@@ -901,8 +1021,7 @@ fn assemble_raster(
 
 /// mosaic same-level tensor chunks into one tensor covering `window`
 fn assemble_tensor(
-    grid: &GridSpec,
-    keys: &[ChunkKey],
+    chunk_bboxes: &[Bbox],
     chunks: &[&TensorChunk],
     window: &Bbox,
     res: f64,
@@ -911,10 +1030,10 @@ fn assemble_tensor(
     let cols = (window.width() / res).round() as usize;
     let rows = (window.height() / res).round() as usize;
     let channels = chunks.first().map_or(caps.channels, |c| c.channels) as usize;
-    let placements: Vec<Placement> = keys
+    let placements: Vec<Placement> = chunk_bboxes
         .iter()
         .zip(chunks)
-        .map(|(key, chunk)| Placement::new(&grid.chunk_bbox(*key), chunk, window, res))
+        .map(|(chunk_bbox, chunk)| Placement::new(chunk_bbox, chunk, window, res))
         .collect();
     let data = mosaic(chunks, &placements, channels, cols, rows)?;
     Ok(TensorChunk {

@@ -662,20 +662,26 @@ async fn viewshed_hides_what_the_wall_hides_pulled_whole_or_chunked() {
 }
 
 #[test]
-fn viewshed_spreads_a_dirty_cell_in_its_disc_to_the_whole_disc() {
-    let viewshed = wall_viewshed();
-    let radius = RADIUS_CELLS * CELL;
-    let disc = Bbox {
-        min_x: viewshed.observer_x - radius,
-        max_x: viewshed.observer_x + radius,
-        min_y: viewshed.observer_y - radius,
-        max_y: viewshed.observer_y + radius,
-    }
-    .expand(CELL);
-    let inside = window(CELL, 25, 24, 26, 25);
-    assert_eq!(viewshed.spread(&inside, CELL), disc);
-    let outside = window(CELL, 60, 0, 61, 1);
-    assert_eq!(viewshed.spread(&outside, CELL), outside);
+fn a_dirty_cell_in_the_viewshed_disc_dirties_the_whole_disc() {
+    let mut g = Graph::new();
+    let src = g.add_source(Box::new(wall_source()));
+    let node = g.add_transform(src, Box::new(wall_viewshed()));
+    let engine = Engine::new(g, 64 << 20).unwrap();
+    let mut events = engine.subscribe();
+
+    engine.invalidate(src, window(CELL, 25, 24, 26, 25));
+    assert_eq!(events.try_recv().unwrap().node, src);
+    let at_viewshed = events.try_recv().expect("the viewshed was left clean");
+    assert_eq!(at_viewshed.node, node);
+    // the disc spans columns 0 to 41 and rows 4 to 45 once aligned to the cells
+    assert_eq!(at_viewshed.bbox, window(CELL, 0, 4, 41, 45));
+
+    engine.invalidate(src, window(CELL, 60, 0, 61, 1));
+    assert_eq!(events.try_recv().unwrap().node, src);
+    assert!(
+        events.try_recv().is_err(),
+        "a cell clear of the disc dirtied the viewshed"
+    );
 }
 
 struct CountingSrc {

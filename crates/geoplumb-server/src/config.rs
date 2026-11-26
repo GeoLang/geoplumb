@@ -7,9 +7,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use geoplumb::TimeInterval;
 use geoplumb::caps::ValueKind;
 use geoplumb::elements::{Burn, Composite, FocalOp, ItemMask, StacSearch};
+use geoplumb::{Crs, TimeInterval};
 use serde::Deserialize;
 use serde_json::Value;
 use terrano_core::{BinaryOp, UnaryOp};
@@ -311,6 +311,43 @@ pub enum OpConfig {
         height: f64,
         radius: f64,
     },
+    FlowDirection {
+        crs: CrsConfig,
+        region: [f64; 4],
+    },
+    FlowAccumulation {
+        crs: CrsConfig,
+        region: [f64; 4],
+    },
+    Watershed {
+        crs: CrsConfig,
+        region: [f64; 4],
+    },
+    StreamOrder {
+        crs: CrsConfig,
+        region: [f64; 4],
+        threshold: f64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(try_from = "String")]
+pub struct CrsConfig(pub Crs);
+
+impl TryFrom<String> for CrsConfig {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<CrsConfig, String> {
+        parse_epsg(&text).map(CrsConfig)
+    }
+}
+
+pub(crate) fn parse_epsg(text: &str) -> Result<Crs, String> {
+    text.split_once(':')
+        .filter(|(authority, _)| authority.eq_ignore_ascii_case("EPSG"))
+        .and_then(|(_, code)| code.parse::<u32>().ok())
+        .map(Crs)
+        .ok_or_else(|| format!("crs {text:?} is not EPSG:<code>"))
 }
 
 /// one class a `reclassify` maps into: `min` inclusive, `max` exclusive,
@@ -631,9 +668,13 @@ impl LayerConfig {
                 OpConfig::Aspect => Some(ASPECT_GRAY),
                 OpConfig::Viewshed { .. } => Some(VIEWSHED_GRAY),
                 OpConfig::Contours { .. } | OpConfig::Polygonize => Some(DEFAULT_GRAY),
-                OpConfig::Reclassify { .. } | OpConfig::Rasterize { .. } | OpConfig::Idw { .. } => {
-                    None
-                }
+                OpConfig::Reclassify { .. }
+                | OpConfig::Rasterize { .. }
+                | OpConfig::Idw { .. }
+                | OpConfig::FlowDirection { .. }
+                | OpConfig::FlowAccumulation { .. }
+                | OpConfig::Watershed { .. }
+                | OpConfig::StreamOrder { .. } => None,
                 OpConfig::Hillshade { .. }
                 | OpConfig::Focal { .. }
                 | OpConfig::Mask { .. }

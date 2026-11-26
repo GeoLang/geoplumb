@@ -2658,3 +2658,244 @@ fn a_vector_layer_takes_no_gray_and_a_burned_one_still_needs_one() {
     let error = Config::parse(&burned).expect_err("burned values carry no range");
     assert!(error.contains("gray"), "{error}");
 }
+
+const HYDROLOGY: &str = r#"
+[[layer]]
+name = "directions"
+source = { kind = "cog", path = "COG_PATH" }
+gray = { min = 0.0, max = 255.0 }
+
+[[layer.op]]
+kind = "flow_direction"
+crs = "EPSG:32632"
+region = REGION
+
+[[layer]]
+name = "accumulation"
+source = { kind = "cog", path = "COG_PATH" }
+gray = { min = 0.0, max = 1000000.0 }
+
+[[layer.op]]
+kind = "flow_accumulation"
+crs = "EPSG:32632"
+region = REGION
+
+[[layer]]
+name = "basins"
+source = { kind = "cog", path = "COG_PATH" }
+gray = { min = 0.0, max = 100.0 }
+
+[[layer.op]]
+kind = "watershed"
+crs = "EPSG:32632"
+region = REGION
+
+[[layer]]
+name = "streams"
+source = { kind = "cog", path = "COG_PATH" }
+gray = { min = 0.0, max = 5.0 }
+
+[[layer.op]]
+kind = "stream_order"
+crs = "EPSG:32632"
+region = REGION
+threshold = 100000.0
+"#;
+
+const HYDROLOGY_LON: (f64, f64) = (7.31, 7.36);
+const HYDROLOGY_LAT: (f64, f64) = (46.75, 46.79);
+
+fn hydrology_region() -> [f64; 4] {
+    let to_utm = projicio_core::Transform::new("EPSG:4326", "EPSG:32632").unwrap();
+    let mut region = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for lon in [HYDROLOGY_LON.0, HYDROLOGY_LON.1] {
+        for lat in [HYDROLOGY_LAT.0, HYDROLOGY_LAT.1] {
+            let (x, y) = to_utm.convert(lon, lat).unwrap();
+            region = [
+                region[0].min(x),
+                region[1].min(y),
+                region[2].max(x),
+                region[3].max(y),
+            ];
+        }
+    }
+    region
+}
+
+fn hydrology_layer_file(cog_path: &str) -> String {
+    let [min_x, min_y, max_x, max_y] = hydrology_region();
+    HYDROLOGY.replace("COG_PATH", cog_path).replace(
+        "REGION",
+        &format!("[{min_x:?}, {min_y:?}, {max_x:?}, {max_y:?}]"),
+    )
+}
+
+fn hydrology_tile() -> (u32, u32) {
+    tile_of(
+        12,
+        (HYDROLOGY_LON.0 + HYDROLOGY_LON.1) / 2.0,
+        (HYDROLOGY_LAT.0 + HYDROLOGY_LAT.1) / 2.0,
+    )
+}
+
+async fn tile_band(app: &Router, uri: &str) -> Vec<f64> {
+    let (status, body) = get(app, uri).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (bands, _) = read_geotiff_bands(&body).expect("terrano reads back what it wrote");
+    bands.band(0).unwrap().data().to_vec()
+}
+
+#[test]
+fn config_parses_the_hydrology_ops_and_each_needs_a_gray_range() {
+    let text = hydrology_layer_file("/data/dem.tif");
+    let config = Config::parse(&text).unwrap_or_else(|e| panic!("{e}"));
+    let region = hydrology_region();
+    let utm = geoplumb::Crs(32632);
+    match &config.layers[0].ops[..] {
+        [OpConfig::FlowDirection { crs, region: got }] => {
+            assert_eq!((crs.0, *got), (utm, region));
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+    match &config.layers[1].ops[..] {
+        [OpConfig::FlowAccumulation { crs, region: got }] => {
+            assert_eq!((crs.0, *got), (utm, region));
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+    match &config.layers[2].ops[..] {
+        [OpConfig::Watershed { crs, region: got }] => {
+            assert_eq!((crs.0, *got), (utm, region));
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+    match &config.layers[3].ops[..] {
+        [
+            OpConfig::StreamOrder {
+                crs,
+                region: got,
+                threshold,
+            },
+        ] => {
+            assert_eq!((crs.0, *got, *threshold), (utm, region, 100000.0));
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    for gray in [
+        "gray = { min = 0.0, max = 255.0 }\n",
+        "gray = { min = 0.0, max = 1000000.0 }\n",
+        "gray = { min = 0.0, max = 100.0 }\n",
+        "gray = { min = 0.0, max = 5.0 }\n",
+    ] {
+        let error = Config::parse(&text.replacen(gray, "", 1))
+            .expect_err("a hydrology layer took a gray range from its source");
+        assert!(error.contains("gray"), "{error}");
+    }
+
+    let error = Config::parse(&text.replace("EPSG:32632", "32632"))
+        .expect_err("a crs without its authority parsed");
+    assert!(error.contains("EPSG:<code>"), "{error}");
+}
+
+#[tokio::test]
+async fn every_hydrology_op_serves_a_tile_cut_from_its_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&hydrology_layer_file(&write_dem(dir.path())));
+    let (x, y) = hydrology_tile();
+    let finite = |values: &[f64]| -> Vec<f64> {
+        let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+        assert!(!finite.is_empty(), "the tile holds no region cell");
+        assert!(
+            finite.len() < values.len(),
+            "the tile holds no cell outside the region"
+        );
+        finite
+    };
+
+    let directions = tile_band(&app, &format!("/tiles/directions/12/{x}/{y}.tif")).await;
+    let codes = [0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+    let directions = finite(&directions);
+    assert!(
+        directions.iter().all(|code| codes.contains(code)),
+        "{directions:?}"
+    );
+    assert!(
+        directions.iter().any(|code| *code != 0.0),
+        "every cell is a pit"
+    );
+
+    let accumulation = tile_band(&app, &format!("/tiles/accumulation/12/{x}/{y}.tif")).await;
+    let accumulation = finite(&accumulation);
+    let smallest = accumulation.iter().copied().fold(f64::INFINITY, f64::min);
+    let largest = accumulation.iter().copied().fold(0.0, f64::max);
+    assert!(smallest > 0.0, "{smallest}");
+    assert!(
+        largest > 10.0 * smallest,
+        "no cell gathers the flow of many: {smallest} to {largest}"
+    );
+
+    let basins = tile_band(&app, &format!("/tiles/basins/12/{x}/{y}.tif")).await;
+    let basins = finite(&basins);
+    assert!(
+        basins
+            .iter()
+            .all(|label| *label >= 1.0 && label.fract() == 0.0),
+        "{basins:?}"
+    );
+
+    let (status, body) = get(&app, &format!("/tiles/streams/12/{x}/{y}.tif")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (bands, _) = read_geotiff_bands(&body).unwrap();
+    let orders: Vec<f64> = bands
+        .band(0)
+        .unwrap()
+        .data()
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+    assert!(!orders.is_empty(), "no cell gathers 100000 square metres");
+    assert!(
+        orders
+            .iter()
+            .all(|order| *order >= 1.0 && order.fract() == 0.0),
+        "{orders:?}"
+    );
+
+    let (status, png) = get(&app, &format!("/tiles/directions/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(opaque_pixels(&png) > 0);
+}
+
+#[tokio::test]
+async fn a_region_over_the_pixel_cap_answers_400_on_tiles_and_exports() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::parse(&hydrology_layer_file(&write_dem(dir.path()))).unwrap();
+    // about 3000 region cells at level 0 against a cap of a few hundred
+    let layers = Layer::build_all(config, 16 << 10, None).expect("the layers must build");
+    let app = router(layers, Some(dir.path().to_path_buf()));
+
+    let (x, y) = hydrology_tile();
+    let (status, body) = get(&app, &format!("/tiles/accumulation/12/{x}/{y}.png")).await;
+    let message = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{message}");
+    assert!(message.contains("pixel cap"), "{message}");
+
+    let [min_x, min_y, max_x, max_y] = hydrology_region();
+    let (status, body) = get(
+        &app,
+        &format!(
+            "/export/accumulation?bbox={min_x},{min_y},{max_x},{max_y}&crs=EPSG:32632&resolution=30"
+        ),
+    )
+    .await;
+    let message = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{message}");
+    assert!(message.contains("pixel cap"), "{message}");
+}

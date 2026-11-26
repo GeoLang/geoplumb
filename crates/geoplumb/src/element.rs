@@ -79,8 +79,7 @@ pub trait Transform: Send + Sync {
     /// engine reasserts it either way
     fn plan(&self, out: &WindowReq) -> WindowReq;
 
-    fn output_without_input(&self, out: &WindowReq, output: &Caps) -> Option<Chunk> {
-        let _ = (out, output);
+    fn region(&self) -> Option<Bbox> {
         None
     }
 

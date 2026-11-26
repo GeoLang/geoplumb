@@ -5,24 +5,13 @@ use crate::elements::raster_vector::one_band;
 use crate::error::{Error, Result};
 use crate::resample::resample_to_grid;
 use crate::window::{Bbox, WindowReq};
-use terrano_core::{BandedRaster, Raster, viewshed};
+use terrano_core::{BandedRaster, viewshed};
 
 pub struct Viewshed {
     pub observer_x: f64,
     pub observer_y: f64,
     pub observer_height: f64,
     pub radius: f64,
-}
-
-impl Viewshed {
-    fn disc(&self) -> Bbox {
-        Bbox::new(
-            self.observer_x - self.radius,
-            self.observer_y - self.radius,
-            self.observer_x + self.radius,
-            self.observer_y + self.radius,
-        )
-    }
 }
 
 impl Transform for Viewshed {
@@ -54,31 +43,16 @@ impl Transform for Viewshed {
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
-        out.with_window(self.disc(), out.resolution)
+        *out
     }
 
-    fn output_without_input(&self, out: &WindowReq, output: &Caps) -> Option<Chunk> {
-        if out.bbox.intersects(&self.disc()) {
-            return None;
-        }
-        let columns = (out.bbox.width() / out.resolution).round() as usize;
-        let rows = (out.bbox.height() / out.resolution).round() as usize;
-        let outside = Raster::new(columns, rows, out.resolution, f64::NAN);
-        Some(Chunk::Raster(RasterChunk {
-            bands: BandedRaster::new(vec![outside]).expect("one band"),
-            bbox: out.bbox,
-            resolution: out.resolution,
-            crs: output.crs(),
-        }))
-    }
-
-    fn spread(&self, dirty: &Bbox, resolution: f64) -> Bbox {
-        let disc = self.disc().expand(resolution);
-        if dirty.intersects(&disc) {
-            disc
-        } else {
-            *dirty
-        }
+    fn region(&self) -> Option<Bbox> {
+        Some(Bbox::new(
+            self.observer_x - self.radius,
+            self.observer_y - self.radius,
+            self.observer_x + self.radius,
+            self.observer_y + self.radius,
+        ))
     }
 
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
