@@ -139,6 +139,7 @@ impl Dtype {
 pub enum ValueKind {
     Continuous,
     Categorical,
+    Peak,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]

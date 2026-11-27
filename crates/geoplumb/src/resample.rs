@@ -1,7 +1,4 @@
-//! driver-side resample onto an exact output grid, bilinear for continuous
-//! bands and nearest for categorical ones. the engine returns
-//! chunk-aligned windows at ladder resolutions, a tile wants an exact
-//! 256 px grid, this bridges the two
+use std::ops::Range;
 
 use terrano_core::{Raster, TypedBand};
 
@@ -30,6 +27,7 @@ pub fn resample_to_grid(
         cols,
         rows,
         cell_size: out_res_x,
+        cell_size_in_input_crs: out_res_x,
     };
     let bands = src
         .bands
@@ -50,6 +48,7 @@ pub(crate) struct OutputGrid {
     pub(crate) cols: usize,
     pub(crate) rows: usize,
     pub(crate) cell_size: f64,
+    pub(crate) cell_size_in_input_crs: f64,
 }
 
 pub(crate) fn resampled_band(
@@ -63,6 +62,12 @@ pub(crate) fn resampled_band(
         ValueKind::Categorical => picked(band, grid.cols, grid.rows, grid.cell_size, |index| {
             let (x, y) = point(index);
             nearest_index(chunk, x, y).filter(|&at| finite_value(band, at).is_some())
+        }),
+        ValueKind::Peak => picked(band, grid.cols, grid.rows, grid.cell_size, |index| {
+            let (x, y) = point(index);
+            peak_index(chunk, x, y, grid.cell_size_in_input_crs, |at| {
+                finite_value(band, at)
+            })
         }),
         ValueKind::Continuous => {
             let raster = band.to_raster();
@@ -86,7 +91,7 @@ pub(crate) fn sample_point(
 ) -> Option<f64> {
     match value_kind {
         ValueKind::Continuous => sample_bilinear(band, chunk, x, y),
-        ValueKind::Categorical => sample_nearest(band, chunk, x, y),
+        ValueKind::Categorical | ValueKind::Peak => sample_nearest(band, chunk, x, y),
     }
 }
 
@@ -147,6 +152,39 @@ pub(crate) fn nearest_index(chunk: &RasterChunk, x: f64, y: f64) -> Option<usize
     Some(row * chunk.width() + col)
 }
 
+fn centers_within(offset_cells: f64, half_width_cells: f64, len: usize) -> Range<usize> {
+    let first = (offset_cells - half_width_cells - 0.5).ceil().max(0.0) as usize;
+    let end = (offset_cells + half_width_cells - 0.5).ceil().max(0.0) as usize;
+    first.min(len)..end.min(len)
+}
+
+pub(crate) fn peak_index(
+    chunk: &RasterChunk,
+    x: f64,
+    y: f64,
+    cell_size_in_input_crs: f64,
+    value: impl Fn(usize) -> Option<f64>,
+) -> Option<usize> {
+    let half_width_cells = cell_size_in_input_crs / chunk.resolution / 2.0;
+    let rows = centers_within(
+        (chunk.bbox.max_y - y) / chunk.resolution,
+        half_width_cells,
+        chunk.height(),
+    );
+    let cols = centers_within(
+        (x - chunk.bbox.min_x) / chunk.resolution,
+        half_width_cells,
+        chunk.width(),
+    );
+    let width = chunk.width();
+    let highest_covered = rows
+        .flat_map(|row| cols.clone().map(move |col| row * width + col))
+        .filter_map(|at| value(at).map(|v| (at, v)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(at, _)| at);
+    highest_covered.or_else(|| nearest_index(chunk, x, y).filter(|&at| value(at).is_some()))
+}
+
 fn sample_nearest(band: &Raster, chunk: &RasterChunk, x: f64, y: f64) -> Option<f64> {
     let v = band.data()[nearest_index(chunk, x, y)?];
     (!band.is_nodata(v) && v.is_finite()).then_some(v)
@@ -171,5 +209,6 @@ pub(crate) fn reduce_block(value_kind: ValueKind, values: &mut [f64]) -> Option<
             }
             Some(mode)
         }
+        ValueKind::Peak => values.iter().copied().max_by(f64::total_cmp),
     }
 }

@@ -1,8 +1,3 @@
-//! first-wins mosaic: each output pixel takes the first input, wiring
-//! order, that has a value there. inputs are sampled onto the output grid,
-//! bilinearly for continuous bands and from the containing pixel for
-//! categorical ones, exact when an input shares the output alignment
-
 use std::borrow::Cow;
 
 use crate::bands::{RasterBands, finite_value, gathered, narrowed_like};
@@ -10,7 +5,7 @@ use crate::caps::{BandKinds, Caps, CapsSet, Constraint, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Fanin;
 use crate::error::Result;
-use crate::resample::{nearest_index, sample_point};
+use crate::resample::{nearest_index, peak_index, sample_point};
 use crate::window::WindowReq;
 use terrano_core::{Raster, TypedBand};
 
@@ -53,31 +48,40 @@ impl Fanin for Mosaic {
                     .iter()
                     .map(|c| c.bands.band(bi).expect("negotiated bands"))
                     .collect();
-                if value_kinds.band(bi) == ValueKind::Categorical {
-                    return gathered(&band, cols, rows, res, |index| {
+                match value_kinds.band(bi) {
+                    ValueKind::Categorical => gathered(&band, cols, rows, res, |index| {
                         let (x, y) = center(index);
                         inputs.iter().enumerate().find_map(|(k, c)| {
                             let at = nearest_index(c, x, y)?;
                             finite_value(band[k], at).map(|_| (k, at))
                         })
-                    });
-                }
-                let rasters: Vec<Cow<'_, Raster>> =
-                    band.iter().map(|band| band.to_raster()).collect();
-                let nodata = rasters[0].nodata;
-                let data = (0..cols * rows)
-                    .map(|index| {
+                    }),
+                    ValueKind::Peak => gathered(&band, cols, rows, res, |index| {
                         let (x, y) = center(index);
-                        inputs
-                            .iter()
-                            .zip(&rasters)
-                            .find_map(|(c, raster)| {
-                                sample_point(ValueKind::Continuous, raster, c, x, y)
+                        inputs.iter().enumerate().find_map(|(k, c)| {
+                            peak_index(c, x, y, res, |at| finite_value(band[k], at))
+                                .map(|at| (k, at))
+                        })
+                    }),
+                    ValueKind::Continuous => {
+                        let rasters: Vec<Cow<'_, Raster>> =
+                            band.iter().map(|band| band.to_raster()).collect();
+                        let nodata = rasters[0].nodata;
+                        let data = (0..cols * rows)
+                            .map(|index| {
+                                let (x, y) = center(index);
+                                inputs
+                                    .iter()
+                                    .zip(&rasters)
+                                    .find_map(|(c, raster)| {
+                                        sample_point(ValueKind::Continuous, raster, c, x, y)
+                                    })
+                                    .unwrap_or(nodata)
                             })
-                            .unwrap_or(nodata)
-                    })
-                    .collect();
-                Ok(narrowed_like(band[0], cols, rows, res, data))
+                            .collect();
+                        Ok(narrowed_like(band[0], cols, rows, res, data))
+                    }
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Chunk::Raster(RasterChunk {

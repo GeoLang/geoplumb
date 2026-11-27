@@ -769,6 +769,38 @@ fn config_parses_a_categorical_value_kind() {
     assert!(err.contains("ordinal"), "{err}");
 }
 
+#[test]
+fn config_parses_a_peak_value_kind() {
+    let config = Config::parse(&CATEGORICAL.replace("\"categorical\"", "\"peak\"")).unwrap();
+    assert!(matches!(
+        source_of(&config.layers[0]),
+        SourceConfig::Cog {
+            value_kind: ValueKindConfig::Peak,
+            ..
+        }
+    ));
+    let search = source_of(&config.layers[1])
+        .stac_search()
+        .expect("a stac source");
+    assert_eq!(
+        search.value_kinds,
+        BTreeMap::from([("map".to_string(), ValueKind::Peak)])
+    );
+
+    let per_asset = PER_ASSET_KINDS.replace(
+        "value_kind = { scl = \"categorical\" }",
+        "composite = \"median\", value_kind = { red = \"peak\" }",
+    );
+    let config = Config::parse(&per_asset).unwrap_or_else(|e| panic!("{e}"));
+    let search = source_of(&config.layers[0])
+        .stac_search()
+        .expect("a stac source");
+    assert_eq!(
+        search.asset_value_kinds().unwrap(),
+        [ValueKind::Peak, ValueKind::Continuous]
+    );
+}
+
 const PER_ASSET_KINDS: &str = r#"
 [[layer]]
 name = "clear"

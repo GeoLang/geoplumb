@@ -256,7 +256,7 @@ fn each_element_reprojects_a_lon_lat_dem_into_its_crs_and_pins_its_value_kind() 
                 crs: UTM_32N,
                 region,
             }),
-            ValueKind::Continuous,
+            ValueKind::Peak,
         ),
         (
             Box::new(Watershed {

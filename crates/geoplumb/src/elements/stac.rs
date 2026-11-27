@@ -253,8 +253,8 @@ impl Composite {
             (Composite::Latest | Composite::Min | Composite::Max, _) => Some(input),
             (
                 Composite::Mean | Composite::Median | Composite::Percentile(_) | Composite::StdDev,
-                ValueKind::Continuous,
-            ) => Some(ValueKind::Continuous),
+                ValueKind::Continuous | ValueKind::Peak,
+            ) => Some(input),
             (
                 Composite::Mean | Composite::Median | Composite::Percentile(_) | Composite::StdDev,
                 ValueKind::Categorical,

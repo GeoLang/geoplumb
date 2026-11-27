@@ -133,7 +133,7 @@ impl Transform for FlowAccumulation {
     }
 
     fn constraint(&self) -> Constraint {
-        projected_dem(self.crs, ValueKind::Continuous)
+        projected_dem(self.crs, ValueKind::Peak)
     }
 
     fn configure(&mut self, _input: &Caps, _output: &Caps) -> Result<()> {

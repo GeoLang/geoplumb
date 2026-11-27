@@ -183,6 +183,7 @@ pub enum ValueKindConfig {
     #[default]
     Continuous,
     Categorical,
+    Peak,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -470,6 +471,7 @@ impl From<ValueKindConfig> for ValueKind {
         match kind {
             ValueKindConfig::Continuous => ValueKind::Continuous,
             ValueKindConfig::Categorical => ValueKind::Categorical,
+            ValueKindConfig::Peak => ValueKind::Peak,
         }
     }
 }

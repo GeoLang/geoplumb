@@ -1,10 +1,3 @@
-//! crs change via projicio, for raster and vector links alike. the request
-//! plan inverse-projects the output window into the source crs. a raster
-//! compute inverse-maps each output pixel center and samples the input
-//! there, bilinearly for continuous bands and from the containing pixel
-//! for categorical ones, a vector compute forward-projects the fragments
-//! themselves
-
 use std::borrow::Cow;
 
 use crate::bands::RasterBands;
@@ -208,10 +201,13 @@ pub(crate) fn warp_to_grid(
     let src_pts = inverse
         .convert_batch(&centers)
         .map_err(|e| Error::Projection(e.to_string()))?;
+    let center_x = (out.bbox.min_x + out.bbox.max_x) / 2.0;
+    let center_y = (out.bbox.min_y + out.bbox.max_y) / 2.0;
     let grid = OutputGrid {
         cols,
         rows,
         cell_size: res,
+        cell_size_in_input_crs: local_scale(inverse, center_x, center_y, res),
     };
     let bands = input
         .bands
