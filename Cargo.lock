@@ -2071,7 +2071,7 @@ dependencies = [
 [[package]]
 name = "terrano-core"
 version = "0.3.0"
-source = "git+https://github.com/GeoLang/terrano.git?branch=master#4af02282c9b70c865acb80d5c4f0d00c887d42c6"
+source = "git+https://github.com/GeoLang/terrano.git?branch=master#30e5ff425c61ba6fb9cb8f08b119255be33981c2"
 dependencies = [
  "flate2",
  "ruzstd",

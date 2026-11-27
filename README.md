@@ -147,7 +147,7 @@ geoplumb info <file.tif>
 
 `pyramid` writes every xyz tile covering a lon/lat bbox from `--min-zoom`, 0 by default, to `--max-zoom`, as `<dir>/z/x/y.png` for a raster layer and `<dir>/z/x/y.mvt` for a vector layer. Each file holds the bytes `GET /tiles/{layer}/{z}/{x}/{y}` serves for that tile, so any static file server serves the directory as the layer.
 
-`info` prints one `key: value` line each for size, band count, sample format, bits, CRS, geotransform (GDAL order), compression, predictor and nodata, then the overview sizes as a list. It reads what terrano's `CogReader` reads: tiled or striped, uncompressed, LZW, deflate or ZSTD, pixel- or band-interleaved.
+`info` prints one `key: value` line each for size, band count, sample format, bits, CRS, geotransform (GDAL order), compression, predictor and nodata, then the overview sizes as a list. It reads what terrano's `CogReader` reads: classic or BigTIFF, tiled or striped, uncompressed, LZW, deflate or ZSTD, pixel- or band-interleaved.
 
 ```
 size: 600 x 400
