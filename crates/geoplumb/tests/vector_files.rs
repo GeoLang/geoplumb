@@ -149,6 +149,69 @@ async fn a_shapefile_without_an_epsg_prj_takes_the_crs_it_is_given() {
     assert_eq!(chunk.features.len(), 2);
 }
 
+fn write_named_point(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join("countries.shp");
+    let table = TableWriterBuilder::new().add_character_field(field("name"), 32);
+    let mut writer = Writer::from_path(&path, table).unwrap();
+    let mut record = Record::default();
+    record.insert("name".into(), FieldValue::Character(Some(name.to_string())));
+    writer
+        .write_shape_and_record(&shapefile::Point::new(-5.5, 7.5), &record)
+        .unwrap();
+    path
+}
+
+fn set_language_driver(shp: &Path, language_driver: u8) -> Vec<u8> {
+    let dbf = shp.with_extension("dbf");
+    let mut bytes = std::fs::read(&dbf).unwrap();
+    // dbf header byte 29 is the language driver id, 0x57 is gdal's default ISO-8859-1
+    bytes[29] = language_driver;
+    std::fs::write(&dbf, &bytes).unwrap();
+    bytes
+}
+
+async fn read_name(shp: &Path) -> Value {
+    let chunk = every_feature(&VecSrc::from_shapefile(shp, Some(Crs::WGS84)).unwrap()).await;
+    chunk.features[0].properties["name"].clone()
+}
+
+#[tokio::test]
+async fn a_dbf_whose_language_driver_names_latin1_reads_as_latin1() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_named_point(dir.path(), "Cote d'Ivoire");
+    let mut bytes = set_language_driver(&path, 0x57);
+    let at = bytes.windows(4).position(|w| w == b"Cote").unwrap();
+    // 0xF4 is ô in ISO-8859-1 and not valid UTF-8 on its own
+    bytes[at + 1] = 0xF4;
+    std::fs::write(path.with_extension("dbf"), &bytes).unwrap();
+
+    assert_eq!(read_name(&path).await, json!("Côte d'Ivoire"));
+}
+
+#[tokio::test]
+async fn a_cpg_naming_utf8_wins_over_the_language_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_named_point(dir.path(), "Côte d'Ivoire");
+    set_language_driver(&path, 0x57);
+    std::fs::write(path.with_extension("cpg"), "UTF-8\r\n").unwrap();
+
+    // read as ISO-8859-1 the two utf-8 bytes of ô would come back as Ã´
+    assert_eq!(read_name(&path).await, json!("Côte d'Ivoire"));
+}
+
+#[test]
+fn a_declared_encoding_geoplumb_cannot_decode_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_named_point(dir.path(), "Abidjan");
+    std::fs::write(path.with_extension("cpg"), "437").unwrap();
+
+    let message = VecSrc::from_shapefile(&path, Some(Crs::WGS84))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("CP437"), "{message}");
+}
+
 #[tokio::test]
 async fn a_csv_reads_points_with_typed_properties() {
     let dir = tempfile::tempdir().unwrap();

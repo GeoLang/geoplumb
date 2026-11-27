@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, ErrorKind};
+use std::io::{BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use shapefile::dbase::{self, FieldValue};
+use shapefile::dbase::encoding::DynEncoding;
+use shapefile::dbase::{self, FieldValue, Unicode};
 use shapefile::record::traits::HasXY;
 use shapefile::{PolygonRing, Shape, ShapeReader};
 use topoi_core::geojson::{Feature, FeatureCollection, FeatureGeometry};
@@ -29,7 +30,9 @@ impl VecSrc {
         let shapes = ShapeReader::with_shx(open(path)?, open(&sidecar(path, "shx"))?)
             .map_err(|e| named(e.to_string()))?;
         let dbf = sidecar(path, "dbf");
-        let table = dbase::Reader::new(open(&dbf)?)
+        let table = dbase::ReaderBuilder::new()
+            .with_encoding(dbf_encoding(path, &dbf)?)
+            .build(open(&dbf)?)
             .map_err(|e| Error::Source(format!("{}: {e}", dbf.display())))?;
         let mut reader = shapefile::Reader::new(shapes, table);
 
@@ -107,6 +110,144 @@ fn prj_crs(shp: &Path) -> Result<Crs> {
                 prj.display()
             ))
         })
+}
+
+// gdal's GetEncodingFromLDIDNumber, the code page each dbf language driver id names
+const LANGUAGE_DRIVER_CODE_PAGES: &[(u8, u16)] = &[
+    (1, 437),
+    (2, 850),
+    (3, 1252),
+    (4, 10000),
+    (8, 865),
+    (10, 850),
+    (11, 437),
+    (13, 437),
+    (14, 850),
+    (15, 437),
+    (16, 850),
+    (17, 437),
+    (18, 850),
+    (19, 932),
+    (20, 850),
+    (21, 437),
+    (22, 850),
+    (23, 865),
+    (24, 437),
+    (25, 437),
+    (26, 850),
+    (27, 437),
+    (28, 863),
+    (29, 850),
+    (31, 852),
+    (34, 852),
+    (35, 852),
+    (36, 860),
+    (37, 850),
+    (38, 866),
+    (55, 850),
+    (64, 852),
+    (77, 936),
+    (78, 949),
+    (79, 950),
+    (80, 874),
+    (88, 1252),
+    (89, 1252),
+    (100, 852),
+    (101, 866),
+    (102, 865),
+    (103, 861),
+    (104, 895),
+    (105, 620),
+    (106, 737),
+    (107, 857),
+    (108, 863),
+    (120, 950),
+    (121, 949),
+    (122, 936),
+    (123, 932),
+    (124, 874),
+    (134, 737),
+    (135, 852),
+    (136, 857),
+    (150, 10007),
+    (151, 10029),
+    (200, 1250),
+    (201, 1251),
+    (202, 1254),
+    (203, 1253),
+    (204, 1257),
+];
+
+fn cpg_encoding_name(line: &str) -> String {
+    // gdal's GetEncodingFromCPG
+    let digits: String = line
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    match digits.parse::<u32>() {
+        Ok(code) if (437..=950).contains(&code) || (1250..=1258).contains(&code) => {
+            return format!("CP{code}");
+        }
+        _ => {}
+    }
+    let upper = line.to_ascii_uppercase();
+    if upper.starts_with("8859") {
+        let rest = &line[4..];
+        return format!("ISO-8859-{}", rest.strip_prefix('-').unwrap_or(rest));
+    }
+    if upper.starts_with("UTF-8") || upper.starts_with("UTF8") {
+        return "UTF-8".to_string();
+    }
+    if upper.starts_with("ANSI 1251") {
+        return "CP1251".to_string();
+    }
+    line.to_string()
+}
+
+fn declared_encoding(shp: &Path, dbf: &Path) -> Result<Option<String>> {
+    // gdal's DBFOpenLL reads the .cpg's first line, then the language driver id at header byte 29
+    let cpg = sidecar(shp, "cpg");
+    match std::fs::read(&cpg) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let line = &text[..text.find(['\r', '\n']).unwrap_or(text.len())];
+            if !line.is_empty() {
+                return Ok(Some(cpg_encoding_name(line)));
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Source(format!("{}: {e}", cpg.display()))),
+    }
+    let mut header = [0u8; 30];
+    File::open(dbf)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|e| Error::Source(format!("{}: {e}", dbf.display())))?;
+    let language_driver = header[29];
+    // gdal names 87, the id its own shapefile writer defaults to, iso-8859-1 rather than a code page
+    if language_driver == 87 {
+        return Ok(Some("ISO-8859-1".to_string()));
+    }
+    Ok(LANGUAGE_DRIVER_CODE_PAGES
+        .iter()
+        .find(|(id, _)| *id == language_driver)
+        .map(|(_, code_page)| format!("CP{code_page}")))
+}
+
+fn dbf_encoding(shp: &Path, dbf: &Path) -> Result<DynEncoding> {
+    // gdal recodes nothing when neither the .cpg nor the language driver id names an encoding
+    let Some(name) = declared_encoding(shp, dbf)? else {
+        return Ok(Unicode.into());
+    };
+    if name.eq_ignore_ascii_case("UTF-8") {
+        return Ok(Unicode.into());
+    }
+    DynEncoding::from_name(&name).ok_or_else(|| {
+        Error::Source(format!(
+            "{}: the dbf text is in {name}, which geoplumb cannot decode",
+            dbf.display()
+        ))
+    })
 }
 
 fn coord<P: HasXY>(point: &P) -> Coord {
