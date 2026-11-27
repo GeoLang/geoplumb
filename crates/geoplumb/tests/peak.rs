@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use geoplumb::caps::{BandKinds, ValueKind};
 use geoplumb::element::Source;
-use geoplumb::elements::{CogSrc, Mosaic, RasterSrc, Reproject};
+use geoplumb::elements::algebra::AlgebraOp;
+use geoplumb::elements::{CogSrc, MapAlgebra, Mosaic, RasterSrc, Reproject};
 use geoplumb::export::{ExportGrid, write_cog};
 use geoplumb::resample::resample_to_grid;
 use geoplumb::{Bbox, Crs, Engine, Graph, NodeId, RasterBands, RasterChunk, WindowReq};
-use terrano_core::{BandedRaster, CogParams, CogReader, Raster};
+use terrano_core::{BandedRaster, CogParams, CogReader, Raster, UnaryOp};
 
 const W: usize = 1100;
 const H: usize = 600;
@@ -90,11 +91,11 @@ async fn pull(engine: &Engine, node: NodeId, bbox: Bbox, resolution: f64) -> Ras
         .into_owned()
 }
 
-fn rows_reaching_the_peak(raster: &Raster) -> usize {
+fn rows_reaching(raster: &Raster, value: f64) -> usize {
     raster
         .data()
         .chunks(raster.width())
-        .filter(|row| row.contains(&PEAK))
+        .filter(|row| row.contains(&value))
         .count()
 }
 
@@ -151,7 +152,7 @@ async fn a_peak_line_keeps_its_value_through_a_2x_decimation_where_continuous_ha
         ("CogSrc", decimated(open_cog(ValueKind::Peak)).await),
     ] {
         assert_eq!(peak.width(), 32, "{what}");
-        assert_eq!(rows_reaching_the_peak(&peak), 32, "{what}");
+        assert_eq!(rows_reaching(&peak, PEAK), 32, "{what}");
     }
 
     for (what, continuous) in [
@@ -181,8 +182,7 @@ fn mercator_y(latitude: f64) -> f64 {
             .ln()
 }
 
-#[tokio::test]
-async fn a_peak_line_keeps_its_value_through_a_reprojection_sampling_up_2x() {
+async fn warped_onto_mercator(mut graph: Graph, input: NodeId) -> (BandKinds, Raster) {
     // web mercator x is longitude times a constant
     let resolution = CELL * MERCATOR_METERS_PER_DEGREE / 2.0;
     let origin_x = ORIGIN_X * MERCATOR_METERS_PER_DEGREE;
@@ -194,36 +194,69 @@ async fn a_peak_line_keeps_its_value_through_a_reprojection_sampling_up_2x() {
         max_y: origin_y,
         min_y: origin_y - 16.0 * resolution,
     };
+    let rp = graph.add_transform(
+        input,
+        Box::new(Reproject::onto_grid(
+            Crs::WEB_MERCATOR,
+            origin_x,
+            origin_y,
+            resolution,
+        )),
+    );
+    let engine = Engine::new(graph, 64 << 20).unwrap();
+    let value_kinds = engine.caps(rp).raster().value_kinds.clone();
+    (value_kinds, pull(&engine, rp, bbox, resolution).await)
+}
+
+#[tokio::test]
+async fn a_peak_line_keeps_its_value_through_a_reprojection_sampling_up_2x() {
     let warped = |value_kind| async move {
         let mut g = Graph::new();
         let src = g.add_source(Box::new(line_src(ORIGIN_X, ORIGIN_Y, value_kind)));
-        let rp = g.add_transform(
-            src,
-            Box::new(Reproject::onto_grid(
-                Crs::WEB_MERCATOR,
-                origin_x,
-                origin_y,
-                resolution,
-            )),
-        );
-        let engine = Engine::new(g, 64 << 20).unwrap();
-        assert_eq!(
-            engine.caps(rp).raster().value_kinds,
-            BandKinds::from(value_kind)
-        );
-        pull(&engine, rp, bbox, resolution).await
+        warped_onto_mercator(g, src).await
     };
 
-    let peak = warped(ValueKind::Peak).await;
+    let (value_kinds, peak) = warped(ValueKind::Peak).await;
+    assert_eq!(value_kinds, BandKinds::from(ValueKind::Peak));
     assert!(peak.height() > 0);
-    assert_eq!(rows_reaching_the_peak(&peak), peak.height());
+    assert_eq!(rows_reaching(&peak, PEAK), peak.height());
 
-    let continuous = warped(ValueKind::Continuous).await;
+    let (value_kinds, continuous) = warped(ValueKind::Continuous).await;
+    assert_eq!(value_kinds, BandKinds::from(ValueKind::Continuous));
     assert!(
         highest(&continuous) < 0.8 * PEAK,
         "bilinear sampling a quarter cell off the line reached {}",
         highest(&continuous)
     );
+}
+
+#[tokio::test]
+async fn a_non_decreasing_unary_op_keeps_a_peak_line_through_a_reprojection() {
+    let warped = |value_kind, op| async move {
+        let mut g = Graph::new();
+        let src = g.add_source(Box::new(line_src(ORIGIN_X, ORIGIN_Y, value_kind)));
+        let algebra = g.add_transform(src, Box::new(MapAlgebra::new(AlgebraOp::Unary(op))));
+        warped_onto_mercator(g, algebra).await
+    };
+
+    let (value_kinds, logged) = warped(ValueKind::Peak, UnaryOp::Log).await;
+    assert_eq!(value_kinds, BandKinds::from(ValueKind::Peak));
+    assert!(logged.height() > 0);
+    assert_eq!(rows_reaching(&logged, PEAK.ln()), logged.height());
+
+    let (value_kinds, absolute) = warped(ValueKind::Peak, UnaryOp::Abs).await;
+    assert_eq!(value_kinds, BandKinds::from(ValueKind::Continuous));
+    assert!(
+        highest(&absolute) < 0.8 * PEAK,
+        "abs of a peak line is continuous, so bilinear sampling blends it, reached {}",
+        highest(&absolute)
+    );
+
+    let (value_kinds, _) = warped(ValueKind::Peak, UnaryOp::Multiply(-1.0)).await;
+    assert_eq!(value_kinds, BandKinds::from(ValueKind::Continuous));
+
+    let (value_kinds, _) = warped(ValueKind::Categorical, UnaryOp::Log).await;
+    assert_eq!(value_kinds, BandKinds::from(ValueKind::Continuous));
 }
 
 #[test]
@@ -252,14 +285,8 @@ fn a_peak_line_keeps_its_value_through_a_resample_sampling_down() {
         .into_owned()
     };
 
-    assert_eq!(
-        rows_reaching_the_peak(&resampled(ValueKind::Peak)),
-        out_side
-    );
-    assert_eq!(
-        rows_reaching_the_peak(&resampled(ValueKind::Categorical)),
-        0
-    );
+    assert_eq!(rows_reaching(&resampled(ValueKind::Peak), PEAK), out_side);
+    assert_eq!(rows_reaching(&resampled(ValueKind::Categorical), PEAK), 0);
     assert!(highest(&resampled(ValueKind::Continuous)) < 0.5 * PEAK);
 }
 
@@ -284,7 +311,7 @@ async fn a_mosaic_keeps_a_peak_line_where_continuous_blends_it() {
 
     let peak = mosaic(ValueKind::Peak).await;
     assert_eq!(peak.height(), 64);
-    assert_eq!(rows_reaching_the_peak(&peak), peak.height());
+    assert_eq!(rows_reaching(&peak, PEAK), peak.height());
 
     let continuous = mosaic(ValueKind::Continuous).await;
     assert!(
@@ -325,7 +352,7 @@ async fn an_export_keeps_a_peak_line_on_every_overview() {
     for level in 0..levels {
         let written = written_level(&bytes, level);
         assert_eq!(
-            rows_reaching_the_peak(&written),
+            rows_reaching(&written, PEAK),
             written.height(),
             "level {level}"
         );

@@ -1,7 +1,9 @@
 //! per-cell map algebra and reclassification over terrano ops
 
 use crate::bands::{RasterBands, narrowed_raster};
-use crate::caps::{BandKinds, Caps, CapsSet, Constraint, Dtype, ValueKind};
+use crate::caps::{
+    BandKinds, Caps, CapsPattern, CapsSet, Constraint, Dtype, RasterPattern, SetField, ValueKind,
+};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::{Fanin, Transform};
 use crate::error::{Error, Result};
@@ -72,6 +74,22 @@ impl MapAlgebra {
     }
 }
 
+// the largest of f(a) over a block is f of the largest a only for a non-decreasing f
+fn is_non_decreasing(op: &UnaryOp) -> bool {
+    match op {
+        UnaryOp::Add(_) | UnaryOp::Sqrt | UnaryOp::Log => true,
+        UnaryOp::Multiply(factor) => *factor > 0.0,
+        UnaryOp::Abs => false,
+    }
+}
+
+fn peak_rasters() -> CapsSet {
+    CapsSet::one(CapsPattern::Raster(RasterPattern {
+        value_kinds: SetField::one(BandKinds::from(ValueKind::Peak)),
+        ..RasterPattern::default()
+    }))
+}
+
 impl Transform for MapAlgebra {
     fn identity(&self) -> String {
         let op = match &self.op {
@@ -86,15 +104,17 @@ impl Transform for MapAlgebra {
     }
 
     fn constraint(&self) -> Constraint {
-        let value_kind = match self.op {
-            AlgebraOp::Unary(_) => ValueKind::Continuous,
-            AlgebraOp::Reclassify(_) => ValueKind::Categorical,
+        let pinned = |input, value_kind| {
+            Constraint::pinned_value_kind_and_dtype(input, value_kind, self.output_dtype)
         };
-        Constraint::pinned_value_kind_and_dtype(
-            CapsSet::any_raster(),
-            value_kind,
-            self.output_dtype,
-        )
+        match &self.op {
+            AlgebraOp::Unary(op) if is_non_decreasing(op) => Constraint::AnyOf(vec![
+                pinned(peak_rasters(), ValueKind::Peak),
+                pinned(CapsSet::any_raster(), ValueKind::Continuous),
+            ]),
+            AlgebraOp::Unary(_) => pinned(CapsSet::any_raster(), ValueKind::Continuous),
+            AlgebraOp::Reclassify(_) => pinned(CapsSet::any_raster(), ValueKind::Categorical),
+        }
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
