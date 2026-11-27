@@ -2,6 +2,7 @@
 
 ## 2026-11-27
 
+- topoi-core locked to 2654af7, on i_overlay 9.2.1, which binds each dissolved hole to its own shell itself. `polygonize` output is unchanged: the 1024 px WorldCover window still matches GDAL in polygon count, hole count and area for every class
 - a spill file write that finishes after its chunk was invalidated no longer replaces or deletes the file of the chunk recomputed after it. The rename into place runs under the cache lock and only while the entry still holds the chunk written, so an evicted and reloaded entry never reads the older chunk and never loses its file to the older write
 - the unary `MapAlgebra` ops `add`, `sqrt`, `log` and `multiply` by a positive factor keep `Peak` over a peak input, so `log` of a flow accumulation keeps its one-cell channels through reprojection, tiles and export overviews. `abs`, `multiply` by zero or less, and every unary op over a continuous or categorical input still output `Continuous`
 
