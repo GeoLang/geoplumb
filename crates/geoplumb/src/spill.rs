@@ -151,23 +151,19 @@ fn parse_chunk_file_name(name: &str) -> Option<(usize, ChunkKey)> {
     (chunk_file_name(node, key) == name).then_some((node, key))
 }
 
-/// writes under a temporary name and renames into place, so a chunk name
-/// never holds a partial file
-pub(crate) fn write_chunk(path: &Path, chunk: &Chunk) -> Result<()> {
-    // per write, so two engines over one graph never write the same temp file
+pub(crate) fn write_temporary_chunk(path: &Path, chunk: &Chunk) -> Result<PathBuf> {
+    // per write, so two writes of one chunk name never share a temp file
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let partial = path.with_extension(format!(
+    let temporary = path.with_extension(format!(
         "{}-{}.tmp",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let written = write_chunk_file(&partial, chunk).and_then(|()| {
-        std::fs::rename(&partial, path).map_err(|e| Error::Source(format!("spill write: {e}")))
-    });
-    if written.is_err() {
-        let _ = std::fs::remove_file(&partial);
+    if let Err(error) = write_chunk_file(&temporary, chunk) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
     }
-    written
+    Ok(temporary)
 }
 
 fn write_chunk_file(path: &Path, chunk: &Chunk) -> Result<()> {
@@ -611,8 +607,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0_0_0_0.bin");
         let chunk = typed_chunk();
-        write_chunk(&path, &Chunk::Raster(chunk.clone())).unwrap();
-        let back = read_chunk(&path).unwrap().into_raster().unwrap();
+        let written = write_temporary_chunk(&path, &Chunk::Raster(chunk.clone())).unwrap();
+        let back = read_chunk(&written).unwrap().into_raster().unwrap();
 
         assert_eq!(
             (back.bbox, back.resolution, back.crs),

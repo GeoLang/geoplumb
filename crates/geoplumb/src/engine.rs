@@ -684,29 +684,36 @@ impl ChunkCache {
         {
             let path = sp.store.path(node, key);
             let c = chunk.clone();
-            let written = path.clone();
-            if offload(move || spill::write_chunk(&written, &c))
-                .await
-                .is_ok()
-            {
-                let mut state = self.state.lock().unwrap();
-                if let Some(Entry::Ready {
-                    chunk: ready,
-                    spilled,
-                    ..
-                }) = state.entries.get_mut(&(node, key))
-                    && Arc::ptr_eq(ready, &chunk)
-                {
-                    *spilled = true;
-                } else {
-                    // evicted or invalidated mid-write, and the next engine
-                    // over this graph would load the orphan file
-                    drop(state);
-                    let _ = std::fs::remove_file(&path);
-                }
+            if let Ok(temporary) = offload(move || spill::write_temporary_chunk(&path, &c)).await {
+                self.install_spill_file(node, key, &chunk, &temporary);
             }
         }
         Ok(chunk)
+    }
+
+    fn install_spill_file(
+        &self,
+        node: usize,
+        key: ChunkKey,
+        chunk: &Arc<Chunk>,
+        temporary: &std::path::Path,
+    ) {
+        let store = &self.spill.as_ref().expect("spill files need a store").store;
+        let mut state = self.state.lock().unwrap();
+        // chunks invalidated mid-write overwrite or delete their successor's file when the rename runs outside the lock
+        if let Some(Entry::Ready {
+            chunk: ready,
+            spilled,
+            ..
+        }) = state.entries.get_mut(&(node, key))
+            && Arc::ptr_eq(ready, chunk)
+            && std::fs::rename(temporary, store.path(node, key)).is_ok()
+        {
+            *spilled = true;
+            return;
+        }
+        drop(state);
+        let _ = std::fs::remove_file(temporary);
     }
 
     fn finish_chunk(
@@ -1240,4 +1247,81 @@ pub async fn materialize(
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::caps::Crs;
+    use terrano_core::Raster;
+
+    fn constant_chunk(value: f64) -> Arc<Chunk> {
+        let raster = Raster::from_vec(2, 2, vec![value; 4], 1.0, f64::NAN).unwrap();
+        Arc::new(Chunk::Raster(RasterChunk {
+            bands: RasterBands::from_rasters(vec![raster]).unwrap(),
+            bbox: Bbox::new(0.0, 0.0, 2.0, 2.0),
+            resolution: 1.0,
+            crs: Crs::WGS84,
+        }))
+    }
+
+    fn first_value(path: &std::path::Path) -> f64 {
+        spill::read_chunk(path)
+            .unwrap()
+            .into_raster()
+            .unwrap()
+            .bands
+            .band(0)
+            .unwrap()
+            .to_raster()
+            .data()[0]
+    }
+
+    #[test]
+    fn a_spill_write_finishing_after_its_chunk_was_replaced_leaves_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = SpillStore::open(dir.path().to_path_buf()).unwrap();
+        let key = ChunkKey {
+            level: 0,
+            ix: 0,
+            iy: 0,
+            time: None,
+        };
+        let path = store.path(0, key);
+        let cache = ChunkCache {
+            state: Mutex::new(CacheState::default()),
+            budget_bytes: 1 << 20,
+            gpu_budget_bytes: None,
+            spill: Some(SpillState {
+                store,
+                budget_bytes: 1 << 20,
+            }),
+        };
+        let invalidated = constant_chunk(1.0);
+        let recomputed = constant_chunk(2.0);
+        let invalidated_write = spill::write_temporary_chunk(&path, &invalidated).unwrap();
+        cache.state.lock().unwrap().entries.insert(
+            (0, key),
+            Entry::Ready {
+                chunk: recomputed.clone(),
+                bytes: recomputed.byte_size(),
+                last_used: 0,
+                spilled: false,
+                domain: Domain::System,
+            },
+        );
+        let recomputed_write = spill::write_temporary_chunk(&path, &recomputed).unwrap();
+
+        cache.install_spill_file(0, key, &recomputed, &recomputed_write);
+        cache.install_spill_file(0, key, &invalidated, &invalidated_write);
+
+        assert_eq!(first_value(&path), 2.0);
+        assert!(!invalidated_write.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let state = cache.state.lock().unwrap();
+        assert!(matches!(
+            state.entries.get(&(0, key)),
+            Some(Entry::Ready { spilled: true, .. })
+        ));
+    }
 }
