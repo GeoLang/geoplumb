@@ -12,7 +12,7 @@ description = "Pull-based geospatial compute pipeline with caps negotiation"
 rust-version = "1.88"
 
 [workspace.dependencies]
-terrano-core = { git = "https://github.com/GeoLang/terrano.git", branch = "master" }
+terrano-core = { git = "https://github.com/GeoLang/terrano.git", branch = "master", features = ["turbojpeg"] }
 projicio-core = { git = "https://github.com/GeoLang/projicio.git", branch = "master" }
 nubis-core = { git = "https://github.com/GeoLang/nubis.git", branch = "master" }
 topoi-core = { git = "https://github.com/GeoLang/topoi.git", branch = "master" }

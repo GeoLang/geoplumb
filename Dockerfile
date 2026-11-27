@@ -4,6 +4,9 @@ FROM rust:bookworm AS builder
 ARG GDAL=0
 
 WORKDIR /app
+# turbojpeg builds libjpeg-turbo from source with cmake, and nasm for its SIMD code
+RUN apt-get update && apt-get install -y --no-install-recommends cmake nasm \
+    && rm -rf /var/lib/apt/lists/*
 RUN case "$GDAL" in 0|1) ;; *) echo "GDAL must be 0 or 1, got $GDAL" >&2; exit 1 ;; esac \
     && if [ "$GDAL" = 1 ]; then \
         apt-get update && apt-get install -y --no-install-recommends libgdal-dev \

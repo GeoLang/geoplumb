@@ -234,8 +234,10 @@ pub fn cog_info(path: &Path) -> Result<String, String> {
     let compression = match base.compression() {
         1 => "none".to_string(),
         5 => "lzw".to_string(),
+        7 => "jpeg".to_string(),
         8 => "deflate".to_string(),
         50000 => "zstd".to_string(),
+        50001 => "webp".to_string(),
         other => format!("tiff code {other}"),
     };
     let predictor = match base.predictor() {
