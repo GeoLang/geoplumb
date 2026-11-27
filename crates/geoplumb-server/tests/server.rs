@@ -13,8 +13,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use geoplumb::caps::ValueKind;
 use geoplumb_server::config::{
-    BinaryOpConfig, BurnConfig, Config, FaninConfig, FocalOpConfig, LayerConfig, OpConfig,
-    SourceConfig, UnaryOpConfig, ValueKindConfig,
+    BinaryOpConfig, BurnConfig, ColorSelectionConfig, Config, FaninConfig, FocalOpConfig,
+    LayerConfig, OpConfig, SourceConfig, UnaryOpConfig, ValueKindConfig,
 };
 use geoplumb_server::{Layer, parse_time, router};
 use jung_mvt::{AttributeValue, TileGeometry, VectorLayer, decode_tile};
@@ -3209,4 +3209,164 @@ async fn a_clip_raster_layer_blanks_the_tile_past_its_cutline() {
         }
     }
     assert!(kept > 0 && blanked > 0, "{kept} kept, {blanked} blanked");
+}
+
+// west of this longitude the relief fixture holds RELIEF_VALUE, east of it nodata
+const RELIEF_EDGE_LON: f64 = 7.34;
+const RELIEF_VALUE: f64 = 200.0;
+const RELIEF_COLORS: &str = "100 0 0 0\n300 200 100 50\n";
+// RELIEF_VALUE lies halfway between the two stops
+const RELIEF_MIDPOINT: [u8; 4] = [100, 50, 25, 255];
+
+fn write_relief_fixture(dir: &Path) -> (String, String) {
+    let mut data = Vec::with_capacity(W * H);
+    for _ in 0..H {
+        for col in 0..W {
+            let lon = ORIGIN_X + (col as f64 + 0.5) * CELL;
+            data.push(if lon < RELIEF_EDGE_LON {
+                RELIEF_VALUE
+            } else {
+                f64::NAN
+            });
+        }
+    }
+    let raster = Raster::from_vec(W, H, data, CELL, f64::NAN).unwrap();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    write_cog(&raster, &cog_params(), &mut buf).unwrap();
+    let cog = dir.join("relief.tif");
+    std::fs::write(&cog, buf.into_inner()).unwrap();
+    let colors = dir.join("relief.txt");
+    std::fs::write(&colors, RELIEF_COLORS).unwrap();
+    let toml_path = |path: &Path| path.display().to_string().replace('\\', "/");
+    (toml_path(&cog), toml_path(&colors))
+}
+
+fn rgba_pixels(bytes: &[u8]) -> Vec<[u8; 4]> {
+    let mut reader = png::Decoder::new(bytes).read_info().expect("a png");
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    assert_eq!(info.color_type, png::ColorType::Rgba);
+    buf[..info.buffer_size()].as_chunks::<4>().0.to_vec()
+}
+
+async fn relief_tile(layer_file: &str, layer: &str) -> Vec<[u8; 4]> {
+    let app = app(layer_file);
+    let (x, y) = tile_of(12, 7.3, 46.8);
+    let (status, content_type, body) =
+        get_typed(&app, &format!("/tiles/{layer}/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(content_type, "image/png");
+    rgba_pixels(&body)
+}
+
+// a z12 tile holds about 33000 pixels on each side of RELIEF_EDGE_LON
+const RELIEF_SIDE_PIXELS: usize = 20_000;
+
+#[tokio::test]
+async fn a_layer_ending_in_color_relief_serves_rgba_png() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cog, colors) = write_relief_fixture(dir.path());
+    let pixels = relief_tile(
+        &format!(
+            r#"
+[[layer]]
+name = "relief"
+source = {{ kind = "cog", path = "{cog}" }}
+
+[[layer.op]]
+kind = "color_relief"
+color_file = "{colors}"
+"#
+        ),
+        "relief",
+    )
+    .await;
+    let opaque: Vec<&[u8; 4]> = pixels.iter().filter(|pixel| pixel[3] == 255).collect();
+    assert!(opaque.len() > RELIEF_SIDE_PIXELS, "{} opaque", opaque.len());
+    // the warp to web mercator blends colour bands only beside transparent pixels
+    assert!(opaque.iter().all(|pixel| **pixel == RELIEF_MIDPOINT));
+    let transparent = pixels
+        .iter()
+        .filter(|pixel| **pixel == [0, 0, 0, 0])
+        .count();
+    assert!(
+        transparent > RELIEF_SIDE_PIXELS,
+        "{transparent} transparent"
+    );
+}
+
+#[tokio::test]
+async fn a_ramp_colours_a_single_band_layer_as_rgba_png() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cog, colors) = write_relief_fixture(dir.path());
+    let pixels = relief_tile(
+        &format!(
+            r#"
+[[layer]]
+name = "ramped"
+source = {{ kind = "cog", path = "{cog}" }}
+ramp = "{colors}"
+"#
+        ),
+        "ramped",
+    )
+    .await;
+    let midpoint = pixels
+        .iter()
+        .filter(|pixel| **pixel == RELIEF_MIDPOINT)
+        .count();
+    let transparent = pixels
+        .iter()
+        .filter(|pixel| **pixel == [0, 0, 0, 0])
+        .count();
+    assert!(midpoint > RELIEF_SIDE_PIXELS, "{midpoint} coloured");
+    assert!(
+        transparent > RELIEF_SIDE_PIXELS,
+        "{transparent} transparent"
+    );
+    assert_eq!(midpoint + transparent, pixels.len());
+}
+
+#[test]
+fn color_relief_and_ramp_layers_refuse_what_they_cannot_colour() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cog, colors) = write_relief_fixture(dir.path());
+    let percent = dir.path().join("percent.txt");
+    std::fs::write(&percent, "0% black\n100% white\n").unwrap();
+    let percent = percent.display().to_string().replace('\\', "/");
+    let mauve = dir.path().join("mauve.txt");
+    std::fs::write(&mauve, "0 mauve\n").unwrap();
+    let mauve = mauve.display().to_string().replace('\\', "/");
+    let layer = |tail: String| {
+        format!(
+            "[[layer]]\nname = \"relief\"\nsource = {{ kind = \"cog\", path = \"{cog}\" }}\n{tail}"
+        )
+    };
+    let relief_op =
+        |file: &str| format!("\n[[layer.op]]\nkind = \"color_relief\"\ncolor_file = \"{file}\"\n");
+    let error = |tail: String| Config::parse(&layer(tail)).unwrap_err();
+
+    let followed = format!("{}\n[[layer.op]]\nkind = \"slope\"\n", relief_op(&colors));
+    assert!(error(followed).contains("last op"));
+    let with_gray = format!("gray = {{ min = 0.0, max = 1.0 }}\n{}", relief_op(&colors));
+    assert!(error(with_gray).contains("no gray or ramp"));
+    let both = format!("ramp = \"{colors}\"\ngray = {{ min = 0.0, max = 1.0 }}\n");
+    assert!(error(both).contains("both gray and ramp"));
+    assert!(error(format!("ramp = \"{percent}\"\n")).contains("percent stops"));
+    assert!(error(relief_op(&percent)).contains("min and max"));
+    assert!(error(relief_op(&mauve)).contains("unknown colour name"));
+
+    let ranged = format!(
+        "{}selection = \"nearest\"\nrange = {{ min = 0.0, max = 1.0 }}\n",
+        relief_op(&percent)
+    );
+    let config = Config::parse(&layer(ranged)).unwrap();
+    assert!(matches!(
+        config.layers[0].ops[0],
+        OpConfig::ColorRelief {
+            selection: ColorSelectionConfig::Nearest,
+            range: Some(_),
+            ..
+        }
+    ));
 }

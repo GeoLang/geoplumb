@@ -13,6 +13,7 @@ terrano-core.workspace = true
 projicio-core.workspace = true
 nubis-core.workspace = true
 topoi-core.workspace = true
+jung-core.workspace = true
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 futures = "0.3"

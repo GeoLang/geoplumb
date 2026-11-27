@@ -1,8 +1,8 @@
 # geoplumb-server layers. copy this file, edit it, and point
 # GEOPLUMB_LAYERS at it. every layer ends reprojected to web mercator and
-# encoded as grayscale png, or as mapbox vector tiles when its chain ends
-# in features, so only the sources, the ops and the gray range the png
-# encoding stretches over go here.
+# encoded as png, or as mapbox vector tiles when its chain ends in
+# features, so only the sources, the ops and the gray range or colour file
+# the png encoding takes go here.
 
 # hillshade over a public copernicus dem collection. bbox is the anchor
 # the grid and crs are read from, not a coverage limit: tiles past it

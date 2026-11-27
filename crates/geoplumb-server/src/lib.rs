@@ -1,5 +1,5 @@
 //! http tile server over geoplumb. one engine per configured layer, xyz
-//! tiles as gray png or, where the path ends in `.tif`, as geotiff, or as
+//! tiles as png or, where the path ends in `.tif`, as geotiff, or as
 //! mapbox vector tiles for a layer ending in features, and a
 //! per-request time interval wherever the layer's source resolves one.
 //! layers come from the toml named by `GEOPLUMB_LAYERS`, the service
@@ -43,7 +43,7 @@ use geoplumb::elements::{
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Bbox, Caps, CapsSet, Crs, Engine, Graph, NodeId, Source, TimeInterval};
 
-use config::{Config, FaninConfig, LayerConfig, LayerShape, OpConfig, SourceConfig};
+use config::{Config, FaninConfig, LayerConfig, LayerShape, OpConfig, PngEncoding, SourceConfig};
 
 pub use export::ExportQuery;
 
@@ -71,7 +71,7 @@ pub struct Layer {
 }
 
 enum LayerOutput {
-    Raster { gray: (f64, f64) },
+    Raster { png: PngEncoding },
     Vector,
 }
 
@@ -137,14 +137,20 @@ impl Layer {
         }
         .map_err(|e| e.to_string())?;
         let output = match engine.caps(node) {
-            Caps::Vector(_) if cfg.gray.is_some() => {
+            Caps::Vector(_) if cfg.gray.is_some() || cfg.ramp.is_some() => {
                 return Err("the chain ends in features, served as vector tiles, \
-                            so the layer takes no gray"
+                            so the layer takes no gray or ramp"
                     .into());
             }
             Caps::Vector(_) => LayerOutput::Vector,
+            Caps::Raster(raster) if cfg.ramp.is_some() && raster.bands != 1 => {
+                return Err(format!(
+                    "a ramp colours one band, the chain ends in {}",
+                    raster.bands
+                ));
+            }
             Caps::Raster(_) => LayerOutput::Raster {
-                gray: cfg.gray_range()?,
+                png: cfg.png_encoding()?,
             },
             Caps::PointCloud(_) | Caps::Tensor(_) => {
                 unreachable!("a reproject outputs raster or vector caps")
@@ -409,6 +415,14 @@ fn add_ops(
                     threshold: *threshold,
                 };
                 graph.add_transform(node, Box::new(element))
+            }
+            OpConfig::ColorRelief {
+                color_file,
+                selection,
+                range,
+            } => {
+                let relief = config::color_relief(color_file, *selection, *range)?;
+                graph.add_transform(node, Box::new(relief))
             }
         };
     }
@@ -770,10 +784,16 @@ async fn encode_tile(
 ) -> Result<(&'static str, Vec<u8>), TileError> {
     let name = &layer.info.name;
     let encoded = match (&layer.output, format) {
-        (LayerOutput::Raster { gray }, TileFormat::Png) => {
+        (LayerOutput::Raster { png }, TileFormat::Png) => {
             render_tile_at(&layer.engine, layer.node, tile, time)
                 .await
-                .and_then(|chunk| geoplumb::encode::png_gray(&chunk, gray.0, gray.1))
+                .and_then(|chunk| match png {
+                    PngEncoding::Gray { min, max } => {
+                        geoplumb::encode::png_gray(&chunk, *min, *max)
+                    }
+                    PngEncoding::Ramp(relief) => geoplumb::encode::png_color_relief(&chunk, relief),
+                    PngEncoding::Rgba => geoplumb::encode::png_rgba(&chunk),
+                })
                 .map(|bytes| ("image/png", bytes))
         }
         (LayerOutput::Raster { .. }, TileFormat::GeoTiff) => {

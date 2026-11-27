@@ -1,14 +1,15 @@
 //! the layer file: one entry per served layer, either a source plus an
 //! ordered op pipeline or several inputs joined by a fanin. every layer
-//! ends reprojected to web mercator and encoded as grayscale png, or as
-//! vector tiles where the chain ends in features, so the file says what
-//! varies and nothing else
+//! ends reprojected to web mercator and encoded as png, or as vector tiles
+//! where the chain ends in features, so the file says what varies and
+//! nothing else
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use geoplumb::caps::{Dtype, ValueKind};
-use geoplumb::elements::{Burn, Composite, FocalOp, ItemMask, StacSearch};
+use geoplumb::elements::color_relief::{ColorFile, ColorSelection, ValueRange};
+use geoplumb::elements::{Burn, ColorRelief, Composite, FocalOp, ItemMask, StacSearch};
 use geoplumb::{Crs, TimeInterval};
 use serde::Deserialize;
 use serde_json::Value;
@@ -50,7 +51,8 @@ pub struct LayerConfig {
     pub ops: Vec<OpConfig>,
     /// the value range the png encoding stretches over, overriding the one
     /// the ops imply, `gray = { min = 0.0, max = 3.0 }`
-    pub gray: Option<GrayConfig>,
+    pub gray: Option<RangeConfig>,
+    pub ramp: Option<PathBuf>,
 }
 
 /// one input of a fan-in layer: a source and the chain over it, the pair
@@ -95,9 +97,34 @@ pub enum BinaryOpConfig {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GrayConfig {
+pub struct RangeConfig {
     pub min: f64,
     pub max: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorSelectionConfig {
+    #[default]
+    Interpolate,
+    Exact,
+    Nearest,
+}
+
+impl From<ColorSelectionConfig> for ColorSelection {
+    fn from(selection: ColorSelectionConfig) -> ColorSelection {
+        match selection {
+            ColorSelectionConfig::Interpolate => ColorSelection::Interpolate,
+            ColorSelectionConfig::Exact => ColorSelection::Exact,
+            ColorSelectionConfig::Nearest => ColorSelection::Nearest,
+        }
+    }
+}
+
+pub enum PngEncoding {
+    Gray { min: f64, max: f64 },
+    Ramp(ColorRelief),
+    Rgba,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -338,6 +365,12 @@ pub enum OpConfig {
         cutline: String,
         nodata: Option<f64>,
     },
+    ColorRelief {
+        color_file: PathBuf,
+        #[serde(default)]
+        selection: ColorSelectionConfig,
+        range: Option<RangeConfig>,
+    },
 }
 
 pub(crate) fn cast_dtype(dtype: &str, nodata: Option<f64>) -> Result<Dtype, String> {
@@ -527,7 +560,18 @@ impl Config {
                     check_ops(&layer.ops).map_err(named)?;
                 }
             }
-            layer.gray_range().map_err(named)?;
+            let colours_before_the_end = layer.ops.iter().rev().skip(1).any(is_color_relief)
+                || layer
+                    .inputs
+                    .iter()
+                    .any(|input| input.ops.iter().any(is_color_relief));
+            if colours_before_the_end {
+                return Err(named(
+                    "color_relief makes the png colours, so it is the layer's last op, after any fanin"
+                        .into(),
+                ));
+            }
+            layer.png_encoding().map_err(named)?;
             for op in layer.chain_ops() {
                 if let OpConfig::ClipRaster { cutline, .. } = op {
                     cutline_layer(&config.layers, cutline).map_err(named)?;
@@ -536,6 +580,10 @@ impl Config {
         }
         Ok(config)
     }
+}
+
+fn is_color_relief(op: &OpConfig) -> bool {
+    matches!(op, OpConfig::ColorRelief { .. })
 }
 
 pub(crate) const COPC_NEEDS_ONE_LOCATION: &str =
@@ -612,10 +660,36 @@ fn check_ops(ops: &[OpConfig]) -> Result<(), String> {
             OpConfig::Cast { dtype, nodata } => {
                 cast_dtype(dtype, *nodata)?;
             }
+            OpConfig::ColorRelief {
+                color_file,
+                selection,
+                range,
+            } => {
+                color_relief(color_file, *selection, *range)?;
+            }
             _ => {}
         }
     }
     Ok(())
+}
+
+fn read_color_file(path: &Path) -> Result<ColorFile, String> {
+    let named = |e: String| format!("color file {}: {e}", path.display());
+    let text = std::fs::read_to_string(path).map_err(|e| named(e.to_string()))?;
+    ColorFile::parse(&text).map_err(|e| named(e.to_string()))
+}
+
+pub(crate) fn color_relief(
+    color_file: &Path,
+    selection: ColorSelectionConfig,
+    range: Option<RangeConfig>,
+) -> Result<ColorRelief, String> {
+    let range = range.map(|range| ValueRange {
+        min: range.min,
+        max: range.max,
+    });
+    ColorRelief::new(read_color_file(color_file)?, selection.into(), range)
+        .map_err(|e| format!("color file {}: {e}", color_file.display()))
 }
 
 /// the polygons a `vec_clip` cuts against, every one the file holds joined
@@ -733,7 +807,8 @@ impl LayerConfig {
                 | OpConfig::FlowDirection { .. }
                 | OpConfig::FlowAccumulation { .. }
                 | OpConfig::Watershed { .. }
-                | OpConfig::StreamOrder { .. } => None,
+                | OpConfig::StreamOrder { .. }
+                | OpConfig::ColorRelief { .. } => None,
                 OpConfig::Hillshade { .. }
                 | OpConfig::Focal { .. }
                 | OpConfig::Mask { .. }
@@ -754,6 +829,40 @@ impl LayerConfig {
                      gray = { min = .., max = .. } unless an op after the fanin fixes one"
                 .to_string(),
         })
+    }
+
+    pub fn png_encoding(&self) -> Result<PngEncoding, String> {
+        let ends_in_color_relief = self.ops.last().is_some_and(is_color_relief);
+        let names_png_colouring = self.gray.is_some() || self.ramp.is_some();
+        if ends_in_color_relief && names_png_colouring {
+            return Err(
+                "the chain ends in color_relief, whose colours are the png, \
+                        so the layer takes no gray or ramp"
+                    .into(),
+            );
+        }
+        if ends_in_color_relief {
+            return Ok(PngEncoding::Rgba);
+        }
+        match (&self.ramp, self.gray) {
+            (Some(_), Some(_)) => Err("names both gray and ramp, a png takes one".into()),
+            (Some(path), None) => {
+                let color_file = read_color_file(path)?;
+                if color_file.has_percent_stops() {
+                    return Err(format!(
+                        "ramp {}: percent stops need a min and max, which only a \
+                         color_relief op takes",
+                        path.display()
+                    ));
+                }
+                ColorRelief::new(color_file, ColorSelection::Interpolate, None)
+                    .map(PngEncoding::Ramp)
+                    .map_err(|e| e.to_string())
+            }
+            (None, _) => self
+                .gray_range()
+                .map(|(min, max)| PngEncoding::Gray { min, max }),
+        }
     }
 }
 

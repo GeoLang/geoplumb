@@ -3,6 +3,7 @@ pub mod band_math;
 pub mod cast;
 pub mod clip_raster;
 pub mod cog;
+pub mod color_relief;
 pub mod copc;
 #[cfg(feature = "gdal")]
 pub mod gdal;
@@ -34,6 +35,7 @@ pub use band_math::BandMath;
 pub use cast::Cast;
 pub use clip_raster::ClipRaster;
 pub use cog::{CogSrc, HttpRange};
+pub use color_relief::ColorRelief;
 pub use copc::{CopcHttpRange, CopcSrc};
 pub use gpkg::GpkgSrc;
 pub use hydrology::{FlowAccumulation, FlowDirection, StreamOrder, Watershed};

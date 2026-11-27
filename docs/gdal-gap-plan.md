@@ -405,6 +405,13 @@ only after a proof script passes on real input, recorded in
       against `gdal_translate` and `gdalwarp` (`native-dtype.sh`).
 - [ ] 8.10 Colour ramps on png tiles, dogfooding `jung-core`'s `ColorRamp`,
       and CRS input beyond EPSG codes in projicio.
+      Built: jung-core reads gdaldem colour files (`ColorFile`) and colours
+      values with them (`ValueRamp`, beside `ColorRamp` and sharing its
+      channel interpolation). A raster layer takes `ramp = "<colour file>"`
+      in place of `gray`, and a layer ending in `color_relief` (9.4) serves
+      RGBA PNG. Both colour through `ColorRelief::rgba`, which the 9.4 proof
+      checks against gdaldem. CRS input beyond EPSG codes is left, track H.
+      Left: CRS input beyond EPSG codes.
 
 ## 9. Routine use: what makes a user pick geoplumb over GDAL
 
@@ -464,6 +471,14 @@ that opens the user's file and writes it back in its own dtype.
       run` equals `gdalwarp -cutline` in every cell. On the Copernicus tile
       warped to UTM 32N with the cutline in WGS84, 231 of 9.9 million cells
       are kept by one tool only, each within one pixel of the boundary.
+      Built: `ColorRelief`, `gdaldem color-relief -alpha` over jung-core's
+      `ValueRamp`, with `-exact_color_entry` and `-nearest_color_entry` as
+      `selection`, and percent stops against an explicit `range`. Layer op
+      `color_relief`. Proof: on Copernicus GLO-30 with absolute stops, the
+      same stops nearest and percent stops over the band's exact range, and
+      on an ESA WorldCover window with one exact colour per class, all four
+      bands equal `gdaldem color-relief -alpha` in every cell. Cutline clip
+      and colour relief are done, the rest of 9.4 is by demand.
 - [ ] 9.5 A parity table users can read and rerun. The measured agreement
       with GDAL is in 8.4 and 8.6 of this file, and the proof scripts that
       produced it are outside the repo. Move them into `geoplumb/proofs/`
