@@ -671,6 +671,7 @@ struct TileQuery {
     t: Option<String>,
 }
 
+#[derive(Clone, Copy)]
 enum TileFormat {
     Png,
     GeoTiff,
@@ -705,6 +706,27 @@ async fn tile(
         Err(e) => return bad_request(e),
     };
     let tile = XyzTile { z, x, y };
+    match encode_tile(layer, tile, time, format).await {
+        Ok((content_type, bytes)) => {
+            ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
+        }
+        Err(TileError::WrongFormat(message)) => bad_request(message),
+        Err(TileError::Engine(e)) => engine_failure(&e),
+    }
+}
+
+enum TileError {
+    WrongFormat(String),
+    Engine(geoplumb::Error),
+}
+
+async fn encode_tile(
+    layer: &Layer,
+    tile: XyzTile,
+    time: Option<TimeInterval>,
+    format: TileFormat,
+) -> Result<(&'static str, Vec<u8>), TileError> {
+    let name = &layer.info.name;
     let encoded = match (&layer.output, format) {
         (LayerOutput::Raster { gray }, TileFormat::Png) => {
             render_tile_at(&layer.engine, layer.node, tile, time)
@@ -724,22 +746,17 @@ async fn tile(
             .await
             .map(|bytes| (jung_mvt::MVT_MEDIA_TYPE, bytes)),
         (LayerOutput::Raster { .. }, TileFormat::Mvt) => {
-            return bad_request(format!(
+            return Err(TileError::WrongFormat(format!(
                 "layer {name} is a raster layer, its tiles are .png or .tif"
-            ));
+            )));
         }
         (LayerOutput::Vector, TileFormat::Png | TileFormat::GeoTiff) => {
-            return bad_request(format!(
+            return Err(TileError::WrongFormat(format!(
                 "layer {name} is a vector layer, its tiles are .mvt"
-            ));
+            )));
         }
     };
-    match encoded {
-        Ok((content_type, bytes)) => {
-            ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
-        }
-        Err(e) => engine_failure(&e),
-    }
+    encoded.map_err(TileError::Engine)
 }
 
 fn bad_request(message: String) -> Response {

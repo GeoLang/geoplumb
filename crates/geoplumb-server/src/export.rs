@@ -226,7 +226,7 @@ fn plan(layer: &Layer, query: &ExportQuery) -> Result<Plan, String> {
     Ok(plan)
 }
 
-fn parse_bbox(text: &str) -> Result<Bbox, String> {
+pub(crate) fn parse_bbox(text: &str) -> Result<Bbox, String> {
     let not_four_numbers = || format!("bbox {text:?} is not four numbers minx,miny,maxx,maxy");
     let numbers = text
         .split(',')

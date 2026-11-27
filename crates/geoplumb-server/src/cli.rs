@@ -3,14 +3,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 use geoplumb::export::write_cog;
+use geoplumb::tile::XyzTile;
 use geoplumb::{Caps, Crs, Engine, NodeId, WindowReq};
 use tempfile::NamedTempFile;
 use terrano_core::CogReader;
 use topoi_core::geojson::{Feature, FeatureCollection, write_geojson};
 
-use crate::config::Config;
-use crate::export::{ExportQuery, Plan, engine_onto_grid};
-use crate::{DEFAULT_CACHE_BYTES, build_layer_graph};
+use crate::config::{Config, LayerConfig};
+use crate::export::{ExportQuery, Plan, engine_onto_grid, parse_bbox};
+use crate::{
+    DEFAULT_CACHE_BYTES, Layer, LayerOutput, MAX_ZOOM, TileError, TileFormat, build_layer_graph,
+    encode_tile, parse_time,
+};
 
 #[derive(Clone, Copy)]
 enum OutputFormat {
@@ -65,18 +69,12 @@ async fn features(job: &LayerJob) -> Result<FeatureCollection, String> {
     })
 }
 
-pub async fn write_layer(
-    layers: &Path,
-    layer: &str,
-    query: ExportQuery,
-    output: &Path,
-) -> Result<(), String> {
-    let format = output_format(output)?;
+fn layer_config(layers: &Path, layer: &str) -> Result<LayerConfig, String> {
     let in_layer_file = |message: String| format!("{}: {message}", layers.display());
     let text = std::fs::read_to_string(layers).map_err(|e| in_layer_file(e.to_string()))?;
     let config = Config::parse(&text).map_err(in_layer_file)?;
     let names: Vec<String> = config.layers.iter().map(|l| l.name.clone()).collect();
-    let layer_config = config
+    config
         .layers
         .into_iter()
         .find(|l| l.name == layer)
@@ -85,7 +83,17 @@ pub async fn write_layer(
                 "no layer is named {layer}, the file names {}",
                 names.join(", ")
             ))
-        })?;
+        })
+}
+
+pub async fn write_layer(
+    layers: &Path,
+    layer: &str,
+    query: ExportQuery,
+    output: &Path,
+) -> Result<(), String> {
+    let format = output_format(output)?;
+    let layer_config = layer_config(layers, layer)?;
 
     // opening sources blocks: a stac layer searches its anchor bbox and a cog layer reads a file header
     let job = tokio::task::spawn_blocking(move || {
@@ -150,6 +158,61 @@ pub async fn write_layer(
     file.persist(output)
         .map_err(|e| format!("{}: {}", output.display(), e.error))?;
     Ok(())
+}
+
+pub struct PyramidQuery {
+    pub bbox: String,
+    pub min_zoom: u8,
+    pub max_zoom: u8,
+    pub t: Option<String>,
+}
+
+pub async fn write_pyramid(
+    layers: &Path,
+    layer: &str,
+    query: PyramidQuery,
+    output: &Path,
+) -> Result<usize, String> {
+    let lonlat = parse_bbox(&query.bbox)?;
+    if query.min_zoom > query.max_zoom || query.max_zoom > MAX_ZOOM {
+        return Err(format!(
+            "zooms {} to {} are not a range within 0 to {MAX_ZOOM}",
+            query.min_zoom, query.max_zoom
+        ));
+    }
+    let time = parse_time(query.t.as_deref())?;
+    let layer_config = layer_config(layers, layer)?;
+    // opening sources blocks: a stac layer searches its anchor bbox and a cog layer reads a file header
+    let served = tokio::task::spawn_blocking(move || {
+        let name = layer_config.name.clone();
+        Layer::build(layer_config, DEFAULT_CACHE_BYTES, None)
+            .map_err(|e| format!("layer {name}: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let (format, extension) = match served.output {
+        LayerOutput::Raster { .. } => (TileFormat::Png, "png"),
+        LayerOutput::Vector => (TileFormat::Mvt, "mvt"),
+    };
+    let mut written = 0;
+    for z in query.min_zoom..=query.max_zoom {
+        for tile in XyzTile::covering(z, &lonlat) {
+            let (_, bytes) =
+                encode_tile(&served, tile, time, format)
+                    .await
+                    .map_err(|e| match e {
+                        TileError::WrongFormat(message) => message,
+                        TileError::Engine(e) => format!("tile {z}/{}/{}: {e}", tile.x, tile.y),
+                    })?;
+            let directory = output.join(z.to_string()).join(tile.x.to_string());
+            std::fs::create_dir_all(&directory)
+                .map_err(|e| format!("{}: {e}", directory.display()))?;
+            let path = directory.join(format!("{}.{extension}", tile.y));
+            std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+            written += 1;
+        }
+    }
+    Ok(written)
 }
 
 pub fn cog_info(path: &Path) -> Result<String, String> {

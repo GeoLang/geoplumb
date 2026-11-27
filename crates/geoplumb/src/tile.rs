@@ -33,6 +33,20 @@ impl XyzTile {
     pub fn resolution(&self) -> f64 {
         2.0 * WEB_MERCATOR_EXTENT / (f64::from(1u32 << self.z) * TILE_PX as f64)
     }
+
+    pub fn covering(z: u8, lonlat: &Bbox) -> impl Iterator<Item = XyzTile> {
+        let n = f64::from(1u32 << z);
+        let last = (1u32 << z) - 1;
+        let column = |lon: f64| (((lon + 180.0) / 360.0 * n).floor().max(0.0) as u32).min(last);
+        let row = |lat: f64| {
+            let r = lat.to_radians();
+            let y = (1.0 - (r.tan() + 1.0 / r.cos()).ln() / std::f64::consts::PI) / 2.0 * n;
+            (y.floor().max(0.0) as u32).min(last)
+        };
+        let (x0, x1) = (column(lonlat.min_x), column(lonlat.max_x));
+        let (y0, y1) = (row(lonlat.max_y), row(lonlat.min_y));
+        (x0..=x1).flat_map(move |x| (y0..=y1).map(move |y| XyzTile { z, x, y }))
+    }
 }
 
 /// pull a node's window for a tile and resample onto the exact 256 px grid

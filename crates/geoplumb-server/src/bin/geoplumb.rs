@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use geoplumb_server::ExportQuery;
-use geoplumb_server::cli::{cog_info, write_layer};
+use geoplumb_server::cli::{PyramidQuery, cog_info, write_layer, write_pyramid};
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +44,36 @@ enum Command {
         output: PathBuf,
     },
     #[command(
+        about = "Write the xyz tiles of one layer over a lon/lat bbox as <output>/z/x/y.png, or .mvt for a vector layer, as geoplumb-server serves them"
+    )]
+    Pyramid {
+        #[arg(help = "the layer TOML geoplumb-server reads")]
+        layers: PathBuf,
+        #[arg(help = "the name of the layer to write")]
+        layer: String,
+        #[arg(
+            long,
+            allow_hyphen_values = true,
+            help = "west,south,east,north in degrees"
+        )]
+        bbox: String,
+        #[arg(long, default_value_t = 0, help = "the first zoom written")]
+        min_zoom: u8,
+        #[arg(long, help = "the last zoom written")]
+        max_zoom: u8,
+        #[arg(
+            long,
+            help = "rfc 3339 start/end interval, the source's own when absent"
+        )]
+        t: Option<String>,
+        #[arg(
+            short = 'o',
+            long = "output",
+            help = "the directory the tiles go under"
+        )]
+        output: PathBuf,
+    },
+    #[command(
         about = "Print the size, bands, sample format, CRS, geotransform, compression, nodata and overviews of a COG"
     )]
     Info {
@@ -71,6 +101,25 @@ async fn main() {
                 t,
             };
             write_layer(&layers, &layer, query, &output).await
+        }
+        Command::Pyramid {
+            layers,
+            layer,
+            bbox,
+            min_zoom,
+            max_zoom,
+            t,
+            output,
+        } => {
+            let query = PyramidQuery {
+                bbox,
+                min_zoom,
+                max_zoom,
+                t,
+            };
+            write_pyramid(&layers, &layer, query, &output)
+                .await
+                .map(|written| println!("{written} tiles under {}", output.display()))
         }
         Command::Info { file } => cog_info(&file).map(|text| print!("{text}")),
     };

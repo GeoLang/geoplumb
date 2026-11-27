@@ -139,10 +139,13 @@ source = { kind = "gdal", path = "/data/dem.tif", band = 1 }
 ```sh
 cargo install --path crates/geoplumb-server --bin geoplumb
 geoplumb run <layers.toml> <layer> --bbox minx,miny,maxx,maxy --crs EPSG:<code> --resolution <r> [--t <start>/<end>] -o <out>
+geoplumb pyramid <layers.toml> <layer> --bbox west,south,east,north [--min-zoom <z>] --max-zoom <z> [--t <start>/<end>] -o <dir>
 geoplumb info <file.tif>
 ```
 
 `run` builds the one layer it names. `--bbox`, `--crs`, `--resolution` and `--t` mean what they mean on `GET /export/{layer}`, and the grid is sized the same way. A raster layer writes a COG to a `.tif` or `.tiff` path, in the layout the export route writes. A vector layer writes GeoJSON to a `.geojson` path: the features in the bbox, clipped to it and merged back where chunk seams cut them. GeoJSON coordinates are lon/lat, so a `.geojson` output takes `--crs EPSG:4326` only. Any other extension is an error, `.gpkg` included. The file is written under a temporary name in the output's directory and renamed when it is complete, so a failed run leaves no file. There is no time limit and no pixel cap. The COG is a classic TIFF, so a run whose compressed tiles pass 4 GiB fails after its last tile.
+
+`pyramid` writes every xyz tile covering a lon/lat bbox from `--min-zoom`, 0 by default, to `--max-zoom`, as `<dir>/z/x/y.png` for a raster layer and `<dir>/z/x/y.mvt` for a vector layer. Each file holds the bytes `GET /tiles/{layer}/{z}/{x}/{y}` serves for that tile, so any static file server serves the directory as the layer.
 
 `info` prints one `key: value` line each for size, band count, sample format, bits, CRS, geotransform (GDAL order), compression, predictor and nodata, then the overview sizes as a list. It reads what terrano's `CogReader` reads: tiled, uncompressed, LZW or deflate.
 
@@ -190,6 +193,9 @@ geoplumb run layers.toml contours --bbox 7.2,46.5,7.6,46.8 --crs EPSG:4326 --res
 
 # a summer median of Sentinel-2 red over the same UTM window, pulled from the STAC API window by window
 geoplumb run layers.toml s2-red-median --bbox 380000,5170000,400000,5190000 --crs EPSG:32632 --resolution 10 --t 2025-06-01T00:00:00Z/2025-09-01T00:00:00Z -o red-median.tif
+
+# gdal2tiles.py -z 8-12 over a lon/lat window, png tiles stretched over the layer's gray range
+geoplumb pyramid layers.toml dem --bbox 7.2,46.5,7.6,46.8 --min-zoom 8 --max-zoom 12 -o tiles
 
 # gdalinfo dem-utm.tif
 geoplumb info dem-utm.tif

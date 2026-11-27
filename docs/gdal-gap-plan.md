@@ -429,14 +429,15 @@ that opens the user's file and writes it back in its own dtype.
       in place of `gdalinfo`. The server's four-minute timeout and export pixel
       cap protect a shared process and do not apply on the command line.
       Built: the binary in `geoplumb-server`, jobs always through a TOML
-      file, `run` to `.tif` and `.geojson` (EPSG:4326 only), and `info`.
+      file, `run` to `.tif` and `.geojson` (EPSG:4326 only), `info`, and
+      `pyramid`, which writes a layer's xyz tiles as a z/x/y directory of
+      the bytes `/tiles` serves.
       Proof: on a GDAL LZW COG of Copernicus GLO-30, `info` matches
       `gdalinfo` and `run` to UTM 32N at 30 m matches
       `gdalwarp -r bilinear -et 0` within 0.65 mm on every pixel.
       Left: `.gpkg`, blocked on geodukt (its writers take `geodukt-core`
       types, `geodukt-core` depends on geoplumb, and its rusqlite 0.40 links
-      a different `libsqlite3-sys` than geoplumb's 0.39), and `geoplumb
-      pyramid`.
+      a different `libsqlite3-sys` than geoplumb's 0.39).
 - [ ] 9.2 Open every GeoTIFF GDAL writes with its defaults. Left: ZSTD,
       JPEG and WebP tiles, striped GeoTIFF and BigTIFF in `CogReader` (section 7 sizes each). A CRS given as WKT or PROJ JSON is
       8.10. Vector: shapefile and CSV as layer sources through geodukt, which

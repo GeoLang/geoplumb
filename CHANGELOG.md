@@ -2,6 +2,7 @@
 
 ## 2026-11-27
 
+- `geoplumb pyramid <layers.toml> <layer> --bbox west,south,east,north [--min-zoom] --max-zoom [--t] -o <dir>` writes every xyz tile covering the bbox as `<dir>/z/x/y.png`, or `.mvt` for a vector layer, each the bytes `/tiles` serves for it. `XyzTile::covering` gives the tiles covering a lon/lat bbox at one zoom, and the `pyramid` example uses it
 - a `stac` asset at the source's pixel size whose grid is off the window's, an item tiled on another origin say, is read on its own grid and resampled onto the window by value kind, as coarser assets are, instead of rounded onto the window's grid, which read continuous values up to half a pixel off. Assets on the grid read as before
 - topoi-core locked to 2654af7, on i_overlay 9.2.1, which binds each dissolved hole to its own shell itself. `polygonize` output is unchanged: the 1024 px WorldCover window still matches GDAL in polygon count, hole count and area for every class
 - a spill file write that finishes after its chunk was invalidated no longer replaces or deletes the file of the chunk recomputed after it. The rename into place runs under the cache lock and only while the entry still holds the chunk written, so an evicted and reloaded entry never reads the older chunk and never loses its file to the older write

@@ -3080,3 +3080,40 @@ gray = {{ min = 0.0, max = 3.0 }}
     let expected: std::collections::BTreeSet<u8> = [1, 2].into();
     assert_eq!(codes, expected);
 }
+
+#[tokio::test]
+async fn pyramid_writes_every_covering_tile_as_the_server_serves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = cog_layer_file(dir.path());
+    let layers = dir.path().join("layers.toml");
+    std::fs::write(&layers, &text).unwrap();
+    let out = dir.path().join("tiles");
+    let (west, south, east, north) = (7.05, 46.7, 7.5, 46.95);
+    let query = geoplumb_server::cli::PyramidQuery {
+        bbox: format!("{west},{south},{east},{north}"),
+        min_zoom: 8,
+        max_zoom: 10,
+        t: None,
+    };
+
+    let written = geoplumb_server::cli::write_pyramid(&layers, "dem", query, &out)
+        .await
+        .unwrap();
+
+    let served = app(&text);
+    let mut expected = 0;
+    for z in 8..=10 {
+        let (x0, y0) = tile_of(z, west, north);
+        let (x1, y1) = tile_of(z, east, south);
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                expected += 1;
+                let file = std::fs::read(out.join(format!("{z}/{x}/{y}.png"))).unwrap();
+                let (status, body) = get(&served, &format!("/tiles/dem/{z}/{x}/{y}.png")).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(file, body, "tile {z}/{x}/{y}");
+            }
+        }
+    }
+    assert_eq!(written, expected);
+}
