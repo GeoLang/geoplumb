@@ -916,6 +916,7 @@ name = "geoplumb"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "copc-core",
  "copc-reader",
  "copc-writer",

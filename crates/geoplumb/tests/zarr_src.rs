@@ -32,7 +32,9 @@ fn v3_coordinate(store: &Arc<FilesystemStore>, name: &str, values: Vec<f64>, att
         .build(store.clone(), &format!("/{name}"))
         .unwrap();
     array.store_metadata().unwrap();
-    array.store_array_subset(&[0..length], values).unwrap();
+    array
+        .store_array_subset(&array.subset_all(), values)
+        .unwrap();
 }
 
 fn layer(array: &str) -> ZarrLayer {
@@ -86,7 +88,7 @@ fn sst_value(step: u64, row: u64, column: u64) -> f32 {
     }
 }
 
-fn write_v3_time_series(dir: &Path) {
+fn write_v3_time_series(dir: &Path, fill_attribute: Value) {
     // sst is time, lat and lon of 3 by 4 by 6 in chunks of 1 by 2 by 4, lat stored south to north
     let store = filesystem_store(dir);
     v3_coordinate(
@@ -110,11 +112,12 @@ fn write_v3_time_series(dir: &Path) {
         .build(store.clone(), "/time")
         .unwrap();
     time.store_metadata().unwrap();
-    time.store_array_subset(&[0..3], vec![0i64, 6, 12]).unwrap();
+    time.store_array_subset(&time.subset_all(), vec![0i64, 6, 12])
+        .unwrap();
 
     let sst = ArrayBuilder::new(vec![3, 4, 6], vec![1, 2, 4], data_type::float32(), f32::NAN)
         .dimension_names(Some(["time", "lat", "lon"]))
-        .attributes(object(json!({"_FillValue": FILL})))
+        .attributes(object(json!({"_FillValue": fill_attribute})))
         .build(store.clone(), "/sst")
         .unwrap();
     sst.store_metadata().unwrap();
@@ -129,7 +132,7 @@ fn write_v3_time_series(dir: &Path) {
 #[tokio::test]
 async fn v3_windows_and_time_steps_read_back_in_their_own_dtype() {
     let dir = tempfile::tempdir().unwrap();
-    write_v3_time_series(dir.path());
+    write_v3_time_series(dir.path(), json!(FILL));
     let mut sst = layer("sst");
     sst.datetime = Some(interval("2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z"));
     let store = ZarrStore::Path(dir.path().to_path_buf());
@@ -180,6 +183,18 @@ async fn v3_windows_and_time_steps_read_back_in_their_own_dtype() {
     assert!(src.read(&south_east).await.is_err());
 }
 
+#[tokio::test]
+async fn xarray_base64_fill_value_masks_float_cells() {
+    let dir = tempfile::tempdir().unwrap();
+    // xarray writes a v3 float _FillValue as base64 of a little endian f64, this is -999
+    write_v3_time_series(dir.path(), json!("AAAAAAA4j8A="));
+    let mut sst = layer("sst");
+    sst.datetime = Some(interval("2024-01-01T05:00:00Z", "2024-01-01T07:00:00Z"));
+    let src = ZarrSrc::open(&ZarrStore::Path(dir.path().to_path_buf()), &sst).unwrap();
+    let middle = read(&src, Bbox::new(1.0, 0.0, 4.0, 2.0), 1.0, None).await;
+    assert_values(&middle, &[131.0, f64::NAN, 133.0, 121.0, 122.0, 123.0]);
+}
+
 fn nonzero(values: &[u64]) -> Vec<NonZeroU64> {
     values
         .iter()
@@ -222,7 +237,7 @@ fn write_v2_levels(dir: &Path) {
         FillValueMetadata::Null,
         json!({"_ARRAY_DIMENSIONS": ["x"]}),
     );
-    x.store_array_subset(&[0..4], vec![500.0f64, 600.0, 700.0, 800.0])
+    x.store_array_subset(&x.subset_all(), vec![500.0f64, 600.0, 700.0, 800.0])
         .unwrap();
     let y = v2_array(
         &store,
@@ -232,7 +247,7 @@ fn write_v2_levels(dir: &Path) {
         FillValueMetadata::Null,
         json!({"_ARRAY_DIMENSIONS": ["y"]}),
     );
-    y.store_array_subset(&[0..3], vec![300.0f64, 200.0, 100.0])
+    y.store_array_subset(&y.subset_all(), vec![300.0f64, 200.0, 100.0])
         .unwrap();
     let t2m = v2_array(
         &store,

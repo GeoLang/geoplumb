@@ -30,6 +30,7 @@ copc-core = "0.9"
 zarrs = { version = "0.23", default-features = false, features = ["filesystem", "gzip", "zlib", "crc32c", "sharding", "transpose"] }
 ruzstd = "0.9"
 inventory = "0.3"
+base64 = "0.22"
 wgpu = { version = "30", optional = true, default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
 
 [features]

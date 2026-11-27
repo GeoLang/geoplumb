@@ -5,6 +5,8 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::prelude::BASE64_STANDARD;
 use futures::future::BoxFuture;
 use ruzstd::decoding::StreamingDecoder;
 use serde_json::Value;
@@ -237,7 +239,7 @@ impl ZarrSrc {
             }
         };
 
-        let packing = Packing::of(&array).map_err(named)?;
+        let packing = Packing::of(&array, stored_type).map_err(named)?;
         let scaled = packing.scale_factor.is_some() || packing.add_offset.is_some();
         let dtype = match (
             stored_type.format(),
@@ -561,10 +563,10 @@ fn widened<T: ElementOwned>(
 }
 
 impl Packing {
-    fn of(array: &ZarrArray) -> core::result::Result<Packing, String> {
+    fn of(array: &ZarrArray, stored_type: StoredType) -> core::result::Result<Packing, String> {
         let attributes = array.attributes();
         let mut missing_values = attribute_numbers(array, "missing_value")?;
-        missing_values.extend(single_number(array, "_FillValue")?);
+        missing_values.extend(fill_value_attribute(array, stored_type)?);
         // xarray masks a zarr v2 array's fill_value as its _FillValue and ignores a v3 one
         if let ArrayMetadata::V2(metadata) = array.metadata()
             && !attributes.contains_key("_FillValue")
@@ -602,6 +604,22 @@ fn attribute_numbers(array: &ZarrArray, name: &str) -> core::result::Result<Vec<
                 .ok_or_else(|| format!("attribute {name} holds {value}, not a number"))
         })
         .collect()
+}
+
+fn fill_value_attribute(
+    array: &ZarrArray,
+    stored_type: StoredType,
+) -> core::result::Result<Option<f64>, String> {
+    let is_float = matches!(stored_type, StoredType::F32 | StoredType::F64);
+    let text = match array.attributes().get("_FillValue") {
+        Some(Value::String(text)) if is_float => text,
+        _ => return single_number(array, "_FillValue"),
+    };
+    // xarray's FillValueCoder writes a float _FillValue as base64 of the value as a little endian f64
+    match BASE64_STANDARD.decode(text).map(<[u8; 8]>::try_from) {
+        Ok(Ok(bytes)) => Ok(Some(f64::from_le_bytes(bytes))),
+        _ => single_number(array, "_FillValue"),
+    }
 }
 
 fn single_number(array: &ZarrArray, name: &str) -> core::result::Result<Option<f64>, String> {
@@ -666,7 +684,7 @@ fn coordinate_values(
     }
     StoredType::of(array)
         .map_err(|e| format!("coordinate {name}: {e}"))?
-        .read(array, &[0..length as u64])
+        .read(array, std::slice::from_ref(&(0..length as u64)))
         .map_err(|e| format!("coordinate {name}: {e}"))
 }
 
