@@ -425,7 +425,7 @@ library and from four examples. The items are in
 the order a first-time user meets them. 9.1 to 9.3 come first: a command
 that opens the user's file and writes it back in its own dtype.
 
-- [ ] 9.1 A `geoplumb` command that reads the layer TOML `geoplumb-server`
+- [x] 9.1 A `geoplumb` command that reads the layer TOML `geoplumb-server`
       reads (`config::Config`) and writes to disk instead of serving.
       `geoplumb run <layers.toml> <layer> --bbox --crs --resolution [--t] -o
       out.tif` writes a COG through `export::write_cog`. A vector layer writes
@@ -441,9 +441,12 @@ that opens the user's file and writes it back in its own dtype.
       the bytes `/tiles` serves.
       Proof: on a GDAL LZW COG of Copernicus GLO-30, `info` matches
       `gdalinfo` and `run` to UTM 32N at 30 m matches
-      `gdalwarp -r bilinear -et 0` within 0.65 mm on every pixel.
-      Left: a proof that `ogrinfo` and GDAL's `validate_gpkg.py` accept a
-      `run` `.gpkg` written from a real layer.
+      `gdalwarp -r bilinear -et 0` within 0.65 mm on every pixel. `run` to
+      `.gpkg` from Natural Earth 1:110m countries as a shapefile in WGS84,
+      the same reprojected to UTM 32N, and a csv of one point per country:
+      GDAL's `validate_gpkg.py` reports nothing, OGR reads each in the
+      `--crs` given, and every feature's attributes equal OGR's read with
+      geometry within 5.3e-16 of its area.
 - [ ] 9.2 Open every GeoTIFF GDAL writes with its defaults. Built: striped
       GeoTIFF, BigTIFF and band interleave (PlanarConfiguration 2), raw, LZW,
       deflate or ZSTD with either predictor, including the floating-point
@@ -453,8 +456,11 @@ that opens the user's file and writes it back in its own dtype.
       window, where `geoplumb run` over each file's own grid equals GDAL's
       read of every pixel and band, JPEG and WebP included. A CRS given as
       WKT or PROJ JSON is 8.10. Vector: the `shapefile` and `csv` layer
-      sources are built, read by geoplumb itself. FlatGeobuf and GeoParquet
-      are left (section 7).
+      sources are built, read by geoplumb itself, dBase text in the
+      encoding GDAL picks. Proof: the 9.1 `.gpkg` inputs, read as
+      shapefile and csv, equal OGR's read, and a `.prj` with no EPSG code
+      is refused naming `crs`. FlatGeobuf and GeoParquet are left
+      (section 7).
 - [x] 9.3 Native dtype on output, which is 8.9. A byte raster exports as
       Byte, where it used to come back as Float64.
 - [ ] 9.4 GDAL operators with no geoplumb element. Nothing in geoplumb or
