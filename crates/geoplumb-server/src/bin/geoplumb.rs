@@ -40,7 +40,11 @@ enum Command {
             help = "rfc 3339 start/end interval, the source's own when absent"
         )]
         t: Option<String>,
-        #[arg(short = 'o', long = "output", help = "a .tif, .geojson or .gpkg path")]
+        #[arg(
+            short = 'o',
+            long = "output",
+            help = "a .tif, .geojson or .gpkg path, an existing .gpkg keeps its other layers"
+        )]
         output: PathBuf,
     },
     #[command(

@@ -926,6 +926,7 @@ dependencies = [
  "gdal",
  "inventory",
  "jung-core",
+ "libc",
  "nubis-core",
  "png",
  "projicio-core",

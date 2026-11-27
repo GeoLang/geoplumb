@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
@@ -22,62 +22,101 @@ const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0;
 
 impl VecSrc {
     pub fn from_shapefile(path: &Path, crs: Option<Crs>) -> Result<Self> {
-        let named = |message: String| Error::Source(format!("{}: {message}", path.display()));
-        let crs = match crs {
-            Some(crs) => crs,
-            None => prj_crs(path)?,
-        };
-        let shapes = ShapeReader::with_shx(open(path)?, open(&sidecar(path, "shx"))?)
-            .map_err(|e| named(e.to_string()))?;
-        let dbf = sidecar(path, "dbf");
-        let table = dbase::ReaderBuilder::new()
-            .with_encoding(dbf_encoding(path, &dbf)?)
-            .build(open(&dbf)?)
-            .map_err(|e| Error::Source(format!("{}: {e}", dbf.display())))?;
-        let mut reader = shapefile::Reader::new(shapes, table);
-
-        let mut rows = Vec::new();
-        for (index, row) in reader.iter_shapes_and_records().enumerate() {
-            let (shape, record) = row.map_err(|e| named(format!("record {index}: {e}")))?;
-            let geometry =
-                shape_geometry(shape).map_err(|e| named(format!("record {index}: {e}")))?;
-            rows.push((geometry, record.into_iter().collect::<Vec<_>>()));
-        }
-
-        // dbase keeps a numeric field's decimal count private
-        let mut numeric_columns: HashMap<String, bool> = HashMap::new();
-        for (_, fields) in &rows {
-            for (name, value) in fields {
-                if let FieldValue::Numeric(Some(number)) = value {
-                    let whole = numeric_columns.entry(name.clone()).or_insert(true);
-                    *whole &= number.fract() == 0.0 && number.abs() <= MAX_EXACT_INTEGER;
-                }
-            }
-        }
-        let whole_columns: HashSet<String> = numeric_columns
-            .into_iter()
-            .filter(|(_, whole)| *whole)
-            .map(|(name, _)| name)
-            .collect();
-        let features = rows
-            .into_iter()
-            .map(|(geometry, fields)| Feature {
-                geometry,
-                properties: fields
-                    .into_iter()
-                    .map(|(name, value)| {
-                        let whole = whole_columns.contains(&name);
-                        (name, property(value, whole))
-                    })
-                    .collect(),
-            })
-            .collect();
-        VecSrc::new(FeatureCollection { features }, crs)
+        let (collection, crs) = read_shapefile(path, crs)?;
+        VecSrc::new(collection, crs)
     }
 }
 
-fn open(path: &Path) -> Result<BufReader<File>> {
-    File::open(path)
+pub fn read_shapefile(path: &Path, crs: Option<Crs>) -> Result<(FeatureCollection, Crs)> {
+    let named = |message: String| Error::Source(format!("{}: {message}", path.display()));
+    let crs = match crs {
+        Some(crs) => crs,
+        None => prj_crs(path)?,
+    };
+    let shapes = ShapeReader::with_shx(open_buffered(path)?, open_buffered(&sidecar(path, "shx"))?)
+        .map_err(|e| named(e.to_string()))?;
+    let dbf = sidecar(path, "dbf");
+    let table = dbase::ReaderBuilder::new()
+        .with_encoding(dbf_encoding(path, &dbf)?)
+        .build(open_buffered(&dbf)?)
+        .map_err(|e| Error::Source(format!("{}: {e}", dbf.display())))?;
+    let mut reader = shapefile::Reader::new(shapes, table);
+
+    let mut rows = Vec::new();
+    for (index, row) in reader.iter_shapes_and_records().enumerate() {
+        let (shape, record) = row.map_err(|e| named(format!("record {index}: {e}")))?;
+        let geometry = shape_geometry(shape).map_err(|e| named(format!("record {index}: {e}")))?;
+        rows.push((geometry, record.into_iter().collect::<Vec<_>>()));
+    }
+
+    // dbase keeps a numeric field's decimal count private
+    let mut numeric_columns: HashMap<String, bool> = HashMap::new();
+    for (_, fields) in &rows {
+        for (name, value) in fields {
+            if let FieldValue::Numeric(Some(number)) = value {
+                let whole = numeric_columns.entry(name.clone()).or_insert(true);
+                *whole &= number.fract() == 0.0 && number.abs() <= MAX_EXACT_INTEGER;
+            }
+        }
+    }
+    let whole_columns: HashSet<String> = numeric_columns
+        .into_iter()
+        .filter(|(_, whole)| *whole)
+        .map(|(name, _)| name)
+        .collect();
+    let features = rows
+        .into_iter()
+        .map(|(geometry, fields)| Feature {
+            geometry,
+            properties: fields
+                .into_iter()
+                .map(|(name, value)| {
+                    let whole = whole_columns.contains(&name);
+                    (name, property(value, whole))
+                })
+                .collect(),
+        })
+        .collect();
+    Ok((FeatureCollection { features }, crs))
+}
+
+#[cfg(unix)]
+fn open_without_following_symlinks(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW fails the open with ELOOP when the last path component is a symlink
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() != Some(libc::ELOOP) {
+                return e;
+            }
+            std::io::Error::other(format!(
+                "{e}, shapefile files are opened without following symlinks"
+            ))
+        })
+}
+
+#[cfg(windows)]
+fn open_without_following_symlinks(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // windows FILE_FLAG_OPEN_REPARSE_POINT opens a symlink itself instead of its target
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "a symbolic link, shapefile files are opened without following symlinks",
+        ));
+    }
+    Ok(file)
+}
+
+fn open_buffered(path: &Path) -> Result<BufReader<File>> {
+    open_without_following_symlinks(path)
         .map(BufReader::new)
         .map_err(|e| Error::Source(format!("{}: {e}", path.display())))
 }
@@ -91,8 +130,11 @@ fn sidecar(shp: &Path, lowercase_extension: &str) -> PathBuf {
 
 fn prj_crs(shp: &Path) -> Result<Crs> {
     let prj = sidecar(shp, "prj");
-    let wkt = match std::fs::read_to_string(&prj) {
-        Ok(wkt) => wkt,
+    let mut wkt = String::new();
+    let read =
+        open_without_following_symlinks(&prj).and_then(|mut file| file.read_to_string(&mut wkt));
+    match read {
+        Ok(_) => {}
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Err(Error::Source(format!(
                 "{}: no {} beside it to give the crs, pass a crs",
@@ -101,7 +143,7 @@ fn prj_crs(shp: &Path) -> Result<Crs> {
             )));
         }
         Err(e) => return Err(Error::Source(format!("{}: {e}", prj.display()))),
-    };
+    }
     projicio_core::epsg::parse_wkt_epsg(&wkt)
         .map(Crs)
         .ok_or_else(|| {
@@ -208,8 +250,11 @@ fn cpg_encoding_name(line: &str) -> String {
 fn declared_encoding(shp: &Path, dbf: &Path) -> Result<Option<String>> {
     // gdal's DBFOpenLL reads the .cpg's first line, then the language driver id at header byte 29
     let cpg = sidecar(shp, "cpg");
-    match std::fs::read(&cpg) {
-        Ok(bytes) => {
+    let mut bytes = Vec::new();
+    let read =
+        open_without_following_symlinks(&cpg).and_then(|mut file| file.read_to_end(&mut bytes));
+    match read {
+        Ok(_) => {
             let text = String::from_utf8_lossy(&bytes);
             let line = &text[..text.find(['\r', '\n']).unwrap_or(text.len())];
             if !line.is_empty() {
@@ -220,7 +265,7 @@ fn declared_encoding(shp: &Path, dbf: &Path) -> Result<Option<String>> {
         Err(e) => return Err(Error::Source(format!("{}: {e}", cpg.display()))),
     }
     let mut header = [0u8; 30];
-    File::open(dbf)
+    open_without_following_symlinks(dbf)
         .and_then(|mut file| file.read_exact(&mut header))
         .map_err(|e| Error::Source(format!("{}: {e}", dbf.display())))?;
     let language_driver = header[29];

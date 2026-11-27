@@ -33,6 +33,9 @@ inventory = "0.3"
 base64 = "0.22"
 wgpu = { version = "30", optional = true, default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 gdal = ["dep:gdal"]
 wgpu = ["dep:wgpu"]

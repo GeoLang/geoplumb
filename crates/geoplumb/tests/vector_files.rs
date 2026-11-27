@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use geoplumb::element::Source;
-use geoplumb::elements::{GpkgSrc, VecSrc, write_geopackage};
+use geoplumb::elements::{GpkgSrc, VecSrc, read_csv, read_shapefile, write_geopackage};
 use geoplumb::{Bbox, Crs, VectorChunk, VectorFeature, WindowReq};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use shapefile::dbase::{FieldName, FieldValue, Record, TableWriterBuilder};
 use shapefile::{PolygonRing, Writer};
 use topoi_core::geojson::FeatureGeometry;
-use topoi_core::{Coord, MultiPolygon, Point, Polygon, Ring};
+use topoi_core::{Coord, LineString, MultiPolygon, Point, Polygon, Ring};
 
 async fn every_feature(src: &impl Source) -> VectorChunk {
     let grid = src.grid();
@@ -210,6 +210,146 @@ fn a_declared_encoding_geoplumb_cannot_decode_is_refused() {
         .unwrap()
         .to_string();
     assert!(message.contains("CP437"), "{message}");
+}
+
+fn write_ferry(dir: &Path, stored: &[(f64, f64)]) -> PathBuf {
+    let path = dir.join("ferry.shp");
+    let table = TableWriterBuilder::new().add_character_field(field("name"), 16);
+    let mut writer = Writer::from_path(&path, table).unwrap();
+    let line = shapefile::Polyline::new(
+        stored
+            .iter()
+            .map(|&(x, y)| shapefile::Point::new(x, y))
+            .collect(),
+    );
+    let mut record = Record::default();
+    record.insert("name".into(), FieldValue::Character(Some("ferry".into())));
+    writer.write_shape_and_record(&line, &record).unwrap();
+    path
+}
+
+#[test]
+fn read_shapefile_returns_every_vertex_as_stored_and_the_prj_crs() {
+    let dir = tempfile::tempdir().unwrap();
+    // VecSrc's window clip returns 0.3 as 0.30000000000000004 and drops the repeated vertex
+    let stored = [(-0.1, 0.0), (0.3, 1.0), (0.3, 1.0), (0.7, 2.0)];
+    let path = write_ferry(dir.path(), &stored);
+    std::fs::write(path.with_extension("prj"), crs_definitions::EPSG_32633.wkt).unwrap();
+
+    let (collection, crs) = read_shapefile(&path, None).unwrap();
+    assert_eq!(crs, Crs(32633));
+    let [ferry] = &collection.features[..] else {
+        panic!("{} features", collection.features.len());
+    };
+    let coords = stored.iter().map(|&(x, y)| Coord::new(x, y)).collect();
+    assert_eq!(
+        ferry.geometry,
+        Some(FeatureGeometry::LineString(LineString::new(coords)))
+    );
+    assert_eq!(ferry.properties["name"], json!("ferry"));
+}
+
+fn write_empty_point_shapefile(dir: &Path) -> PathBuf {
+    let path = dir.join("empty.shp");
+    // esri shapefile header: big-endian file code 9994 and length in 16-bit words, little-endian version 1000 and shape type 1, point
+    let mut header = [0u8; 100];
+    header[0..4].copy_from_slice(&9994i32.to_be_bytes());
+    header[24..28].copy_from_slice(&50i32.to_be_bytes());
+    header[28..32].copy_from_slice(&1000i32.to_le_bytes());
+    header[32..36].copy_from_slice(&1i32.to_le_bytes());
+    std::fs::write(&path, header).unwrap();
+    std::fs::write(path.with_extension("shx"), header).unwrap();
+    // dbase writes the table header when the writer is dropped
+    drop(
+        TableWriterBuilder::new()
+            .add_character_field(field("name"), 16)
+            .build_with_file_dest(path.with_extension("dbf"))
+            .unwrap(),
+    );
+    path
+}
+
+#[test]
+fn an_empty_shapefile_or_csv_reads_as_an_empty_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let shp = write_empty_point_shapefile(dir.path());
+    let (collection, crs) = read_shapefile(&shp, Some(Crs::WGS84)).unwrap();
+    assert!(collection.features.is_empty());
+    assert_eq!(crs, Crs::WGS84);
+
+    let csv = dir.path().join("empty.csv");
+    std::fs::write(&csv, "name,lon,lat\n").unwrap();
+    assert!(read_csv(&csv, "lon", "lat").unwrap().features.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_shapefile_file_is_refused_with_or_without_a_target() {
+    for extension in ["shp", "shx", "dbf", "prj", "cpg"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_named_point(dir.path(), "Abidjan");
+        std::fs::write(path.with_extension("prj"), crs_definitions::EPSG_4326.wkt).unwrap();
+        std::fs::write(path.with_extension("cpg"), "UTF-8").unwrap();
+        let linked = path.with_extension(extension);
+        let moved = dir.path().join(format!("moved.{extension}"));
+        std::fs::rename(&linked, &moved).unwrap();
+
+        let absent = dir.path().join(format!("absent.{extension}"));
+        for target in [&moved, &absent] {
+            std::os::unix::fs::symlink(target, &linked).unwrap();
+            let message = read_shapefile(&path, None).err().unwrap().to_string();
+            assert!(
+                message.contains(&linked.display().to_string())
+                    && message.contains("without following symlinks"),
+                "{extension} linked to {}: {message}",
+                target.display()
+            );
+            std::fs::remove_file(&linked).unwrap();
+        }
+        std::fs::rename(&moved, &linked).unwrap();
+        assert_eq!(read_shapefile(&path, None).unwrap().0.features.len(), 1);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_named_point(dir.path(), "Abidjan");
+    for extension in ["shp", "shx", "dbf"] {
+        std::fs::rename(
+            path.with_extension(extension),
+            path.with_extension(extension.to_ascii_uppercase()),
+        )
+        .unwrap();
+    }
+    let shp = path.with_extension("SHP");
+    let moved = dir.path().join("moved.DBF");
+    std::fs::rename(shp.with_extension("DBF"), &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, shp.with_extension("DBF")).unwrap();
+    let message = read_shapefile(&shp, Some(Crs::WGS84))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.contains("countries.DBF") && message.contains("without following symlinks"),
+        "{message}"
+    );
+}
+
+#[test]
+fn read_csv_returns_every_coordinate_as_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("moorings.csv");
+    std::fs::write(&path, "name,lon,lat\neast,0.3,-0.1\nwest,0.3,-0.1\n").unwrap();
+
+    let collection = read_csv(&path, "lon", "lat").unwrap();
+    let geometries: Vec<_> = collection
+        .features
+        .iter()
+        .map(|feature| feature.geometry.clone())
+        .collect();
+    assert_eq!(
+        geometries,
+        vec![Some(FeatureGeometry::Point(Point::new(0.3, -0.1))); 2]
+    );
+    assert_eq!(collection.features[1].properties["name"], json!("west"));
 }
 
 #[tokio::test]
@@ -429,4 +569,128 @@ fn a_property_named_like_the_key_column_is_refused() {
         message.contains("FID") && message.contains("fid"),
         "{message}"
     );
+}
+
+fn mooring(id: u64, lon: f64, lat: f64, name: &str) -> VectorFeature {
+    VectorFeature {
+        id,
+        geometry: FeatureGeometry::Point(Point::new(lon, lat)),
+        properties: HashMap::from([("name".to_string(), json!(name))]),
+    }
+}
+
+fn names(chunk: &VectorChunk) -> Vec<&str> {
+    chunk
+        .features
+        .iter()
+        .map(|feature| feature.properties["name"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn writing_a_layer_into_a_geopackage_replaces_that_layer_and_keeps_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harbour.gpkg");
+    write_geopackage(&path, "sites", &written_features(), Crs(32633)).unwrap();
+    let old = [
+        mooring(0, PIER_X, NORTHING, "old east"),
+        mooring(1, DOCK_X, NORTHING, "old west"),
+    ];
+    write_geopackage(&path, "moorings", &old, Crs(32633)).unwrap();
+    let mut new = [
+        mooring(0, 13.4, 52.5, "east"),
+        mooring(1, 13.5, 52.6, "west"),
+        mooring(2, 13.6, 52.7, "north"),
+    ];
+    new[2].properties.insert("depth".to_string(), json!(4.5));
+    write_geopackage(&path, "moorings", &new, Crs::WGS84).unwrap();
+
+    let sites = every_feature(&GpkgSrc::open(&path, Some("sites"), None).unwrap()).await;
+    assert_eq!(sites.crs, Crs(32633));
+    assert_eq!(names(&sites), ["pier", "dock", "buoy"]);
+    let moorings = every_feature(&GpkgSrc::open(&path, Some("moorings"), None).unwrap()).await;
+    assert_eq!(moorings.crs, Crs::WGS84);
+    assert_eq!(names(&moorings), ["east", "west", "north"]);
+    assert_eq!(moorings.features[2].properties["depth"], json!(4.5));
+
+    let connection = Connection::open(&path).unwrap();
+    let count = |sql: &str| -> i64 { connection.query_row(sql, [], |row| row.get(0)).unwrap() };
+    for metadata in ["gpkg_contents", "gpkg_geometry_columns", "gpkg_extensions"] {
+        assert_eq!(
+            count(&format!("SELECT count(*) FROM {metadata}")),
+            2,
+            "{metadata}"
+        );
+    }
+    assert_eq!(count("SELECT count(*) FROM rtree_moorings_geom"), 3);
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' \
+             AND name LIKE 'rtree_moorings_geom_%'"
+        ),
+        7
+    );
+}
+
+#[test]
+fn writing_a_geopackage_over_a_file_that_is_not_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = dir.path().join("notes.gpkg");
+    std::fs::write(&text, "harbour notes, not a database").unwrap();
+    let message = write_geopackage(&text, "moorings", &written_features(), Crs(32633))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("notes.gpkg") && message.contains("not a geopackage"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&text).unwrap(),
+        "harbour notes, not a database"
+    );
+
+    let database = dir.path().join("ledger.gpkg");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch("CREATE TABLE entries (amount INTEGER)")
+        .unwrap();
+    drop(connection);
+    let message = write_geopackage(&database, "moorings", &written_features(), Crs(32633))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("ledger.gpkg") && message.contains("not a geopackage"),
+        "{message}"
+    );
+    let tables: Vec<String> = Connection::open(&database)
+        .unwrap()
+        .prepare("SELECT name FROM sqlite_master")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(tables, ["entries"]);
+}
+
+#[test]
+fn an_empty_or_nul_holding_name_is_refused_before_any_file_is_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("names.gpkg");
+    let mut unnamed_property = written_features();
+    unnamed_property[0]
+        .properties
+        .insert(String::new(), json!("blank"));
+    let cases = [
+        ("", written_features(), "cannot be empty"),
+        ("moor\0ings", written_features(), "NUL"),
+        ("moorings", unnamed_property, "cannot be empty"),
+    ];
+    for (table, features, problem) in cases {
+        let message = write_geopackage(&path, table, &features, Crs(32633))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(problem), "{table:?}: {message}");
+        assert!(!path.exists(), "{table:?} made a file");
+    }
 }

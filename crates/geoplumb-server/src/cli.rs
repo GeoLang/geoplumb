@@ -156,6 +156,11 @@ pub async fn write_layer(
         }
         (LayerKind::Vector, OutputFormat::Gpkg) => {
             let chunk = features(&job).await?;
+            // sqlite rolls back a failed write to an existing geopackage
+            if output.exists() {
+                return write_geopackage(output, layer, &chunk.features, job.plan.crs)
+                    .map_err(|e| e.to_string());
+            }
             write_geopackage(file.path(), layer, &chunk.features, job.plan.crs)
                 .map_err(|e| e.to_string())?;
         }

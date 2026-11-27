@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 use topoi_core::geojson::FeatureGeometry;
 
@@ -203,6 +203,14 @@ fn connect(path: &Path) -> Result<Connection> {
 }
 
 fn quote_identifier(identifier: &str) -> std::result::Result<String, String> {
+    if identifier.is_empty() {
+        return Err("geopackage identifiers cannot be empty".into());
+    }
+    if identifier.contains('\0') {
+        return Err(format!(
+            "geopackage identifier {identifier:?} contains a NUL character"
+        ));
+    }
     if identifier.contains('"') {
         return Err(format!(
             "geopackage identifier {identifier} contains a double quote"
@@ -411,18 +419,21 @@ const METADATA_TABLES: &str = "
         CONSTRAINT uk_gc_table_name UNIQUE (table_name),
         CONSTRAINT fk_gc_tn FOREIGN KEY (table_name) REFERENCES gpkg_contents(table_name),
         CONSTRAINT fk_gc_srs FOREIGN KEY (srs_id) REFERENCES gpkg_spatial_ref_sys (srs_id));
-    CREATE TABLE gpkg_extensions (
-        table_name TEXT,
-        column_name TEXT,
-        extension_name TEXT NOT NULL,
-        definition TEXT NOT NULL,
-        scope TEXT NOT NULL,
-        CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name));
     INSERT INTO gpkg_spatial_ref_sys VALUES
         ('Undefined Cartesian SRS', -1, 'NONE', -1, 'undefined',
             'undefined Cartesian coordinate reference system'),
         ('Undefined geographic SRS', 0, 'NONE', 0, 'undefined',
             'undefined geographic coordinate reference system');";
+
+// gpkg_extensions is optional in the geopackage spec
+const EXTENSIONS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS gpkg_extensions (
+        table_name TEXT,
+        column_name TEXT,
+        extension_name TEXT NOT NULL,
+        definition TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name));";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ColumnType {
@@ -578,6 +589,121 @@ fn rtree_triggers(table: &str, rtree: &str) -> std::result::Result<String, Strin
     ))
 }
 
+fn register_epsg_srs(
+    connection: &Connection,
+    crs: Crs,
+    srs_id: i32,
+    definition: &str,
+) -> std::result::Result<(), String> {
+    let registered: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT organization, organization_coordsys_id FROM gpkg_spatial_ref_sys \
+             WHERE srs_id = ?1",
+            [srs_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    match registered {
+        None => connection
+            .execute(
+                "INSERT INTO gpkg_spatial_ref_sys (srs_name, srs_id, organization, \
+                 organization_coordsys_id, definition) VALUES (?1, ?2, 'EPSG', ?2, ?3)",
+                rusqlite::params![crs.to_string(), srs_id, definition],
+            )
+            .map(drop)
+            .map_err(|e| e.to_string()),
+        Some((organization, code))
+            if organization.eq_ignore_ascii_case("EPSG") && code == i64::from(srs_id) =>
+        {
+            Ok(())
+        }
+        Some((organization, code)) => Err(format!(
+            "gpkg_spatial_ref_sys gives srs_id {srs_id} to {organization} {code}, not to {crs}"
+        )),
+    }
+}
+
+fn table_exists(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get(0),
+    )
+}
+
+fn require_geopackage_tables(connection: &Connection) -> std::result::Result<(), String> {
+    for required in [
+        "gpkg_spatial_ref_sys",
+        "gpkg_contents",
+        "gpkg_geometry_columns",
+    ] {
+        if !table_exists(connection, required).map_err(|e| e.to_string())? {
+            return Err(format!(
+                "is a sqlite database without a {required} table, so not a geopackage"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn drop_feature_layer(connection: &Connection, table: &str) -> std::result::Result<(), String> {
+    let sql_error = |e: rusqlite::Error| e.to_string();
+    // sqlite matches table names ignoring ascii case
+    let layer: Option<(String, String)> = connection
+        .query_row(
+            "SELECT table_name, data_type FROM gpkg_contents WHERE table_name = ?1 COLLATE NOCASE",
+            [table],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((layer, data_type)) = layer else {
+        return Ok(());
+    };
+    if data_type != "features" {
+        return Err(format!(
+            "{layer} is a {data_type} table, which a feature layer cannot replace"
+        ));
+    }
+    let geometry_column: Option<String> = connection
+        .query_row(
+            "SELECT column_name FROM gpkg_geometry_columns WHERE table_name = ?1",
+            [&layer],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    // rusqlite's bundled sqlite enforces the foreign key from gpkg_geometry_columns to gpkg_contents
+    for metadata in [
+        "gpkg_geometry_columns",
+        "gpkg_extensions",
+        "gpkg_data_columns",
+        "gpkg_ogr_contents",
+        "gpkg_contents",
+    ] {
+        if table_exists(connection, metadata).map_err(sql_error)? {
+            connection
+                .execute(
+                    &format!("DELETE FROM {metadata} WHERE table_name = ?1"),
+                    [&layer],
+                )
+                .map_err(sql_error)?;
+        }
+    }
+    // sqlite drops a table's triggers along with it
+    connection
+        .execute_batch(&format!("DROP TABLE {};", quote_identifier(&layer)?))
+        .map_err(sql_error)?;
+    if let Some(geometry_column) = geometry_column {
+        let rtree = quote_identifier(&format!("rtree_{layer}_{geometry_column}"))?;
+        connection
+            .execute_batch(&format!("DROP TABLE IF EXISTS {rtree};"))
+            .map_err(sql_error)?;
+    }
+    Ok(())
+}
+
 pub fn write_geopackage(
     path: &Path,
     table: &str,
@@ -640,31 +766,44 @@ pub fn write_geopackage(
     let triggers = rtree_triggers(table, &rtree).map_err(write_error)?;
 
     let mut connection = Connection::open(path).map_err(sql_error)?;
-    connection
-        .pragma_update(None, "application_id", GPKG_APPLICATION_ID)
-        .map_err(sql_error)?;
-    connection
-        .pragma_update(None, "user_version", GPKG_USER_VERSION)
-        .map_err(sql_error)?;
-    let transaction = connection.transaction().map_err(sql_error)?;
-    transaction
-        .execute_batch(METADATA_TABLES)
-        .map_err(sql_error)?;
-    transaction
-        .execute(
-            "INSERT INTO gpkg_spatial_ref_sys VALUES ('WGS 84 geodetic', 4326, 'EPSG', 4326, ?1, \
-             'longitude/latitude coordinates in decimal degrees on the WGS 84 spheroid')",
-            [crs_definitions::EPSG_4326.wkt],
-        )
-        .map_err(sql_error)?;
-    if crs != Crs::WGS84 {
+    let schema_error = |e: rusqlite::Error| match e.sqlite_error_code() {
+        Some(ErrorCode::NotADatabase) => {
+            write_error("is not a geopackage, nor any sqlite database".into())
+        }
+        _ => sql_error(e),
+    };
+    // sqlite takes the write lock at BEGIN IMMEDIATE, before the schema is read
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(schema_error)?;
+    let schema_objects: i64 = transaction
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .map_err(schema_error)?;
+    if schema_objects == 0 {
+        transaction
+            .pragma_update(None, "application_id", GPKG_APPLICATION_ID)
+            .map_err(sql_error)?;
+        transaction
+            .pragma_update(None, "user_version", GPKG_USER_VERSION)
+            .map_err(sql_error)?;
+        transaction
+            .execute_batch(METADATA_TABLES)
+            .map_err(sql_error)?;
         transaction
             .execute(
-                "INSERT INTO gpkg_spatial_ref_sys VALUES (?1, ?2, 'EPSG', ?2, ?3, NULL)",
-                rusqlite::params![crs.to_string(), srs_id, definition],
+                "INSERT INTO gpkg_spatial_ref_sys VALUES ('WGS 84 geodetic', 4326, 'EPSG', 4326, ?1, \
+                 'longitude/latitude coordinates in decimal degrees on the WGS 84 spheroid')",
+                [crs_definitions::EPSG_4326.wkt],
             )
             .map_err(sql_error)?;
+    } else {
+        require_geopackage_tables(&transaction).map_err(write_error)?;
+        drop_feature_layer(&transaction, table).map_err(write_error)?;
     }
+    transaction
+        .execute_batch(EXTENSIONS_TABLE)
+        .map_err(sql_error)?;
+    register_epsg_srs(&transaction, crs, srs_id, definition).map_err(write_error)?;
     transaction
         .execute_batch(&format!(
             "CREATE TABLE {quoted_table} (\"{PRIMARY_KEY}\" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, \
@@ -688,13 +827,15 @@ pub fn write_geopackage(
         .map_err(sql_error)?;
     transaction
         .execute(
-            "INSERT INTO gpkg_geometry_columns VALUES (?1, ?2, ?3, ?4, 0, 0)",
+            "INSERT INTO gpkg_geometry_columns (table_name, column_name, geometry_type_name, \
+             srs_id, z, m) VALUES (?1, ?2, ?3, ?4, 0, 0)",
             rusqlite::params![table, GEOMETRY_COLUMN, geometry_type, srs_id],
         )
         .map_err(sql_error)?;
     transaction
         .execute(
-            "INSERT INTO gpkg_extensions VALUES (?1, ?2, 'gpkg_rtree_index', \
+            "INSERT INTO gpkg_extensions (table_name, column_name, extension_name, definition, \
+             scope) VALUES (?1, ?2, 'gpkg_rtree_index', \
              'http://www.geopackage.org/spec120/#extension_rtree', 'write-only')",
             rusqlite::params![table, GEOMETRY_COLUMN],
         )

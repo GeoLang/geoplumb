@@ -1,15 +1,17 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Output};
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use geoplumb::elements::GpkgSrc;
-use geoplumb::{Bbox, Crs, Source, WindowReq};
+use geoplumb::elements::{GpkgSrc, write_geopackage};
+use geoplumb::{Bbox, Crs, Source, VectorFeature, WindowReq};
 use geoplumb_server::config::Config;
 use geoplumb_server::{Layer, router};
 use projicio_core::Transform;
 use terrano_core::{CogParams, CogReader, RangeRead, Raster, SampleFormat, write_cog};
+use topoi_core::Point;
 use topoi_core::geojson::{FeatureGeometry, read_geojson};
 use tower::ServiceExt;
 
@@ -803,6 +805,63 @@ async fn geoplumb_run_writes_a_vector_layer_as_a_geopackage_in_the_crs_it_was_as
         (ferry_east_end - bbox.max_x).abs() < 1e-6,
         "the ferry ends at {ferry_east_end}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn geoplumb_run_into_an_existing_geopackage_replaces_its_layer_and_keeps_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let layers = write_command_layers(dir.path());
+    let out = dir.path().join("bay.gpkg");
+    let buoy = |id: u64, lon: f64, name: &str| VectorFeature {
+        id,
+        geometry: FeatureGeometry::Point(Point::new(lon, 37.6)),
+        properties: HashMap::from([("name".to_string(), serde_json::json!(name))]),
+    };
+    write_geopackage(
+        &out,
+        "buoys",
+        &[buoy(0, -122.5, "outer"), buoy(1, -122.4, "inner")],
+        Crs::WGS84,
+    )
+    .unwrap();
+
+    // the second run replaces the sites table the first run wrote
+    for _ in 0..2 {
+        let output = geoplumb(&[
+            "run",
+            &layers,
+            "sites",
+            "--bbox",
+            "-122.5,37.7,-122.3,37.9",
+            "--crs",
+            "EPSG:4326",
+            "--resolution",
+            "0.001",
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+
+    for (table, expected) in [
+        ("buoys", vec!["inner", "outer"]),
+        ("sites", vec!["ferry", "park", "pier"]),
+    ] {
+        let src = GpkgSrc::open(&out, Some(table), None).unwrap();
+        let request = WindowReq {
+            bbox: Bbox::new(-123.0, 37.0, -122.0, 38.0),
+            resolution: src.grid().base_resolution,
+            time: None,
+        };
+        let chunk = src.read(&request).await.unwrap().into_vector().unwrap();
+        let mut names: Vec<&str> = chunk
+            .features
+            .iter()
+            .map(|feature| feature.properties["name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, expected, "{table}");
+    }
 }
 
 #[test]
