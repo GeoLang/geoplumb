@@ -1,0 +1,13 @@
+# sentinel-2 true colour over interlaken in august 2025, cloud-free: each pixel is
+# the median of every item in the month, and each item's red, green and blue count
+# only where that item's scl is 4, 5 or 6, vegetation, bare ground and water. scl
+# is 20 m against 10 m red, green and blue, so each 10 m cell takes the code of the
+# 20 m scl pixel under it, and scl is not a band of the output.
+[[layer]]
+name = "sentinel2-median"
+gray = { min = 0.0, max = 3000.0 }
+source = { kind = "stac", api = "https://earth-search.aws.element84.com/v1", collection = "sentinel-2-l2a", assets = [
+    "red",
+    "green",
+    "blue",
+], bbox = [7.82, 46.67, 7.96, 46.77], datetime = "2025-08-01T00:00:00Z/2025-09-01T00:00:00Z", composite = "median", item_mask = { asset = "scl", valid_values = [4.0, 5.0, 6.0] } }

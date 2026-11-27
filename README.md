@@ -231,6 +231,16 @@ geoplumb info dem-utm.tif
 
 The Docker image holds `geoplumb-server` only.
 
+## Compared with GDAL
+
+[docs/gdal-parity.md](docs/gdal-parity.md) lists each operator beside the GDAL command it was checked against, the public input, the measure and the result. The scripts in [proofs/](proofs/README.md) rerun every comparison against your build, and `proofs/bench.sh` times hillshade, warp, contours and COG export against GDAL.
+
+A cloud-free Sentinel-2 median written as a COG is one command over [examples/sentinel2-median.toml](examples/sentinel2-median.toml). GDAL 3.12 has no STAC source that keeps items apart, so the same output takes a STAC search of its own, a `gdalwarp` and a `gdal raster calc` per item and band, and a `gdal raster mosaic --pixel-function median` per band, see `proofs/sentinel2-median.sh`.
+
+```sh
+geoplumb run examples/sentinel2-median.toml sentinel2-median --bbox 410100,5170020,420000,5179920 --crs EPSG:32632 --resolution 10 -o median.tif
+```
+
 ## Library
 
 ```rust

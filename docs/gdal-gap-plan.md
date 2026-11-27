@@ -505,22 +505,45 @@ that opens the user's file and writes it back in its own dtype.
       on an ESA WorldCover window with one exact colour per class, all four
       bands equal `gdaldem color-relief -alpha` in every cell. Cutline clip
       and colour relief are done, the rest of 9.4 is by demand.
-- [ ] 9.5 A parity table users can read and rerun. The measured agreement
+- [x] 9.5 A parity table users can read and rerun. The measured agreement
       with GDAL is in 8.4 and 8.6 of this file, and the proof scripts that
       produced it are outside the repo. Move them into `geoplumb/proofs/`
       with the steps that fetch their public inputs, and publish
       `docs/gdal-parity.md`: one row per operator with the GDAL command it was
       compared to, the input, the measure and the result.
-- [ ] 9.6 A benchmark against GDAL. None exists. A bench script timing wall
+      Built: `proofs/` holds one script per operator family against the
+      binary in `GEOPLUMB_BIN`, and `proofs/fetch.sh` downloads the three
+      public inputs into `GEOPLUMB_PROOF_DATA` and checks their sha256.
+      `docs/gdal-parity.md` holds the results of one run of every script
+      through `geoplumb run` on GDAL 3.12.4, all passing except the warp in
+      `cli.sh`, which passes against gdalwarp 3.13.3 (max 0.67 mm) and
+      differs from gdalwarp 3.12.4 by a median of 11 cm with the same PROJ
+      9.8.1. The hydrology proofs compare against pysheds, not GDAL, and stay
+      out.
+- [x] 9.6 A benchmark against GDAL. None exists. A bench script timing wall
       clock and peak memory for hillshade, warp, contours and export on the
       proof inputs, geoplumb against the GDAL command from 9.5.
-- [ ] 9.7 The case GDAL handles worst, as the first example in the docs: a
+      Built: `proofs/bench.sh` runs each pair three times under
+      `/usr/bin/time -v` over the Copernicus tile and prints the medians as
+      a markdown table. The numbers are in `docs/gdal-parity.md`: geoplumb
+      is slower on hillshade, warp and COG export and faster on contours,
+      at higher peak memory.
+- [x] 9.7 The case GDAL handles worst, as the first example in the docs: a
       cloud-free Sentinel-2 median over a bbox written as a COG by one
       `geoplumb run` over a `stac` layer with a `mask` over SCL and the
       `median` composite, pulled window by window without downloading whole
       scenes. Before claiming the advantage, write the same job with GDAL
       3.12 (the STACIT driver and whatever median it offers) and put both
       side by side.
+      Built: `examples/sentinel2-median.toml`, a README section, and
+      `proofs/sentinel2-median.sh`, which times one `geoplumb run` against a
+      GDAL 3.12 pipeline and compares the two outputs. STACIT mosaics a
+      search with the newest item on top and has no per-item mask or median,
+      so the GDAL side lists items from the STAC API itself, then runs
+      `gdalwarp` and `gdal raster calc` per item and band and
+      `gdal raster mosaic --pixel-function median` per band. Over 19 items
+      the two outputs are equal in every cell of all three bands, and
+      `geoplumb run` takes 31.5 s against GDAL's 93.2 s.
 
 geoplumb is AGPL and GDAL is MIT. That does not matter for command line use,
 it does for anyone linking the crate. It is a licence decision, not a task.

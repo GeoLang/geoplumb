@@ -1022,6 +1022,30 @@ fn the_example_ndvi_layer_takes_a_median_under_an_item_mask() {
 }
 
 #[test]
+fn the_sentinel2_median_example_masks_each_item_on_scl_before_the_median() {
+    let config = Config::parse(include_str!("../../../examples/sentinel2-median.toml")).unwrap();
+    let [layer] = &config.layers[..] else {
+        panic!("one layer, got {}", config.layers.len());
+    };
+    assert_eq!(layer.name, "sentinel2-median");
+    let search = source_of(layer).stac_search().expect("a stac source");
+    assert_eq!(search.collection, "sentinel-2-l2a");
+    assert_eq!(search.assets, ["red", "green", "blue"]);
+    assert_eq!(search.composite, geoplumb::elements::Composite::Median);
+    assert_eq!(
+        search.item_mask,
+        Some(geoplumb::elements::ItemMask {
+            asset: "scl".into(),
+            valid_values: vec![4.0, 5.0, 6.0],
+        })
+    );
+    assert_eq!(
+        search.datetime.as_deref(),
+        Some("2025-08-01T00:00:00Z/2025-09-01T00:00:00Z")
+    );
+}
+
+#[test]
 fn a_unary_op_takes_its_constant_where_it_has_one() {
     let text = r#"
 [[layer]]
