@@ -377,7 +377,8 @@ only after a proof script passes on real input, recorded in
       Polygonize's polygon count, hole count and area, no invalid polygon,
       and a symmetric difference under 1e-5 cells. That needed terrano's
       pinch turn fixed (7ed5e85), topoi's union made OGC-valid on an i64
-      grid with a hole re-binding that stands in for iOverlay#104 (4d791e9),
+      grid (4d791e9), whose hole binding i_overlay 9.2.1 fixed upstream
+      (iOverlay#104, topoi 2654af7),
       and `dissolve` unioning each id in one call. `Viewshed` is proven: a
       10 km disc on Copernicus GLO-30 warped to UTM 32N at 30 m, exported
       through `/export`, equals its four quadrant exports bit for bit and
@@ -388,18 +389,22 @@ only after a proof script passes on real input, recorded in
 
 ### Wave 3
 
-- [ ] 8.7 Global operations. Flow accumulation, watershed and stream order
-      depend on a whole upstream basin, so no fixed halo works. tiletopia
-      runs them over one bounded window in memory. Design before building:
-      a transform over a declared region computed once per ladder level and
-      pull time, under a pixel cap. Then tiletopia's
-      `/api/v1/analysis/terrain` and `/viewshed` call geoplumb and its
-      copies go.
+- [x] 8.7 Global operations. Flow accumulation, watershed and stream order
+      depend on a whole upstream basin, so no fixed halo works. A region
+      transform computes once per ladder level and pull time over a
+      declared region, under a pixel cap. The four hydrology ops are proven
+      against pysheds (`hydrology.sh`). tiletopia's
+      `/api/v1/analysis/terrain` and `/viewshed` run as geoplumb graphs
+      (tiletopia 008c4c4), and Lake Thun's outlet drains 0.997 of terrano's
+      area at 90 m through the route, with flow accumulation as the `peak`
+      value kind.
 - [ ] 8.8 Zarr source over `zarrs`, after checking the crate is still the
       current choice.
-- [ ] 8.9 Native dtype. Every source serves f64. terrano's `Raster` is f64
-      only, so this starts as a design: where a typed sample buffer lives
-      (terrano or a geoplumb chunk), and what compute does with it.
+- [x] 8.9 Native dtype. terrano's `TypedBand` holds each band in its file
+      format, raster caps carry a dtype per band, and `CogSrc`, `StacSrc`
+      and `GdalSrc` serve the file's own format through export and `.tif`
+      tiles, palette included. Proven on WorldCover and Copernicus GLO-30
+      against `gdal_translate` and `gdalwarp` (`native-dtype.sh`).
 - [ ] 8.10 Colour ramps on png tiles, dogfooding `jung-core`'s `ColorRamp`,
       and CRS input beyond EPSG codes in projicio.
 
@@ -436,9 +441,8 @@ that opens the user's file and writes it back in its own dtype.
       JPEG and WebP tiles, striped GeoTIFF and BigTIFF in `CogReader` (section 7 sizes each). A CRS given as WKT or PROJ JSON is
       8.10. Vector: shapefile and CSV as layer sources through geodukt, which
       reads both, then FlatGeobuf and GeoParquet (section 7).
-- [ ] 9.3 Native dtype on output, which is 8.9. A byte raster exported today
-      comes back as f64: the deflated base level of the 8.4 WorldCover export
-      is 154,948 bytes as Float64 against 96,586 as Byte.
+- [x] 9.3 Native dtype on output, which is 8.9. A byte raster exports as
+      Byte, where it used to come back as Float64.
 - [ ] 9.4 GDAL operators with no geoplumb element. Nothing in geoplumb or
       terrano clips a raster to a polygon as `gdalwarp -cutline` does
       (`vec_clip` clips features only), fills nodata (`gdal_fillnodata`),
