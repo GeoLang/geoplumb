@@ -234,6 +234,7 @@ pub fn cog_info(path: &Path) -> Result<String, String> {
         1 => "none".to_string(),
         5 => "lzw".to_string(),
         8 => "deflate".to_string(),
+        50000 => "zstd".to_string(),
         other => format!("tiff code {other}"),
     };
     let predictor = match base.predictor() {

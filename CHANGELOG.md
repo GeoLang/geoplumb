@@ -2,6 +2,7 @@
 
 ## 2026-11-27
 
+- terrano-core locked to 4af0228: `cog` layer sources, `geoplumb info` and `geoplumb run` read ZSTD tiles and strips, GDAL's `COMPRESS=ZSTD`, and `geoplumb info` names that compression `zstd`
 - terrano-core locked to 5a2275b: `cog` layer sources, `geoplumb info` and `geoplumb run` open striped and band-interleaved GeoTIFFs, the layouts `gdal_translate` writes without `-of COG`, and pixel-interleaved multi-band files with the floating-point predictor read right, where every pixel used to read wrong
 - `geoplumb pyramid <layers.toml> <layer> --bbox west,south,east,north [--min-zoom] --max-zoom [--t] -o <dir>` writes every xyz tile covering the bbox as `<dir>/z/x/y.png`, or `.mvt` for a vector layer, each the bytes `/tiles` serves for it. `XyzTile::covering` gives the tiles covering a lon/lat bbox at one zoom, and the `pyramid` example uses it
 - a `stac` asset at the source's pixel size whose grid is off the window's, an item tiled on another origin say, is read on its own grid and resampled onto the window by value kind, as coarser assets are, instead of rounded onto the window's grid, which read continuous values up to half a pixel off. Assets on the grid read as before

@@ -216,7 +216,7 @@ with opens gets a pure-Rust reader, most opens first, and when the counter
 has been zero for a year the feature is deleted. What that porting list looks
 like today, by what the org already touches:
 
-- COG tile compressions beyond deflate and LZW: JPEG and WebP tiles (`image` crates), ZSTD (`ruzstd` for decode, pure Rust). LERC
+- COG tile compressions beyond deflate, LZW and ZSTD: JPEG and WebP tiles (`image` crates). LERC
   has a C binding crate and no pure-Rust decoder that I know of. Each is one
   to two weeks in terrano including predictor and band interleave cases.
 - BigTIFF in `CogReader`, one week.
@@ -439,13 +439,13 @@ that opens the user's file and writes it back in its own dtype.
       types, `geodukt-core` depends on geoplumb, and its rusqlite 0.40 links
       a different `libsqlite3-sys` than geoplumb's 0.39).
 - [ ] 9.2 Open every GeoTIFF GDAL writes with its defaults. Built: striped
-      GeoTIFF and band interleave (PlanarConfiguration 2), raw, LZW or
-      deflate with either predictor, including the floating-point predictor
+      GeoTIFF and band interleave (PlanarConfiguration 2), raw, LZW, deflate
+      or ZSTD with either predictor, including the floating-point predictor
       over pixel-interleaved bands.
       Proof: `gdal_translate` on Copernicus GLO-30 and an ESA WorldCover
       window, where `geoplumb run` over each file's own grid equals GDAL's
-      read of every pixel and band. Left: ZSTD, JPEG and WebP tiles and
-      BigTIFF in `CogReader` (section 7 sizes each). A CRS given as WKT or PROJ JSON is
+      read of every pixel and band. Left: JPEG and WebP tiles and BigTIFF in
+      `CogReader` (section 7 sizes each). A CRS given as WKT or PROJ JSON is
       8.10. Vector: shapefile and CSV as layer sources through geodukt, which
       reads both, then FlatGeobuf and GeoParquet (section 7).
 - [x] 9.3 Native dtype on output, which is 8.9. A byte raster exports as
