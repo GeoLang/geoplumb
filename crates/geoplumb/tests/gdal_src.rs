@@ -6,11 +6,13 @@ use gdal::raster::Buffer;
 use gdal::spatial_ref::SpatialRef;
 use gdal::{Dataset, DatasetOptions, DriverManager, GdalOpenFlags};
 use geoplumb::RasterBands;
-use geoplumb::caps::ValueKind;
+use geoplumb::caps::{Dtype, ValueKind};
 use geoplumb::element::Source;
 use geoplumb::elements::{GdalSrc, RasterSrc};
 use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, WindowReq};
-use terrano_core::{BandedRaster, GeoTiffMetadata, Raster, SampleFormat, write_geotiff_bands};
+use terrano_core::{
+    BandedRaster, GeoTiffMetadata, Raster, SampleFormat, TypedBand, write_geotiff_bands,
+};
 
 const W: usize = 600;
 const H: usize = 400;
@@ -346,5 +348,76 @@ async fn concurrent_chunks_match_one_read() {
         for (x, y) in a.data().iter().zip(b.data()) {
             assert!(x == y || (x.is_nan() && y.is_nan()), "{x} vs {y}");
         }
+    }
+}
+
+fn height_at(col: usize, row: usize) -> i16 {
+    (col as i32 * 37 - row as i32 * 53) as i16
+}
+
+#[tokio::test]
+async fn an_int16_band_is_served_as_int16_with_its_nodata() {
+    let dir = tempfile::tempdir().unwrap();
+    let heights = (0..W * H)
+        .map(|index| f64::from(height_at(index % W, index / W)))
+        .collect();
+    let raster = Raster::from_vec(W, H, heights, CELL, f64::NAN).unwrap();
+    let meta = GeoTiffMetadata {
+        origin_x: ORIGIN_X,
+        origin_y: ORIGIN_Y,
+        pixel_width: CELL,
+        pixel_height: CELL,
+        epsg: 4326,
+    };
+    let mut bytes = Vec::new();
+    write_geotiff_bands(
+        &BandedRaster::new(vec![raster]).unwrap(),
+        &meta,
+        SampleFormat::I16,
+        &mut bytes,
+    )
+    .unwrap();
+    let path = dir.path().join("heights.tif");
+    std::fs::write(&path, &bytes).unwrap();
+    let dataset = Dataset::open_ex(
+        &path,
+        DatasetOptions {
+            open_flags: GdalOpenFlags::GDAL_OF_UPDATE | GdalOpenFlags::GDAL_OF_RASTER,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    dataset
+        .rasterband(1)
+        .unwrap()
+        .set_no_data_value(Some(f64::from(i16::MIN)))
+        .unwrap();
+    drop(dataset);
+
+    let mut graph = Graph::new();
+    let node = graph.add_source(Box::new(
+        GdalSrc::open(&path, ValueKind::Continuous).unwrap(),
+    ));
+    let engine = Engine::new(graph, 64 << 20).unwrap();
+    assert_eq!(
+        engine.caps(node).raster().dtypes.band(0),
+        Dtype::I16 {
+            nodata: Some(i16::MIN)
+        }
+    );
+
+    let src = GdalSrc::open(&path, ValueKind::Continuous).unwrap();
+    let chunk = read(&src, &request(window(-16, -16, 48, 48), CELL)).await;
+    let TypedBand::I16 { samples, nodata } = chunk.bands.band(0).unwrap() else {
+        panic!("the int16 band was not served as i16");
+    };
+    assert_eq!(*nodata, Some(i16::MIN));
+    for (index, value) in samples.values().iter().enumerate() {
+        let (col, row) = (index % 64, index / 64);
+        let want = match col < 16 || row < 16 {
+            true => i16::MIN,
+            false => height_at(col - 16, row - 16),
+        };
+        assert_eq!(*value, want, "col {col} row {row}");
     }
 }

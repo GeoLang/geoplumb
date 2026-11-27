@@ -1,13 +1,10 @@
-//! chunk encoders for the demo drivers: grayscale png with alpha for
-//! nodata, and geotiff via terrano
+use std::io::Cursor;
 
 use crate::bands::finite_value;
-use crate::caps::Crs;
+use crate::caps::{Crs, Dtype};
 use crate::chunk::RasterChunk;
 use crate::error::{Error, Result};
-use terrano_core::{
-    BandedRaster, GeoTiffMetadata, Raster, SampleFormat, TypedBand, write_geotiff_bands,
-};
+use terrano_core::{CogParams, TypedBand, typed_tile_bytes, write_cog_tiles};
 
 pub fn png_gray(chunk: &RasterChunk, min: f64, max: f64) -> Result<Vec<u8>> {
     let band = chunk
@@ -41,43 +38,47 @@ pub fn png_gray(chunk: &RasterChunk, min: f64, max: f64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn with_sentinel(band: &TypedBand) -> Raster {
-    let mut raster = band.to_raster().into_owned();
-    if let Some(sentinel) = band.integer_nodata() {
-        for value in raster.data_mut() {
-            if value.is_nan() {
-                *value = sentinel;
-            }
-        }
-    }
-    raster
-}
-
-pub fn geotiff(chunk: &RasterChunk) -> Result<Vec<u8>> {
+pub fn geotiff(chunk: &RasterChunk, palette: Option<&[[u16; 3]]>) -> Result<Vec<u8>> {
     let Crs(epsg) = chunk.crs;
-    let meta = GeoTiffMetadata {
+    let bands = chunk.bands.bands();
+    let first = Dtype::of(&bands[0]);
+    let one_dtype = bands.iter().all(|band| Dtype::of(band) == first);
+    // a tiff has one sample format and one nodata value for every band
+    let dtype = if one_dtype { first } else { Dtype::F64 };
+    let bands: Vec<TypedBand> = match dtype {
+        Dtype::F64 => chunk
+            .bands
+            .clone()
+            .into_rasters()
+            .into_iter()
+            .map(TypedBand::F64)
+            .collect(),
+        _ => bands.to_vec(),
+    };
+    let (width, height) = (chunk.width(), chunk.height());
+    let params = CogParams {
+        // tiff 6.0 tile sides are multiples of 16
+        tile_width: width.next_multiple_of(16) as u32,
+        tile_height: height.next_multiple_of(16) as u32,
+        overview_levels: 0,
+        epsg: epsg as u16,
         origin_x: chunk.bbox.min_x,
         origin_y: chunk.bbox.max_y,
         pixel_width: chunk.resolution,
         pixel_height: chunk.resolution,
-        epsg: epsg as u16,
+        deflate: false,
+        format: dtype.format(),
+        nodata: dtype.integer_nodata(),
+        palette: palette.map(<[[u16; 3]]>::to_vec),
     };
-    let bands = chunk.bands.bands();
-    let first = bands[0].format();
-    let format = if bands.iter().all(|band| band.format() == first) {
-        first
-    } else {
-        // write_geotiff_bands writes one sample format for every band
-        SampleFormat::F64
-    };
-    let rasters = bands
-        .iter()
-        .map(|band| match format {
-            SampleFormat::F64 => band.to_raster().into_owned(),
-            _ => with_sentinel(band),
-        })
-        .collect();
-    let mut out = Vec::new();
-    write_geotiff_bands(&BandedRaster::new(rasters)?, &meta, format, &mut out)?;
-    Ok(out)
+    let mut out = Cursor::new(Vec::new());
+    write_cog_tiles(
+        width,
+        height,
+        bands.len(),
+        &params,
+        |_, tile_col, tile_row| typed_tile_bytes(&bands, tile_col, tile_row, &params),
+        &mut out,
+    )?;
+    Ok(out.into_inner())
 }

@@ -73,7 +73,7 @@ impl RasterBands {
     }
 }
 
-trait Sample: Copy + PartialEq + Send + Sync + 'static {
+pub(crate) trait Sample: Copy + PartialEq + Send + Sync + 'static {
     const FLOAT: bool;
 
     fn view(band: &TypedBand) -> Option<(&[Self], Option<Self>)>;
@@ -362,6 +362,27 @@ pub(crate) fn narrowed(
         Dtype::F32 => narrowed_to::<f32>(None, width, height, cell_size, values),
         Dtype::F64 => narrowed_to::<f64>(None, width, height, cell_size, values),
     }
+}
+
+pub(crate) fn narrowed_raster(dtype: Dtype, raster: &Raster) -> TypedBand {
+    let values = raster
+        .data()
+        .iter()
+        .map(|&value| {
+            if raster.is_nodata(value) {
+                f64::NAN
+            } else {
+                value
+            }
+        })
+        .collect();
+    narrowed(
+        dtype,
+        raster.width(),
+        raster.height(),
+        raster.cell_size,
+        values,
+    )
 }
 
 fn narrowed_like_samples<T: Sample>(

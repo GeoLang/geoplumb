@@ -50,6 +50,7 @@ struct RtNode {
     /// so its chunks are cached per time
     time_varying: bool,
     region: Option<Bbox>,
+    palette: Option<Vec<[u16; 3]>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,12 +186,31 @@ impl Engine {
                 RtElem::Transform { element, .. } => element.region(),
                 RtElem::Source(_) | RtElem::Fanin { .. } => None,
             };
+            let parent_palette =
+                |p: usize| &nodes[p].as_ref().expect("parents built first").palette;
+            let palette = match &elem {
+                RtElem::Source(s) => s.palette(),
+                RtElem::Transform { parent, element }
+                    if element.constraint().passes_dtypes_through() =>
+                {
+                    parent_palette(*parent).clone()
+                }
+                RtElem::Fanin { parents, element }
+                    if element.constraint().passes_dtypes_through() =>
+                {
+                    let first = parent_palette(parents[0]);
+                    let shared = parents.iter().all(|p| parent_palette(*p) == first);
+                    first.clone().filter(|_| shared)
+                }
+                RtElem::Transform { .. } | RtElem::Fanin { .. } => None,
+            };
             nodes[i] = Some(RtNode {
                 elem,
                 caps: caps[i].clone(),
                 grid,
                 time_varying,
                 region,
+                palette,
             });
         }
         let (events, _) = broadcast::channel(64);
@@ -300,6 +320,10 @@ impl Engine {
 
     pub fn grid(&self, node: NodeId) -> &GridSpec {
         &self.nodes[node.0].grid
+    }
+
+    pub fn palette(&self, node: NodeId) -> Option<&[[u16; 3]]> {
+        self.nodes[node.0].palette.as_deref()
     }
 
     pub fn node_count(&self) -> usize {

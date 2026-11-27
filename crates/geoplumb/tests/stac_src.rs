@@ -11,14 +11,14 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
-use geoplumb::caps::{BandKinds, ValueKind};
+use geoplumb::caps::{BandKinds, Dtype, ValueKind};
 use geoplumb::element::Source;
 use geoplumb::elements::{
     Composite, ItemMask, StacSearch, StacSrc,
     stac::{STACK_VALUE_BUDGET, s3_to_https},
 };
 use geoplumb::{Bbox, Crs, Engine, Graph, RasterChunk, TimeInterval, WindowReq};
-use terrano_core::{BandedRaster, CogParams, Raster, write_cog, write_cog_bands};
+use terrano_core::{BandedRaster, CogParams, Raster, SampleFormat, write_cog, write_cog_bands};
 
 const CELL: f64 = 0.001;
 const ORIGIN_X: f64 = 7.0;
@@ -2867,17 +2867,23 @@ static MASKED_EXPECTED: [MaskedColumns; 6] = [
     },
 ];
 
-async fn start_masked_mock() -> (String, Arc<Mock>) {
-    start_mock_with(|base| {
+async fn start_masked_mock(format: SampleFormat) -> (String, Arc<Mock>) {
+    start_mock_with(move |base| {
+        let fine = CogParams {
+            format,
+            // no scene value or quality code is 0
+            nodata: format.integer_range().map_or(Some(f64::NAN), |_| Some(0.0)),
+            ..class_params()
+        };
         let coarse = CogParams {
             pixel_width: COARSE_CELL,
             pixel_height: COARSE_CELL,
-            ..class_params()
+            ..fine.clone()
         };
         let mut cogs = std::collections::HashMap::new();
         let mut features = Vec::new();
         for item in &MASKED_ITEMS {
-            let data = grid_cog(&class_params(), MASKED_COLS, MASKED_ROWS, |col, row| {
+            let data = grid_cog(&fine, MASKED_COLS, MASKED_ROWS, |col, row| {
                 let ground = elevation(
                     ORIGIN_X + (col as f64 + 0.5) * CELL,
                     ORIGIN_Y - (row as f64 + 0.5) * CELL,
@@ -2891,9 +2897,7 @@ async fn start_masked_mock() -> (String, Arc<Mock>) {
                 true => CLOUD_CODE,
                 false => CLEAR_CODE,
             };
-            let mask = grid_cog(&class_params(), MASKED_COLS, MASKED_ROWS, |col, _| {
-                code(col)
-            });
+            let mask = grid_cog(&fine, MASKED_COLS, MASKED_ROWS, |col, _| code(col));
             let coarse_mask = grid_cog(&coarse, MASKED_COLS / 2, MASKED_ROWS / 2, |col, _| {
                 code(2 * col)
             });
@@ -2947,7 +2951,7 @@ async fn read_masked(base: &str, mask_asset: &str, composite: Composite) -> Rast
 type ExpectedForComposite = fn(&MaskedColumns) -> Option<f64>;
 
 async fn assert_item_mask_composites(mask_asset: &str) {
-    let (base, _mock) = start_masked_mock().await;
+    let (base, _mock) = start_masked_mock(SampleFormat::F64).await;
     let cases: [(Composite, ExpectedForComposite); 3] = [
         (Composite::Latest, |columns| columns.latest),
         (Composite::Median, |columns| columns.median),
@@ -2986,4 +2990,159 @@ async fn an_item_mask_drops_each_items_clouded_pixels_before_the_composite() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_coarser_item_mask_masks_each_fine_cell_by_the_code_under_it() {
     assert_item_mask_composites("mask_coarse").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_item_mask_masks_native_integer_bands() {
+    let (base, _mock) = start_masked_mock(SampleFormat::U16).await;
+    let chunk = read_masked(&base, "mask", Composite::Latest).await;
+    assert_eq!(
+        Dtype::of(chunk.bands.band(0).unwrap()),
+        Dtype::U16 { nodata: Some(0) }
+    );
+    let mut bare = 0;
+    each_pixel(&chunk, |_, x, y, got| {
+        let col = ((x - ORIGIN_X) / CELL).floor() as usize;
+        let columns = MASKED_EXPECTED
+            .iter()
+            .find(|columns| columns.cols.contains(&col))
+            .expect("every column has a case");
+        match columns.latest {
+            None => {
+                bare += 1;
+                assert!(got.is_nan(), "col {col}: {got}, every item is clouded");
+            }
+            Some(shift) => assert_eq!(got, (elevation(x, y) + shift).round(), "col {col}"),
+        }
+    });
+    assert_eq!(bare, 10 * MASKED_ROWS);
+}
+
+// the older item sits this far above the newer one everywhere
+const OLDER_SHIFT: f64 = 1000.0;
+
+fn whole_elevation(col: usize, row: usize) -> f64 {
+    elevation(
+        ORIGIN_X + (col as f64 + 0.5) * CELL,
+        ORIGIN_Y - (row as f64 + 0.5) * CELL,
+    )
+    .round()
+}
+
+fn newer_holed(row: usize) -> bool {
+    (100..120).contains(&row)
+}
+
+async fn start_u16_mock(nodata: Option<f64>) -> (String, Arc<Mock>) {
+    start_mock_with(move |base| {
+        let params = CogParams {
+            format: SampleFormat::U16,
+            nodata,
+            ..class_params()
+        };
+        let newer = grid_cog(&params, CLASS_COLS, CLASS_ROWS, |col, row| {
+            match nodata.is_some() && newer_holed(row) {
+                true => f64::NAN,
+                false => whole_elevation(col, row),
+            }
+        });
+        let older = grid_cog(&params, CLASS_COLS, CLASS_ROWS, |col, row| {
+            whole_elevation(col, row) + OLDER_SHIFT
+        });
+        let mut cogs = std::collections::HashMap::new();
+        cogs.insert("newer.tif".into(), newer);
+        cogs.insert("older.tif".into(), older);
+        let features = vec![
+            item(
+                "newer",
+                "2024-06-02T00:00:00Z",
+                &format!("{base}/cog/newer.tif"),
+                CLASS_BBOX,
+                4326,
+            ),
+            item(
+                "older",
+                "2024-06-01T00:00:00Z",
+                &format!("{base}/cog/older.tif"),
+                CLASS_BBOX,
+                4326,
+            ),
+        ];
+        (cogs, features)
+    })
+    .await
+}
+
+type CompositeOf = fn(Option<f64>, f64) -> f64;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stac_composites_keep_the_asset_dtype_or_widen_to_f64() {
+    let (base, _mock) = start_u16_mock(Some(0.0)).await;
+    let asset = Dtype::U16 { nodata: Some(0) };
+    let cases: [(Composite, Dtype, CompositeOf); 6] = [
+        (Composite::Latest, asset, |newer, older| {
+            newer.unwrap_or(older)
+        }),
+        (Composite::Min, asset, |newer, older| {
+            newer.map_or(older, |newer| newer.min(older))
+        }),
+        (Composite::Max, asset, |newer, older| {
+            newer.map_or(older, |newer| newer.max(older))
+        }),
+        (Composite::Mean, Dtype::F64, |newer, older| {
+            newer.map_or(older, |newer| (newer + older) / 2.0)
+        }),
+        (Composite::Median, Dtype::F64, |newer, older| {
+            newer.map_or(older, |newer| (newer + older) / 2.0)
+        }),
+        (Composite::Count, Dtype::F64, |newer, _| {
+            newer.map_or(1.0, |_| 2.0)
+        }),
+    ];
+    let req = WindowReq {
+        bbox: Bbox::new(CLASS_BBOX[0], CLASS_BBOX[1], CLASS_BBOX[2], CLASS_BBOX[3]),
+        resolution: CELL,
+        time: None,
+    };
+    for (composite, dtype, expected) in cases {
+        let mut search = StacSearch::new(&base, "u16", "data", CLASS_BBOX);
+        search.composite = composite;
+        let src = open_search(search).await;
+        let mut graph = Graph::new();
+        let node = graph.add_source(Box::new(src));
+        let engine = Engine::new(graph, 64 << 20).unwrap();
+        assert_eq!(
+            engine.caps(node).raster().dtypes.band(0),
+            dtype,
+            "{composite:?}"
+        );
+        let chunk = engine.pull(node, req).await.unwrap().into_raster().unwrap();
+        let band = chunk.bands.band(0).unwrap();
+        assert_eq!(Dtype::of(band), dtype, "{composite:?}");
+        let values = band.to_raster();
+        assert_eq!(values.width(), CLASS_COLS);
+        for (index, got) in values.data().iter().enumerate() {
+            let (col, row) = (index % CLASS_COLS, index / CLASS_COLS);
+            let older = whole_elevation(col, row) + OLDER_SHIFT;
+            let newer = (!newer_holed(row)).then(|| whole_elevation(col, row));
+            assert_eq!(
+                *got,
+                expected(newer, older),
+                "{composite:?} col {col} row {row}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stac_integer_asset_without_nodata_is_refused_at_open() {
+    let (base, _mock) = start_u16_mock(None).await;
+    let search = StacSearch::new(&base, "u16", "data", CLASS_BBOX);
+    let opened = tokio::task::spawn_blocking(move || StacSrc::open(&search))
+        .await
+        .unwrap();
+    let Err(error) = opened else {
+        panic!("a u16 asset with no nodata opened");
+    };
+    assert!(error.to_string().contains("no nodata"), "{error}");
 }

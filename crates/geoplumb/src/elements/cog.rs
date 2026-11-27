@@ -1,14 +1,8 @@
-//! windowed cog source. each pull fetches only the tiles it touches
-//! through terrano's CogReader, served from the file overview nearest the
-//! requested ladder level. when the file pyramid is shallower than the
-//! request the remainder is block-decimated by each band's value kind, matching
-//! RasterSrc semantics
-
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
-use crate::bands::{RasterBands, narrowed_like};
+use crate::bands::{RasterBands, narrowed, narrowed_like, picked};
 use crate::caps::{
     BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange,
     SetField, ValueKind,
@@ -20,7 +14,7 @@ use crate::resample::reduce_block;
 use crate::spill::Fnv1a;
 use crate::window::{GridSpec, WindowReq};
 use futures::future::BoxFuture;
-use terrano_core::{CogReader, RangeRead, Raster, TypedBand};
+use terrano_core::{CogReader, RangeRead, TypedBand};
 
 pub struct CogSrc<R: RangeRead + Send + Sync + 'static> {
     reader: Arc<CogReader<R>>,
@@ -30,12 +24,12 @@ pub struct CogSrc<R: RangeRead + Send + Sync + 'static> {
     bands: u16,
     crs: Crs,
     value_kinds: BandKinds,
+    dtype: Dtype,
+    nodata: Option<f64>,
 }
 
 impl<R: RangeRead + Send + Sync + 'static> CogSrc<R> {
-    /// reads the file layout with blocking range requests, call it off
-    /// the async runtime (`spawn_blocking`) when one is running
-    pub fn open(source: R, value_kinds: impl Into<BandKinds>) -> Result<Self> {
+    pub fn open(source: R, value_kinds: impl Into<BandKinds>, nodata: Option<f64>) -> Result<Self> {
         let value_kinds = value_kinds.into();
         let reader = CogReader::open(source)?;
         let meta = reader.meta().clone();
@@ -45,6 +39,7 @@ impl<R: RangeRead + Send + Sync + 'static> CogSrc<R> {
                 "{value_kinds:?} does not fit a cog of {bands} bands"
             )));
         }
+        let dtype = cog_dtype(&reader, nodata)?;
         Ok(CogSrc {
             origin_x: meta.origin_x,
             origin_y: meta.origin_y,
@@ -52,17 +47,17 @@ impl<R: RangeRead + Send + Sync + 'static> CogSrc<R> {
             bands,
             crs: Crs(u32::from(meta.epsg)),
             value_kinds,
+            dtype,
+            nodata,
             reader: Arc::new(reader),
         })
     }
 
-    /// bands the file carries, every level alike
     pub fn bands(&self) -> u16 {
         self.bands
     }
 }
 
-/// samples per pixel at the base level, which every level shares
 pub(crate) fn band_count<R: RangeRead>(reader: &CogReader<R>) -> Result<u16> {
     let samples = reader
         .levels()
@@ -72,22 +67,50 @@ pub(crate) fn band_count<R: RangeRead>(reader: &CogReader<R>) -> Result<u16> {
     u16::try_from(samples).map_err(|_| Error::Source(format!("cog has {samples} bands")))
 }
 
+pub(crate) fn cog_dtype<R: RangeRead>(reader: &CogReader<R>, nodata: Option<f64>) -> Result<Dtype> {
+    let levels = reader.levels();
+    let base = levels
+        .first()
+        .ok_or_else(|| Error::Source("cog has no levels".into()))?;
+    let (format, file_nodata) = (base.sample_format(), base.nodata());
+    let integer = format.integer_range().is_some();
+    for (index, level) in levels.iter().enumerate() {
+        let same_nodata = level.nodata().map(f64::to_bits) == file_nodata.map(f64::to_bits);
+        if level.sample_format() != format || !same_nodata {
+            return Err(Error::Source(format!(
+                "cog level {index} is {} with nodata {:?}, level 0 is {} with nodata {file_nodata:?}",
+                level.sample_format().name(),
+                level.nodata(),
+                format.name()
+            )));
+        }
+        if integer && nodata.is_none() {
+            // read_window_typed refuses an integer level with a transparency mask and no nodata before it fetches a tile
+            reader
+                .read_window_typed(index, 0, 0, 0, 0)
+                .map_err(|e| Error::Source(format!("{e}, name a nodata for the source")))?;
+        }
+    }
+    Dtype::from_format(format, nodata.or(file_nodata))
+}
+
 impl<R: RangeRead + Send + Sync + 'static> Source for CogSrc<R> {
     fn identity(&self) -> String {
         // the tile offsets and byte counts of every level stand in for the content
         let mut layout = Fnv1a::new();
         write!(layout, "{:?}", self.reader.levels()).expect("hashing never fails");
         format!(
-            "CogSrc meta={:?} layout={:016x} value_kinds={:?}",
+            "CogSrc meta={:?} layout={:016x} value_kinds={:?} nodata={:?}",
             self.reader.meta(),
             layout.finish(),
-            self.value_kinds
+            self.value_kinds,
+            self.nodata
         )
     }
 
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
-            dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
+            dtypes: SetField::one(BandDtypes::from(self.dtype)),
             bands: SetField::one(self.bands),
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.base_resolution),
@@ -105,18 +128,51 @@ impl<R: RangeRead + Send + Sync + 'static> Source for CogSrc<R> {
         }
     }
 
+    fn palette(&self) -> Option<Vec<[u16; 3]>> {
+        self.reader.levels()[0].palette().map(<[[u16; 3]]>::to_vec)
+    }
+
     fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<Chunk>> {
         let reader = self.reader.clone();
         let req = *req;
-        let (origin_x, origin_y, crs) = (self.origin_x, self.origin_y, self.crs);
+        let (origin_x, origin_y, crs, nodata) =
+            (self.origin_x, self.origin_y, self.crs, self.nodata);
         let value_kinds = self.value_kinds.clone();
         Box::pin(async move {
             crate::engine::offload(move || {
-                read_chunk(&reader, &req, origin_x, origin_y, crs, &value_kinds).map(Chunk::Raster)
+                read_chunk(&reader, &req, origin_x, origin_y, crs, &value_kinds, nodata)
+                    .map(Chunk::Raster)
             })
             .await
         })
     }
+}
+
+fn read_window<R: RangeRead>(
+    reader: &CogReader<R>,
+    level: usize,
+    (col0, row0): (usize, usize),
+    (cols, rows): (usize, usize),
+    nodata: Option<f64>,
+) -> Result<Vec<TypedBand>> {
+    let Some(nodata) = nodata else {
+        return Ok(reader.read_window_typed(level, col0, row0, cols, rows)?);
+    };
+    let dtype = Dtype::from_format(reader.levels()[level].sample_format(), Some(nodata))?;
+    let window = reader.read_window_bands(level, col0, row0, cols, rows)?;
+    Ok(window
+        .into_bands()
+        .into_iter()
+        .map(|band| {
+            let cell_size = band.cell_size;
+            let values = band
+                .into_data()
+                .into_iter()
+                .map(|value| if value == nodata { f64::NAN } else { value })
+                .collect();
+            narrowed(dtype, cols, rows, cell_size, values)
+        })
+        .collect())
 }
 
 pub(crate) fn read_chunk<R: RangeRead>(
@@ -126,10 +182,10 @@ pub(crate) fn read_chunk<R: RangeRead>(
     origin_y: f64,
     crs: Crs,
     value_kinds: &BandKinds,
+    nodata: Option<f64>,
 ) -> Result<RasterChunk> {
     let level = reader.select_level(req.resolution);
     let lres = reader.levels()[level].pixel_width;
-    let samples = reader.levels()[level].samples;
     let factor = (req.resolution / lres).round().max(1.0) as usize;
     let cols = (req.bbox.width() / req.resolution).round() as usize;
     let rows = (req.bbox.height() / req.resolution).round() as usize;
@@ -137,38 +193,36 @@ pub(crate) fn read_chunk<R: RangeRead>(
     let col0 = ((req.bbox.min_x - origin_x) / lres).round() as i64;
     let row0 = ((origin_y - req.bbox.max_y) / lres).round() as i64;
 
-    // read_window_bands pads right/bottom itself but cannot start left or
-    // above the image, so clamp the start and copy at an offset
-    let mut fine = vec![vec![f64::NAN; fcols * frows]; samples];
+    // terrano pads a window past the right and bottom edges itself but cannot start one left of or above the image
     let (skip_c, skip_r) = ((-col0).max(0) as usize, (-row0).max(0) as usize);
-    if skip_c < fcols && skip_r < frows {
-        let window = reader.read_window_bands(
-            level,
+    let (read_cols, read_rows) = (fcols.saturating_sub(skip_c), frows.saturating_sub(skip_r));
+    let window = read_window(
+        reader,
+        level,
+        (
             (col0 + skip_c as i64) as usize,
             (row0 + skip_r as i64) as usize,
-            fcols - skip_c,
-            frows - skip_r,
-        )?;
-        for (plane, band) in fine.iter_mut().zip(window.bands()) {
-            let w = band.width();
-            for r in 0..band.height() {
-                let dst = (skip_r + r) * fcols + skip_c;
-                plane[dst..dst + w].copy_from_slice(&band.data()[r * w..(r + 1) * w]);
-            }
-        }
-    }
+        ),
+        (read_cols, read_rows),
+        nodata,
+    )?;
 
-    let bands = fine
-        .into_iter()
+    let fine_cell = if factor == 1 { req.resolution } else { lres };
+    let bands = window
+        .iter()
         .enumerate()
-        .map(|(bi, plane)| {
+        .map(|(bi, band)| {
+            let placed = picked(band, fcols, frows, fine_cell, |index| {
+                let (col, row) = (index % fcols, index / fcols);
+                if col < skip_c || row < skip_r {
+                    return None;
+                }
+                Some((row - skip_r) * read_cols + col - skip_c)
+            });
             if factor == 1 {
-                let raster = Raster::from_vec(cols, rows, plane, req.resolution, f64::NAN);
-                return TypedBand::F64(raster.expect("window dims"));
+                return placed;
             }
-            let fine = Raster::from_vec(fcols, frows, plane, lres, f64::NAN);
-            let fine = TypedBand::F64(fine.expect("window dims"));
-            decimate_band(&fine, factor, value_kinds.band(bi), req.resolution)
+            decimate_band(&placed, factor, value_kinds.band(bi), req.resolution)
         })
         .collect();
     Ok(RasterChunk {
@@ -179,7 +233,7 @@ pub(crate) fn read_chunk<R: RangeRead>(
     })
 }
 
-fn decimate_band(
+pub(crate) fn decimate_band(
     fine: &TypedBand,
     factor: usize,
     value_kind: ValueKind,
@@ -191,7 +245,7 @@ fn decimate_band(
     narrowed_like(fine, cols, rows, cell_size, decimated)
 }
 
-pub(crate) fn decimate(
+fn decimate(
     fine: &[f64],
     cols: usize,
     rows: usize,

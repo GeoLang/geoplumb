@@ -13,7 +13,7 @@ use crate::chunk::{Chunk, RasterChunk, TensorChunk, TensorData};
 use crate::element::Transform;
 use crate::error::{Error, Result};
 use crate::window::{Bbox, WindowReq};
-use terrano_core::Raster;
+use terrano_core::{SampleGrid, TypedBand};
 
 /// fields a raster to tensor transform carries over: the common fields plus
 /// the plane count, which couples raster bands to tensor channels so a band
@@ -197,7 +197,6 @@ impl ConvolutionWindow {
     }
 }
 
-/// tensor channels back to raster bands, one band per channel, nodata NaN
 pub struct ToRaster;
 
 impl Transform for ToRaster {
@@ -210,7 +209,7 @@ impl Transform for ToRaster {
             input: CapsSet::one(CapsPattern::Tensor(TensorPattern::default())),
             passthrough: cross_kind_passthrough(),
             output: CapsPattern::Raster(RasterPattern {
-                dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
+                dtypes: SetField::one(BandDtypes::from(Dtype::F32)),
                 value_kinds: SetField::one(BandKinds::from(ValueKind::Continuous)),
                 ..RasterPattern::default()
             }),
@@ -224,15 +223,14 @@ impl Transform for ToRaster {
     fn compute(&self, out: &WindowReq, input: &Chunk) -> Result<Chunk> {
         let input = input.tensor()?.crop_to(&out.bbox)?;
         let (cols, rows) = (input.width(), input.height());
-        let bands: Vec<Raster> = (0..input.channels as usize)
+        let bands = (0..input.channels as usize)
             .map(|c| {
-                let data: Vec<f64> = input.channel(c).iter().map(|v| f64::from(*v)).collect();
-                Raster::from_vec(cols, rows, data, input.resolution, f64::NAN)
-                    .expect("to raster dims")
+                SampleGrid::new(cols, rows, input.resolution, input.channel(c).to_vec())
+                    .map(TypedBand::F32)
             })
-            .collect();
+            .collect::<core::result::Result<Vec<_>, _>>()?;
         Ok(Chunk::Raster(RasterChunk {
-            bands: RasterBands::from_rasters(bands)?,
+            bands: RasterBands::new(bands)?,
             bbox: input.bbox,
             resolution: input.resolution,
             crs: input.crs,

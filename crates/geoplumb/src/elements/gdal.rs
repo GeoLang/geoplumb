@@ -3,17 +3,17 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use gdal::Dataset;
-use gdal::raster::{RasterBand, ResampleAlg};
-use terrano_core::Raster;
+use gdal::raster::{GdalDataType, GdalType, RasterBand, ResampleAlg};
+use terrano_core::{SampleFormat, TypedBand};
 
-use crate::bands::RasterBands;
+use crate::bands::{RasterBands, Sample};
 use crate::caps::{
     BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange,
     SetField,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
-use crate::elements::cog::decimate;
+use crate::elements::cog::decimate_band;
 use crate::elements::file_stamp;
 use crate::error::{Error, Result};
 use crate::window::{GridSpec, WindowReq};
@@ -34,6 +34,8 @@ struct GdalFile {
     // 1-based gdal band indices, in the order the chunk carries them
     bands: Vec<usize>,
     nodata: Vec<Option<f64>>,
+    dtypes: Vec<Dtype>,
+    readers: Vec<BandReader>,
     // pixel width of the base level, then of each overview in gdal order
     level_resolutions: Vec<f64>,
     origin_x: f64,
@@ -125,11 +127,18 @@ impl GdalSrc {
         let code = u32::try_from(code).map_err(|_| named(format!("epsg code {code}")))?;
 
         let mut nodata = Vec::with_capacity(bands.len());
+        let mut dtypes = Vec::with_capacity(bands.len());
+        let mut readers = Vec::with_capacity(bands.len());
         let mut overview_widths: Option<Vec<usize>> = None;
         let base_width = dataset.raster_size().0;
         for &b in &bands {
             let raster_band = dataset.rasterband(b).map_err(|e| named(e.to_string()))?;
+            let (format, reader) = band_reader(raster_band.band_type());
+            let dtype = Dtype::from_format(format, raster_band.no_data_value())
+                .map_err(|e| named(format!("band {b}: {e}")))?;
             nodata.push(raster_band.no_data_value());
+            dtypes.push(dtype);
+            readers.push(reader);
             let widths = overview_widths_of(&raster_band).map_err(|e| named(e.to_string()))?;
             match &overview_widths {
                 None => overview_widths = Some(widths),
@@ -157,6 +166,8 @@ impl GdalSrc {
                 driver: dataset.driver().short_name(),
                 bands,
                 nodata,
+                dtypes,
+                readers,
                 level_resolutions,
                 origin_x,
                 origin_y,
@@ -171,6 +182,76 @@ impl GdalSrc {
     pub fn driver(&self) -> &str {
         &self.file.driver
     }
+}
+
+struct BandWindow {
+    col0: i64,
+    row0: i64,
+    cols: usize,
+    rows: usize,
+    cell_size: f64,
+    nodata: Option<f64>,
+}
+
+type BandReader = fn(&RasterBand, &BandWindow) -> gdal::errors::Result<TypedBand>;
+
+fn band_reader(band_type: GdalDataType) -> (SampleFormat, BandReader) {
+    match band_type {
+        GdalDataType::UInt8 => (SampleFormat::U8, read_native::<u8> as BandReader),
+        GdalDataType::UInt16 => (SampleFormat::U16, read_native::<u16> as BandReader),
+        GdalDataType::Int16 => (SampleFormat::I16, read_native::<i16> as BandReader),
+        GdalDataType::UInt32 => (SampleFormat::U32, read_native::<u32> as BandReader),
+        GdalDataType::Int32 => (SampleFormat::I32, read_native::<i32> as BandReader),
+        GdalDataType::Float32 => (SampleFormat::F32, read_native::<f32> as BandReader),
+        // the gdal crate builds Int8 only against gdal 3.7 and later, 64-bit integers have no terrano format
+        _ => (SampleFormat::F64, read_native::<f64> as BandReader),
+    }
+}
+
+fn read_native<T: Sample + GdalType>(
+    band: &RasterBand,
+    window: &BandWindow,
+) -> gdal::errors::Result<TypedBand> {
+    let nodata = window.nodata.map(|value| T::narrow(value, None));
+    let sentinel = if T::FLOAT { None } else { nodata };
+    let fill = T::fill(sentinel);
+    let mut plane = vec![fill; window.cols * window.rows];
+    // gdal refuses a window past the band edge, so clamp both ends and copy at an offset
+    let (x0, x1) = (
+        window.col0.max(0),
+        (window.col0 + window.cols as i64).min(band.x_size() as i64),
+    );
+    let (y0, y1) = (
+        window.row0.max(0),
+        (window.row0 + window.rows as i64).min(band.y_size() as i64),
+    );
+    if x1 > x0 && y1 > y0 {
+        let size = ((x1 - x0) as usize, (y1 - y0) as usize);
+        let read = band.read_as::<T>(
+            (x0 as isize, y0 as isize),
+            size,
+            size,
+            Some(ResampleAlg::NearestNeighbour),
+        )?;
+        let (skip_c, skip_r) = ((x0 - window.col0) as usize, (y0 - window.row0) as usize);
+        for (r, row) in read.data().chunks_exact(size.0).enumerate() {
+            let dst = (skip_r + r) * window.cols + skip_c;
+            for (out, &value) in plane[dst..dst + size.0].iter_mut().zip(row) {
+                *out = if T::FLOAT && Some(value) == nodata {
+                    fill
+                } else {
+                    value
+                };
+            }
+        }
+    }
+    Ok(T::build(
+        window.cols,
+        window.rows,
+        window.cell_size,
+        plane,
+        sentinel,
+    ))
 }
 
 fn overview_widths_of(band: &RasterBand) -> gdal::errors::Result<Vec<usize>> {
@@ -219,82 +300,61 @@ impl GdalFile {
         let factor = (req.resolution / level_resolution).round().max(1.0) as usize;
         let cols = (req.bbox.width() / req.resolution).round() as usize;
         let rows = (req.bbox.height() / req.resolution).round() as usize;
-        let (fine_cols, fine_rows) = (cols * factor, rows * factor);
         let col0 = ((req.bbox.min_x - self.origin_x) / level_resolution).round() as i64;
         let row0 = ((self.origin_y - req.bbox.max_y) / level_resolution).round() as i64;
+        let window = |nodata| BandWindow {
+            col0,
+            row0,
+            cols: cols * factor,
+            rows: rows * factor,
+            cell_size: if factor == 1 {
+                req.resolution
+            } else {
+                level_resolution
+            },
+            nodata,
+        };
 
         let dataset = self.take_dataset()?;
-        let planes = self.read_planes(&dataset, level, (col0, row0), (fine_cols, fine_rows));
+        let fine = self.read_bands(&dataset, level, window);
         self.return_dataset(dataset);
 
-        let bands: Vec<Raster> = planes?
+        let bands = fine?
             .into_iter()
             .enumerate()
-            .map(|(bi, plane)| {
-                let data = if factor == 1 {
-                    plane
-                } else {
-                    decimate(&plane, cols, rows, factor, self.value_kinds.band(bi))
-                };
-                Raster::from_vec(cols, rows, data, req.resolution, f64::NAN).expect("window dims")
+            .map(|(bi, band)| {
+                if factor == 1 {
+                    return band;
+                }
+                decimate_band(&band, factor, self.value_kinds.band(bi), req.resolution)
             })
             .collect();
         Ok(RasterChunk {
-            bands: RasterBands::from_rasters(bands)?,
+            bands: RasterBands::new(bands)?,
             bbox: req.bbox,
             resolution: req.resolution,
             crs: self.crs,
         })
     }
 
-    fn read_planes(
+    fn read_bands(
         &self,
         dataset: &Dataset,
         level: usize,
-        (col0, row0): (i64, i64),
-        (fine_cols, fine_rows): (usize, usize),
-    ) -> Result<Vec<Vec<f64>>> {
+        window: impl Fn(Option<f64>) -> BandWindow,
+    ) -> Result<Vec<TypedBand>> {
         let named =
             |e: gdal::errors::GdalError| Error::Source(format!("{}: {e}", self.path.display()));
-        let mut planes = Vec::with_capacity(self.bands.len());
-        for (&b, &nodata) in self.bands.iter().zip(&self.nodata) {
+        let mut bands = Vec::with_capacity(self.bands.len());
+        for ((&b, &nodata), read) in self.bands.iter().zip(&self.nodata).zip(&self.readers) {
             let base = dataset.rasterband(b).map_err(named)?;
             let band = match level {
                 0 => base,
                 overview => base.overview(overview - 1).map_err(named)?,
             };
-            let mut plane = vec![f64::NAN; fine_cols * fine_rows];
-            // gdal refuses a window past the band edge, so clamp both ends
-            // and copy at an offset
-            let (x0, x1) = (
-                col0.max(0),
-                (col0 + fine_cols as i64).min(band.x_size() as i64),
-            );
-            let (y0, y1) = (
-                row0.max(0),
-                (row0 + fine_rows as i64).min(band.y_size() as i64),
-            );
-            if x1 > x0 && y1 > y0 {
-                let size = ((x1 - x0) as usize, (y1 - y0) as usize);
-                let window = band
-                    .read_as::<f64>(
-                        (x0 as isize, y0 as isize),
-                        size,
-                        size,
-                        Some(ResampleAlg::NearestNeighbour),
-                    )
-                    .map_err(named)?;
-                let (skip_c, skip_r) = ((x0 - col0) as usize, (y0 - row0) as usize);
-                for (r, row) in window.data().chunks_exact(size.0).enumerate() {
-                    let dst = (skip_r + r) * fine_cols + skip_c;
-                    for (out, &v) in plane[dst..dst + size.0].iter_mut().zip(row) {
-                        *out = if Some(v) == nodata { f64::NAN } else { v };
-                    }
-                }
-            }
-            planes.push(plane);
+            bands.push(read(&band, &window(nodata)).map_err(named)?);
         }
-        Ok(planes)
+        Ok(bands)
     }
 }
 
@@ -318,7 +378,7 @@ impl Source for GdalSrc {
 
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
-            dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
+            dtypes: SetField::one(BandDtypes::from_bands(self.file.dtypes.clone())),
             bands: SetField::one(self.file.served_band_count()),
             crs: SetField::one(self.file.crs),
             resolution: ResRange::at_least(self.file.level_resolutions[0]),

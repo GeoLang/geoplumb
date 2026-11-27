@@ -1,4 +1,4 @@
-use crate::bands::{RasterBands, narrowed};
+use crate::bands::{RasterBands, narrowed_raster};
 use crate::caps::{
     BandDtypes, Caps, CapsPattern, CapsSet, Constraint, Dtype, FieldMask, RasterPattern, SetField,
 };
@@ -9,6 +9,7 @@ use crate::window::WindowReq;
 
 pub struct Cast {
     to: BandDtypes,
+    lossless_only: bool,
 }
 
 fn cast_constraint(to: SetField<BandDtypes>) -> Constraint {
@@ -26,6 +27,13 @@ fn cast_constraint(to: SetField<BandDtypes>) -> Constraint {
 }
 
 impl Cast {
+    pub fn new(to: BandDtypes) -> Cast {
+        Cast {
+            to,
+            lossless_only: false,
+        }
+    }
+
     pub fn adapter() -> Adapter {
         Adapter {
             template: cast_constraint(SetField::Any),
@@ -37,7 +45,10 @@ impl Cast {
                     return None;
                 };
                 let to = dtypes.first()?.clone();
-                Some(Box::new(Cast { to }))
+                Some(Box::new(Cast {
+                    to,
+                    lossless_only: true,
+                }))
             }),
         }
     }
@@ -56,9 +67,14 @@ impl Transform for Cast {
         let input = input.raster();
         for band in 0..usize::from(input.bands) {
             let (from, to) = (input.dtypes.band(band), self.to.band(band));
-            if from != to && !from.widens_losslessly_to(to) {
+            if self.lossless_only && from != to && !from.widens_losslessly_to(to) {
                 return Err(Error::InvalidGraph(format!(
                     "dtype of band {band} cannot go from {from:?} to {to:?} without losing values"
+                )));
+            }
+            if from.marks_absent_cells() && !to.marks_absent_cells() {
+                return Err(Error::InvalidGraph(format!(
+                    "a cast of band {band} from {from:?} to {to:?} has no nodata to mark absent cells"
                 )));
             }
         }
@@ -81,8 +97,7 @@ impl Transform for Cast {
                 if Dtype::of(band) == to {
                     return band.clone();
                 }
-                let widened = band.to_raster().into_owned().into_data();
-                narrowed(to, band.width(), band.height(), band.cell_size(), widened)
+                narrowed_raster(to, &band.to_raster())
             })
             .collect();
         Ok(Chunk::Raster(RasterChunk {

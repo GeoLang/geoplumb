@@ -7,12 +7,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use geoplumb::caps::ValueKind;
+use geoplumb::caps::{Dtype, ValueKind};
 use geoplumb::elements::{Burn, Composite, FocalOp, ItemMask, StacSearch};
 use geoplumb::{Crs, TimeInterval};
 use serde::Deserialize;
 use serde_json::Value;
-use terrano_core::{BinaryOp, UnaryOp};
+use terrano_core::{BinaryOp, SampleFormat, UnaryOp};
 use topoi_core::MultiPolygon;
 use topoi_core::geojson::FeatureGeometry;
 
@@ -123,6 +123,7 @@ pub enum SourceConfig {
         path: PathBuf,
         #[serde(default)]
         value_kind: ValueKindConfig,
+        nodata: Option<f64>,
     },
     /// any raster gdal opens, in a server built with the `gdal` feature
     Gdal {
@@ -328,6 +329,22 @@ pub enum OpConfig {
         region: [f64; 4],
         threshold: f64,
     },
+    Cast {
+        dtype: String,
+        nodata: Option<f64>,
+    },
+}
+
+pub(crate) fn cast_dtype(dtype: &str, nodata: Option<f64>) -> Result<Dtype, String> {
+    let format = SampleFormat::from_name(dtype).ok_or_else(|| {
+        format!("cast dtype {dtype:?} is not one of u8, i8, u16, i16, u32, i32, f32, f64")
+    })?;
+    if format.integer_range().is_none() && nodata.is_some() {
+        return Err(format!(
+            "cast to {dtype} takes no nodata, NaN marks absent float cells"
+        ));
+    }
+    Dtype::from_format(format, nodata).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -581,6 +598,9 @@ fn check_ops(ops: &[OpConfig]) -> Result<(), String> {
             } if !(radius.is_finite() && *radius > 0.0) => {
                 return Err(format!("idw needs a positive radius_px, got {radius}"));
             }
+            OpConfig::Cast { dtype, nodata } => {
+                cast_dtype(dtype, *nodata)?;
+            }
             _ => {}
         }
     }
@@ -678,6 +698,7 @@ impl LayerConfig {
                 OpConfig::Hillshade { .. }
                 | OpConfig::Focal { .. }
                 | OpConfig::Mask { .. }
+                | OpConfig::Cast { .. }
                 | OpConfig::Unary { .. }
                 | OpConfig::Convolve { .. }
                 | OpConfig::VecFilter { .. }

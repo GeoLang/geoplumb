@@ -50,6 +50,47 @@ impl Dtype {
         }
     }
 
+    pub fn from_format(format: SampleFormat, nodata: Option<f64>) -> crate::error::Result<Dtype> {
+        let sentinel = match (format.integer_range(), nodata) {
+            (Some((low, high)), Some(value))
+                if value.fract() == 0.0 && (low..=high).contains(&value) =>
+            {
+                Some(value)
+            }
+            (Some(_), Some(value)) => {
+                return Err(terrano_core::Error::InvalidInput(format!(
+                    "nodata {value} is not a {} value",
+                    format.name()
+                ))
+                .into());
+            }
+            (Some(_), None) | (None, _) => None,
+        };
+        // float casts of a whole value inside the type's range are exact
+        Ok(match format {
+            SampleFormat::U8 => Dtype::U8 {
+                nodata: sentinel.map(|value| value as u8),
+            },
+            SampleFormat::I8 => Dtype::I8 {
+                nodata: sentinel.map(|value| value as i8),
+            },
+            SampleFormat::U16 => Dtype::U16 {
+                nodata: sentinel.map(|value| value as u16),
+            },
+            SampleFormat::I16 => Dtype::I16 {
+                nodata: sentinel.map(|value| value as i16),
+            },
+            SampleFormat::U32 => Dtype::U32 {
+                nodata: sentinel.map(|value| value as u32),
+            },
+            SampleFormat::I32 => Dtype::I32 {
+                nodata: sentinel.map(|value| value as i32),
+            },
+            SampleFormat::F32 => Dtype::F32,
+            SampleFormat::F64 => Dtype::F64,
+        })
+    }
+
     pub fn format(&self) -> SampleFormat {
         match self {
             Dtype::U8 { .. } => SampleFormat::U8,
@@ -979,6 +1020,15 @@ impl Constraint {
                 dtypes: SetField::one(BandDtypes::from(dtype)),
                 ..RasterPattern::default()
             }),
+        }
+    }
+
+    pub fn passes_dtypes_through(&self) -> bool {
+        match self {
+            Constraint::Identity(_) => true,
+            Constraint::Derived { passthrough, .. } => passthrough.dtypes,
+            Constraint::AnyOf(members) => members.iter().all(Constraint::passes_dtypes_through),
+            Constraint::Produces(_) => false,
         }
     }
 

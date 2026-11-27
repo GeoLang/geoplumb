@@ -29,16 +29,16 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use geoplumb::caps::ValueKind;
+use geoplumb::caps::{BandDtypes, ValueKind};
 #[cfg(feature = "gdal")]
 use geoplumb::elements::GdalSrc;
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::stac::format_rfc3339;
 use geoplumb::elements::{
-    Aspect, BandMath, CogSrc, Combine, Contours, CopcSrc, FlowAccumulation, FlowDirection, Focal,
-    GpkgSrc, Hillshade, IdwGrid, LasSrc, MapAlgebra, Mosaic, NetcdfSrc, Polygonize, QualityMask,
-    RasterSrc, Rasterize, Reproject, Slope, StacSrc, StreamOrder, TensorConv, ToRaster, ToTensor,
-    VecClip, VecFilter, VecSchema, VecSrc, Viewshed, Watershed,
+    Aspect, BandMath, Cast, CogSrc, Combine, Contours, CopcSrc, FlowAccumulation, FlowDirection,
+    Focal, GpkgSrc, Hillshade, IdwGrid, LasSrc, MapAlgebra, Mosaic, NetcdfSrc, Polygonize,
+    QualityMask, RasterSrc, Rasterize, Reproject, Slope, StacSrc, StreamOrder, TensorConv,
+    ToRaster, ToTensor, VecClip, VecFilter, VecSchema, VecSrc, Viewshed, Watershed,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Bbox, Caps, CapsSet, Crs, Engine, Graph, NodeId, Source, TimeInterval};
@@ -255,6 +255,10 @@ fn add_ops(
                 let algebra = MapAlgebra::new(AlgebraOp::Unary((*op).into()));
                 graph.add_transform(node, Box::new(algebra))
             }
+            OpConfig::Cast { dtype, nodata } => {
+                let to = config::cast_dtype(dtype, *nodata)?;
+                graph.add_transform(node, Box::new(Cast::new(BandDtypes::from(to))))
+            }
             OpConfig::Rasterize { burn } => {
                 graph.add_transform(node, Box::new(Rasterize { burn: burn.into() }))
             }
@@ -387,10 +391,15 @@ fn composite_info(name: &str, inputs: Vec<LayerInfo>) -> LayerInfo {
 fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, LayerInfo), String> {
     let name = layer.to_string();
     match source {
-        SourceConfig::Cog { path, value_kind } => {
-            let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let src =
-                CogSrc::open(file, ValueKind::from(*value_kind)).map_err(|e| e.to_string())?;
+        SourceConfig::Cog {
+            path,
+            value_kind,
+            nodata,
+        } => {
+            let named = |e: String| format!("{}: {e}", path.display());
+            let file = std::fs::File::open(path).map_err(|e| named(e.to_string()))?;
+            let src = CogSrc::open(file, ValueKind::from(*value_kind), *nodata)
+                .map_err(|e| named(e.to_string()))?;
             Ok((
                 Box::new(src),
                 LayerInfo {
@@ -662,9 +671,6 @@ struct TileQuery {
     t: Option<String>,
 }
 
-/// what the tile path asks to be encoded as. `.tif` hands over the chunk's
-/// own f64 bands and their georeferencing, `.mvt` a vector layer's
-/// features, everything else is the gray png
 enum TileFormat {
     Png,
     GeoTiff,
@@ -709,7 +715,9 @@ async fn tile(
         (LayerOutput::Raster { .. }, TileFormat::GeoTiff) => {
             render_tile_at(&layer.engine, layer.node, tile, time)
                 .await
-                .and_then(|chunk| geoplumb::encode::geotiff(&chunk))
+                .and_then(|chunk| {
+                    geoplumb::encode::geotiff(&chunk, layer.engine.palette(layer.node))
+                })
                 .map(|bytes| ("image/tiff", bytes))
         }
         (LayerOutput::Vector, TileFormat::Mvt) => mvt::vector_tile(layer, tile, time)

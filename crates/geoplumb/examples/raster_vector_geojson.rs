@@ -26,7 +26,7 @@ async fn main() {
         _ => panic!("{USAGE}"),
     };
     let file = std::fs::File::open(path).expect("open the raster");
-    let source = CogSrc::open(file, value_kind).expect("read the cog header");
+    let source = CogSrc::open(file, value_kind, None).expect("read the cog header");
     let grid = source.grid();
     let resolution = grid.base_resolution;
     let window = Bbox {

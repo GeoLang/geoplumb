@@ -21,7 +21,7 @@ use jung_mvt::{AttributeValue, TileGeometry, VectorLayer, decode_tile};
 use nubis_core::{Point3, PointCloud, write_las};
 use rusqlite::types::Value;
 use terrano_core::{
-    BandedRaster, CogParams, Raster, read_geotiff_bands, write_cog, write_cog_bands,
+    BandedRaster, CogParams, CogReader, GeoTiffMetadata, Raster, write_cog, write_cog_bands,
 };
 use topoi_core::geojson::FeatureGeometry;
 use topoi_core::{Coord, Polygon};
@@ -718,9 +718,14 @@ fn config_parses_sources_ops_and_their_order() {
     let dem = &config.layers[1];
     assert!(source_of(dem).stac_search().is_none());
     match source_of(dem) {
-        SourceConfig::Cog { path, value_kind } => {
+        SourceConfig::Cog {
+            path,
+            value_kind,
+            nodata,
+        } => {
             assert_eq!(path.to_str(), Some("/data/dem.tif"));
             assert!(matches!(value_kind, ValueKindConfig::Continuous));
+            assert_eq!(*nodata, None);
         }
         other => panic!("unexpected source: {other:?}"),
     }
@@ -2203,6 +2208,15 @@ async fn a_gdal_layer_serves_the_tile_the_cog_layer_does() {
 /// range across the rendered tile
 const BANDED_GRAY: (f64, f64) = (300.0, 400.0);
 
+fn read_tif(bytes: &[u8]) -> (BandedRaster, GeoTiffMetadata) {
+    let reader = CogReader::open(bytes).expect("terrano reads back what it wrote");
+    let base = &reader.levels()[0];
+    let bands = reader
+        .read_window_bands(0, 0, 0, base.width, base.height)
+        .unwrap();
+    (bands, reader.meta().clone())
+}
+
 #[tokio::test]
 async fn the_same_tile_is_served_as_png_or_as_geotiff() {
     let dir = tempfile::tempdir().unwrap();
@@ -2235,7 +2249,7 @@ gray = {{ min = {}, max = {} }}
     assert_eq!(status, StatusCode::OK);
     assert_eq!(tif_type, "image/tiff");
 
-    let (bands, meta) = read_geotiff_bands(&tif).expect("terrano reads back what it wrote");
+    let (bands, meta) = read_tif(&tif);
     assert_eq!(bands.band_count(), 2, "the second band did not survive");
     assert_eq!(bands.width(), 256);
     assert_eq!(bands.height(), 256);
@@ -2746,7 +2760,7 @@ fn hydrology_tile() -> (u32, u32) {
 async fn tile_band(app: &Router, uri: &str) -> Vec<f64> {
     let (status, body) = get(app, uri).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let (bands, _) = read_geotiff_bands(&body).expect("terrano reads back what it wrote");
+    let (bands, _) = read_tif(&body);
     bands.band(0).unwrap().data().to_vec()
 }
 
@@ -2851,7 +2865,7 @@ async fn every_hydrology_op_serves_a_tile_cut_from_its_region() {
 
     let (status, body) = get(&app, &format!("/tiles/streams/12/{x}/{y}.tif")).await;
     assert_eq!(status, StatusCode::OK);
-    let (bands, _) = read_geotiff_bands(&body).unwrap();
+    let (bands, _) = read_tif(&body);
     let orders: Vec<f64> = bands
         .band(0)
         .unwrap()
@@ -2898,4 +2912,139 @@ async fn a_region_over_the_pixel_cap_answers_400_on_tiles_and_exports() {
     let message = String::from_utf8_lossy(&body);
     assert_eq!(status, StatusCode::BAD_REQUEST, "{message}");
     assert!(message.contains("pixel cap"), "{message}");
+}
+
+const CAST_STRIPES: [f64; 6] = [-5.0, 2.5, 300.0, 100.0, f64::NAN, 7.4];
+
+fn write_cast_stripes(dir: &Path) -> String {
+    let data = (0..W * H)
+        .map(|index| CAST_STRIPES[(index % W) / (W / CAST_STRIPES.len())])
+        .collect();
+    let raster = Raster::from_vec(W, H, data, CELL, f64::NAN).unwrap();
+    let params = CogParams {
+        // terrano averages the overviews it writes
+        overview_levels: 0,
+        ..cog_params()
+    };
+    let path = dir.join("stripes.tif");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write_cog(&raster, &params, &mut file).unwrap();
+    path.display().to_string().replace('\\', "/")
+}
+
+const CAST_LAYER: &str = r#"
+[[layer]]
+name = "narrowed"
+source = { kind = "cog", path = "STRIPES_PATH", value_kind = "categorical" }
+gray = { min = 0.0, max = 255.0 }
+
+[[layer.op]]
+kind = "cast"
+dtype = "u8"
+NODATA
+"#;
+
+#[tokio::test]
+async fn a_cast_op_narrows_rounds_and_saturates_into_its_dtype() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cast_stripes(dir.path());
+    let app = app(&CAST_LAYER
+        .replace("STRIPES_PATH", &path)
+        .replace("NODATA", "nodata = 0"));
+    let (x, y) = tile_of(9, 7.3, 46.8);
+    let (status, tif) = get(&app, &format!("/tiles/narrowed/9/{x}/{y}.tif")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&tif));
+
+    let reader = CogReader::open(tif.as_slice()).unwrap();
+    let base = &reader.levels()[0];
+    assert_eq!(base.sample_format(), terrano_core::SampleFormat::U8);
+    assert_eq!(base.nodata(), Some(0.0));
+    let read = reader
+        .read_window_typed(0, 0, 0, base.width, base.height)
+        .unwrap();
+    let terrano_core::TypedBand::U8 { samples, nodata } = &read[0] else {
+        panic!("the cast tile is not u8");
+    };
+    assert_eq!(*nodata, Some(0));
+    let codes: std::collections::BTreeSet<u8> = samples.values().iter().copied().collect();
+    // -5 saturates onto the sentinel 0 and steps up to 1, 2.5 rounds away from zero, 300 saturates
+    let narrowed: std::collections::BTreeSet<u8> = [0, 1, 3, 7, 100, 255].into();
+    assert_eq!(codes, narrowed);
+}
+
+#[test]
+fn a_cast_op_refuses_a_dtype_it_cannot_build() {
+    let cases = [
+        ("dtype = \"u9\"", "not one of"),
+        ("dtype = \"f32\"\nnodata = 0.0", "takes no nodata"),
+        ("dtype = \"u8\"\nnodata = 300.0", "not a u8 value"),
+        ("dtype = \"i16\"\nnodata = 0.5", "not a i16 value"),
+    ];
+    for (op, why) in cases {
+        let text = format!(
+            "[[layer]]\nname = \"a\"\nsource = {{ kind = \"cog\", path = \"/a.tif\" }}\n\
+             [[layer.op]]\nkind = \"cast\"\n{op}\n"
+        );
+        let error = Config::parse(&text).expect_err(op);
+        assert!(error.contains(why), "{op}: {error}");
+    }
+}
+
+#[test]
+fn a_cast_to_an_integer_without_nodata_refuses_a_band_with_absent_cells() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cast_stripes(dir.path());
+    let config = Config::parse(
+        &CAST_LAYER
+            .replace("STRIPES_PATH", &path)
+            .replace("NODATA", ""),
+    )
+    .expect("the layer file parses");
+    let Err(error) = Layer::build_all(config, 64 << 20, None) else {
+        panic!("a cast with no nodata built over a band with NaN cells");
+    };
+    assert!(error.contains("no nodata to mark absent cells"), "{error}");
+}
+
+#[tokio::test]
+async fn a_cog_layer_nodata_becomes_the_sentinel_of_a_file_without_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = (0..W * H)
+        .map(|index| 1.0 + ((index % W) / 7 % 2) as f64)
+        .collect();
+    let raster = Raster::from_vec(W, H, data, CELL, f64::NAN).unwrap();
+    let params = CogParams {
+        overview_levels: 0,
+        format: terrano_core::SampleFormat::U8,
+        nodata: None,
+        ..cog_params()
+    };
+    let path = dir.path().join("codes.tif");
+    let mut file = std::fs::File::create(&path).unwrap();
+    write_cog(&raster, &params, &mut file).unwrap();
+    let app = app(&format!(
+        r#"
+[[layer]]
+name = "codes"
+source = {{ kind = "cog", path = "{}", value_kind = "categorical", nodata = 2 }}
+gray = {{ min = 0.0, max = 3.0 }}
+"#,
+        path.display().to_string().replace('\\', "/")
+    ));
+    let (x, y) = tile_of(12, 7.3, 46.8);
+    let (status, tif) = get(&app, &format!("/tiles/codes/12/{x}/{y}.tif")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&tif));
+    let reader = CogReader::open(tif.as_slice()).unwrap();
+    let base = &reader.levels()[0];
+    assert_eq!(base.sample_format(), terrano_core::SampleFormat::U8);
+    assert_eq!(base.nodata(), Some(2.0));
+    let read = reader
+        .read_window_typed(0, 0, 0, base.width, base.height)
+        .unwrap();
+    let codes: std::collections::BTreeSet<u8> = match &read[0] {
+        terrano_core::TypedBand::U8 { samples, .. } => samples.values().iter().copied().collect(),
+        other => panic!("the tile is {}", other.format().name()),
+    };
+    let expected: std::collections::BTreeSet<u8> = [1, 2].into();
+    assert_eq!(codes, expected);
 }

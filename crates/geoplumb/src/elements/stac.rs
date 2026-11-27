@@ -21,14 +21,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 
-use crate::bands::{RasterBands, gathered};
+use crate::bands::{RasterBands, gathered, narrowed};
 use crate::caps::{
     BandDtypes, BandKinds, CapsPattern, CapsSet, Constraint, Crs, Dtype, RasterPattern, ResRange,
     SetField, ValueKind,
 };
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Source;
-use crate::elements::cog::{HttpRange, band_count, read_chunk};
+use crate::elements::cog::{HttpRange, band_count, cog_dtype, read_chunk};
 use crate::elements::mask::mask_by_quality;
 use crate::elements::reproject::{inverse_window, local_scale, warp_to_grid};
 use crate::engine::align_outward;
@@ -261,6 +261,17 @@ impl Composite {
             ) => None,
         }
     }
+
+    pub fn output_dtype(self, input: Dtype) -> Dtype {
+        match self {
+            Composite::Latest | Composite::Min | Composite::Max => input,
+            Composite::Mean
+            | Composite::Median
+            | Composite::Percentile(_)
+            | Composite::StdDev
+            | Composite::Count => Dtype::F64,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -467,6 +478,9 @@ struct Inner {
     base_resolution: f64,
     asset_bands: Vec<u16>,
     asset_value_kinds: Vec<ValueKind>,
+    asset_dtypes: Vec<Dtype>,
+    item_dtypes: BandDtypes,
+    dtypes: BandDtypes,
     bands: u16,
     /// lon/lat to the anchor crs for item footprints, `None` when it is 4326
     to_native: Option<projicio_core::Transform>,
@@ -671,6 +685,35 @@ impl StacSrc {
                 mask.asset, asset_bands[output_assets]
             )));
         }
+        let asset_dtypes = readers
+            .iter()
+            .map(|reader| cog_dtype(reader, None))
+            .collect::<Result<Vec<Dtype>>>()?;
+        if let Some((asset, dtype)) = search
+            .assets
+            .iter()
+            .zip(&asset_dtypes)
+            .find(|(_, dtype)| !dtype.marks_absent_cells())
+        {
+            return Err(Error::Source(format!(
+                "stac asset {asset} is {dtype:?}, an integer with no nodata, so pixels outside an \
+                 item read as 0 and hide every older item"
+            )));
+        }
+        let band_dtypes: Vec<Dtype> = asset_dtypes[..output_assets]
+            .iter()
+            .zip(&asset_bands[..output_assets])
+            .flat_map(|(dtype, asset_band_count)| {
+                std::iter::repeat_n(*dtype, usize::from(*asset_band_count))
+            })
+            .collect();
+        let dtypes = BandDtypes::from_bands(
+            band_dtypes
+                .iter()
+                .map(|dtype| search.composite.output_dtype(*dtype))
+                .collect(),
+        );
+        let item_dtypes = BandDtypes::from_bands(band_dtypes);
         let bands = asset_bands[..output_assets].iter().sum();
         let value_kinds = BandKinds::from_bands(
             asset_value_kinds
@@ -693,6 +736,9 @@ impl StacSrc {
             crs,
             base_resolution: finest.pixel_width,
             asset_bands,
+            asset_dtypes,
+            item_dtypes,
+            dtypes,
             asset_value_kinds: asset_value_kinds
                 .into_iter()
                 .chain(search.item_mask.iter().map(|_| ValueKind::Categorical))
@@ -936,6 +982,13 @@ impl Inner {
                 item.hrefs[k], self.asset_bands[k]
             )));
         }
+        let dtype = cog_dtype(reader, None)?;
+        if dtype != self.asset_dtypes[k] {
+            return Err(Error::Source(format!(
+                "stac item asset {} is {dtype:?}, the anchor item's is {:?}",
+                item.hrefs[k], self.asset_dtypes[k]
+            )));
+        }
         let value_kinds = BandKinds::from(self.asset_value_kinds[k]);
         match &item.reprojection {
             None if meta.pixel_width > self.base_resolution => {
@@ -948,6 +1001,7 @@ impl Inner {
                 meta.origin_y,
                 self.crs,
                 &value_kinds,
+                None,
             ),
             Some(reprojection) => read_warped(
                 reader,
@@ -960,24 +1014,17 @@ impl Inner {
         }
     }
 
-    /// nothing intersects: an all-nodata window on the source grid
-    fn empty(&self, req: &WindowReq) -> Result<RasterChunk> {
+    fn empty(&self, req: &WindowReq, dtypes: &BandDtypes) -> Result<RasterChunk> {
         let cols = (req.bbox.width() / req.resolution).round() as usize;
         let rows = (req.bbox.height() / req.resolution).round() as usize;
-        let bands = (0..self.bands)
-            .map(|_| {
-                terrano_core::Raster::from_vec(
-                    cols,
-                    rows,
-                    vec![f64::NAN; cols * rows],
-                    req.resolution,
-                    f64::NAN,
-                )
+        let bands = (0..usize::from(self.bands))
+            .map(|bi| {
+                let absent = vec![f64::NAN; cols * rows];
+                narrowed(dtypes.band(bi), cols, rows, req.resolution, absent)
             })
-            .collect::<core::result::Result<Vec<_>, _>>()
-            .map_err(Error::Terrano)?;
+            .collect();
         Ok(RasterChunk {
-            bands: RasterBands::from_rasters(bands)?,
+            bands: RasterBands::new(bands)?,
             bbox: req.bbox,
             resolution: req.resolution,
             crs: self.crs,
@@ -1031,6 +1078,7 @@ fn read_resampled(
         origin_y,
         crs,
         value_kinds,
+        None,
     )?;
     let cols = (req.bbox.width() / req.resolution).round() as usize;
     let rows = (req.bbox.height() / req.resolution).round() as usize;
@@ -1080,6 +1128,7 @@ fn read_warped(
         origin_y,
         reprojection.crs,
         value_kinds,
+        None,
     )?;
     warp_to_grid(&chunk, req, &reprojection.from_anchor, anchor, value_kinds)
 }
@@ -1096,7 +1145,7 @@ async fn read_item(
     // still miss one, and opening its cogs to find that out costs a fetch
     if !item.bbox.intersects(&req.bbox) {
         let (inner, req) = (inner.clone(), *req);
-        return crate::engine::offload(move || inner.empty(&req)).await;
+        return crate::engine::offload(move || inner.empty(&req, &inner.item_dtypes)).await;
     }
     let reads = (0..item.readers.len()).map(|k| {
         let inner = inner.clone();
@@ -1360,7 +1409,7 @@ async fn reduce_window(
     for strip in row_strips(req, rows, strip_rows) {
         let over_strip = items_intersecting(items, &strip.bbox);
         if over_strip.is_empty() {
-            parts.push(inner.empty(&strip)?);
+            parts.push(inner.empty(&strip, &inner.dtypes)?);
             continue;
         }
         let chunks = read_items(inner, &over_strip, &strip, &req.bbox).await?;
@@ -1489,18 +1538,18 @@ impl WindowFold {
         }
     }
 
-    fn finish(self, req: &WindowReq, crs: Crs) -> Result<RasterChunk> {
+    fn finish(self, req: &WindowReq, crs: Crs, dtypes: &BandDtypes) -> Result<RasterChunk> {
         let planes = self
             .planes
             .iter()
-            .map(|plane| {
+            .enumerate()
+            .map(|(bi, plane)| {
                 let data = plane.iter().map(|pixel| pixel.finish(self.op)).collect();
-                terrano_core::Raster::from_vec(self.cols, self.rows, data, req.resolution, f64::NAN)
+                narrowed(dtypes.band(bi), self.cols, self.rows, req.resolution, data)
             })
-            .collect::<core::result::Result<Vec<_>, _>>()
-            .map_err(Error::Terrano)?;
+            .collect();
         Ok(RasterChunk {
-            bands: RasterBands::from_rasters(planes)?,
+            bands: RasterBands::new(planes)?,
             bbox: req.bbox,
             resolution: req.resolution,
             crs,
@@ -1540,8 +1589,8 @@ async fn fold_window(
     let Some(fold) = fold else {
         return Ok(None);
     };
-    let (crs, req) = (inner.crs, *req);
-    crate::engine::offload(move || fold.finish(&req, crs).map(Some)).await
+    let (inner, req) = (inner.clone(), *req);
+    crate::engine::offload(move || fold.finish(&req, inner.crs, &inner.dtypes).map(Some)).await
 }
 
 const MIN_PERCENT: f64 = 0.0;
@@ -1611,7 +1660,7 @@ impl Source for StacSrc {
 
     fn constraint(&self) -> Constraint {
         Constraint::Produces(CapsSet::one(CapsPattern::Raster(RasterPattern {
-            dtypes: SetField::one(BandDtypes::from(Dtype::F64)),
+            dtypes: SetField::one(self.inner.dtypes.clone()),
             bands: SetField::one(self.bands),
             crs: SetField::one(self.crs),
             resolution: ResRange::at_least(self.inner.base_resolution),
@@ -1651,7 +1700,12 @@ impl Source for StacSrc {
             };
             match merged {
                 Some(chunk) => Ok(Chunk::Raster(chunk)),
-                None => crate::engine::offload(move || inner.empty(&req).map(Chunk::Raster)).await,
+                None => {
+                    crate::engine::offload(move || {
+                        inner.empty(&req, &inner.dtypes).map(Chunk::Raster)
+                    })
+                    .await
+                }
             }
         })
     }
@@ -1833,7 +1887,9 @@ mod fold_tests {
         for wave in chunks.chunks(FOLD_WAVE) {
             fold = fold_wave(fold, wave.to_vec(), FOLD_BANDS, op);
         }
-        fold.unwrap().finish(&FOLD_REQ, Crs::WGS84).unwrap()
+        fold.unwrap()
+            .finish(&FOLD_REQ, Crs::WGS84, &BandDtypes::from(Dtype::F64))
+            .unwrap()
     }
 
     fn assert_matches(stacked: &RasterChunk, folded: &RasterChunk, tolerance: f64, what: &str) {

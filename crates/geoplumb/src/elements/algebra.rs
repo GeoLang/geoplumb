@@ -1,13 +1,13 @@
 //! per-cell map algebra and reclassification over terrano ops
 
-use crate::bands::RasterBands;
+use crate::bands::{RasterBands, narrowed_raster};
 use crate::caps::{BandKinds, Caps, CapsSet, Constraint, Dtype, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::{Fanin, Transform};
 use crate::error::{Error, Result};
 use crate::resample::sample_point;
 use crate::window::WindowReq;
-use terrano_core::{BinaryOp, Raster, UnaryOp, reclassify};
+use terrano_core::{BinaryOp, Raster, TypedBand, UnaryOp, reclassify};
 
 pub enum AlgebraOp {
     Unary(UnaryOp),
@@ -17,11 +17,58 @@ pub enum AlgebraOp {
 
 pub struct MapAlgebra {
     op: AlgebraOp,
+    output_dtype: Dtype,
+}
+
+// smallest first, each keeping its top value free as the sentinel
+const CLASS_DTYPES: [Dtype; 6] = [
+    Dtype::U8 {
+        nodata: Some(u8::MAX),
+    },
+    Dtype::I8 {
+        nodata: Some(i8::MAX),
+    },
+    Dtype::U16 {
+        nodata: Some(u16::MAX),
+    },
+    Dtype::I16 {
+        nodata: Some(i16::MAX),
+    },
+    Dtype::U32 {
+        nodata: Some(u32::MAX),
+    },
+    Dtype::I32 {
+        nodata: Some(i32::MAX),
+    },
+];
+
+fn class_dtype(classes: &[(f64, f64, f64)]) -> Dtype {
+    let values = classes.iter().map(|(_, _, class)| *class);
+    if values.clone().any(|class| class.fract() != 0.0) {
+        return Dtype::F64;
+    }
+    let (lowest, highest) = values.fold((0.0, 0.0), |(lowest, highest): (f64, f64), class| {
+        (lowest.min(class), highest.max(class))
+    });
+    CLASS_DTYPES
+        .into_iter()
+        .find(|dtype| {
+            let (min, max) = dtype
+                .format()
+                .integer_range()
+                .expect("class dtypes are integers");
+            lowest >= min && highest < max
+        })
+        .unwrap_or(Dtype::F64)
 }
 
 impl MapAlgebra {
     pub fn new(op: AlgebraOp) -> Self {
-        MapAlgebra { op }
+        let output_dtype = match &op {
+            AlgebraOp::Unary(_) => Dtype::F64,
+            AlgebraOp::Reclassify(classes) => class_dtype(classes),
+        };
+        MapAlgebra { op, output_dtype }
     }
 }
 
@@ -43,7 +90,11 @@ impl Transform for MapAlgebra {
             AlgebraOp::Unary(_) => ValueKind::Continuous,
             AlgebraOp::Reclassify(_) => ValueKind::Categorical,
         };
-        Constraint::pinned_value_kind_and_dtype(CapsSet::any_raster(), value_kind, Dtype::F64)
+        Constraint::pinned_value_kind_and_dtype(
+            CapsSet::any_raster(),
+            value_kind,
+            self.output_dtype,
+        )
     }
 
     fn plan(&self, out: &WindowReq) -> WindowReq {
@@ -58,14 +109,18 @@ impl Transform for MapAlgebra {
             .iter()
             .map(|band| {
                 let band = band.to_raster();
-                match &self.op {
+                let computed = match &self.op {
                     AlgebraOp::Unary(op) => band.apply_unary(op),
                     AlgebraOp::Reclassify(classes) => reclassify(&band, classes),
+                };
+                match self.output_dtype {
+                    Dtype::F64 => TypedBand::F64(computed),
+                    narrow => narrowed_raster(narrow, &computed),
                 }
             })
             .collect();
         let full = RasterChunk {
-            bands: RasterBands::from_rasters(bands).expect("uniform bands"),
+            bands: RasterBands::new(bands)?,
             bbox: input.bbox,
             resolution: input.resolution,
             crs: input.crs,

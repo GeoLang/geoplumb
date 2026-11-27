@@ -108,7 +108,7 @@ pub async fn write_cog<W: Write + Seek + Send + 'static>(
         deflate: true,
         format: dtype.format(),
         nodata: dtype.integer_nodata(),
-        palette: None,
+        palette: engine.palette(node).map(<[[u16; 3]]>::to_vec),
     };
     let runtime = tokio::runtime::Handle::current();
     let dropped = Arc::new(AtomicBool::new(false));

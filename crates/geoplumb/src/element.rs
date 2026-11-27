@@ -44,6 +44,10 @@ pub trait Source: Send + Sync {
         false
     }
 
+    fn palette(&self) -> Option<Vec<[u16; 3]>> {
+        None
+    }
+
     /// req is chunk-aligned to `grid()` by the engine, the response must
     /// cover exactly that grid window
     fn read<'a>(&'a self, req: &'a WindowReq) -> BoxFuture<'a, Result<Chunk>>;

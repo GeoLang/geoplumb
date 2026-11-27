@@ -1,4 +1,4 @@
-use crate::bands::RasterBands;
+use crate::bands::{RasterBands, narrowed_raster};
 use crate::caps::{BandKinds, Caps, Constraint, Dtype, ValueKind};
 use crate::chunk::{Chunk, RasterChunk};
 use crate::element::Transform;
@@ -7,6 +7,9 @@ use crate::error::{Error, Result};
 use crate::resample::resample_to_grid;
 use crate::window::{Bbox, WindowReq};
 use terrano_core::viewshed;
+
+// terrano's viewshed codes are 0 hidden and 1 visible
+const VIEWSHED_DTYPE: Dtype = Dtype::U8 { nodata: Some(255) };
 
 pub struct Viewshed {
     pub observer_x: f64,
@@ -27,7 +30,7 @@ impl Transform for Viewshed {
         Constraint::pinned_value_kind_and_dtype(
             one_band(ValueKind::Continuous),
             ValueKind::Categorical,
-            Dtype::F64,
+            VIEWSHED_DTYPE,
         )
     }
 
@@ -73,7 +76,7 @@ impl Transform for Viewshed {
         let row = ((input.bbox.max_y - self.observer_y) / input.resolution).floor() as usize;
         let seen = viewshed(&dem, row, column, self.observer_height, self.radius);
         let disc = RasterChunk {
-            bands: RasterBands::from_rasters(vec![seen]).expect("one band"),
+            bands: RasterBands::new(vec![narrowed_raster(VIEWSHED_DTYPE, &seen)])?,
             bbox: input.bbox,
             resolution: input.resolution,
             crs: input.crs,

@@ -187,7 +187,7 @@ async fn cog_src_decimates_categories_by_mode() {
     )
     .unwrap();
     let open = |value_kind: ValueKind| {
-        CogSrc::open(std::fs::File::open(&path).unwrap(), value_kind).unwrap()
+        CogSrc::open(std::fs::File::open(&path).unwrap(), value_kind, None).unwrap()
     };
     let bbox = window(0, 0, side, side);
     let resolution = 4.0 * CELL;
