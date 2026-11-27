@@ -69,21 +69,22 @@ async fn features(job: &LayerJob) -> Result<FeatureCollection, String> {
     })
 }
 
-fn layer_config(layers: &Path, layer: &str) -> Result<LayerConfig, String> {
+fn read_layer_file(
+    layers: &Path,
+    layer: &str,
+) -> Result<(LayerConfig, Arc<[LayerConfig]>), String> {
     let in_layer_file = |message: String| format!("{}: {message}", layers.display());
     let text = std::fs::read_to_string(layers).map_err(|e| in_layer_file(e.to_string()))?;
     let config = Config::parse(&text).map_err(in_layer_file)?;
-    let names: Vec<String> = config.layers.iter().map(|l| l.name.clone()).collect();
-    config
-        .layers
-        .into_iter()
-        .find(|l| l.name == layer)
-        .ok_or_else(|| {
-            in_layer_file(format!(
-                "no layer is named {layer}, the file names {}",
-                names.join(", ")
-            ))
-        })
+    let named = config.layers.iter().find(|l| l.name == layer).cloned();
+    let Some(named) = named else {
+        let names: Vec<&str> = config.layers.iter().map(|l| l.name.as_str()).collect();
+        return Err(in_layer_file(format!(
+            "no layer is named {layer}, the file names {}",
+            names.join(", ")
+        )));
+    };
+    Ok((named, config.layers.into()))
 }
 
 pub async fn write_layer(
@@ -93,11 +94,11 @@ pub async fn write_layer(
     output: &Path,
 ) -> Result<(), String> {
     let format = output_format(output)?;
-    let layer_config = layer_config(layers, layer)?;
+    let (layer_config, layer_file) = read_layer_file(layers, layer)?;
 
     // opening sources blocks: a stac layer searches its anchor bbox and a cog layer reads a file header
     let job = tokio::task::spawn_blocking(move || {
-        let layer_graph = build_layer_graph(&layer_config)
+        let layer_graph = build_layer_graph(&layer_config, &layer_file)
             .map_err(|e| format!("layer {}: {e}", layer_config.name))?;
         let plan = Plan::from_query(&query, layer_graph.chain_crs)?;
         let (engine, node) = engine_onto_grid(layer_graph, &plan, DEFAULT_CACHE_BYTES)?;
@@ -181,11 +182,11 @@ pub async fn write_pyramid(
         ));
     }
     let time = parse_time(query.t.as_deref())?;
-    let layer_config = layer_config(layers, layer)?;
+    let (layer_config, layer_file) = read_layer_file(layers, layer)?;
     // opening sources blocks: a stac layer searches its anchor bbox and a cog layer reads a file header
     let served = tokio::task::spawn_blocking(move || {
         let name = layer_config.name.clone();
-        Layer::build(layer_config, DEFAULT_CACHE_BYTES, None)
+        Layer::build(layer_config, layer_file, DEFAULT_CACHE_BYTES, None)
             .map_err(|e| format!("layer {name}: {e}"))
     })
     .await

@@ -1,6 +1,7 @@
 pub mod algebra;
 pub mod band_math;
 pub mod cast;
+pub mod clip_raster;
 pub mod cog;
 pub mod copc;
 #[cfg(feature = "gdal")]
@@ -31,6 +32,7 @@ pub use self::wgpu::{Download, Upload, WgpuConvolve};
 pub use algebra::{Combine, MapAlgebra};
 pub use band_math::BandMath;
 pub use cast::Cast;
+pub use clip_raster::ClipRaster;
 pub use cog::{CogSrc, HttpRange};
 pub use copc::{CopcHttpRange, CopcSrc};
 pub use gpkg::GpkgSrc;

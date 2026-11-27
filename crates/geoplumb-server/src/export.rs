@@ -143,7 +143,7 @@ pub(crate) async fn cog(
         let internal = |reason: String| (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response();
         let built = tokio::task::spawn_blocking(move || {
             let layer = &state.layers[index];
-            let layer_graph = build_layer_graph(&layer.config)?;
+            let layer_graph = build_layer_graph(&layer.config, &layer.layer_file)?;
             let (engine, node) = engine_onto_grid(layer_graph, &plan, layer.budget_bytes)?;
             let file = tempfile::tempfile_in(&export_dir).map_err(|e| {
                 format!(

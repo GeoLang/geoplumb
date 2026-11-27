@@ -3117,3 +3117,96 @@ async fn pyramid_writes_every_covering_tile_as_the_server_serves_it() {
     }
     assert_eq!(written, expected);
 }
+
+const CLIP_CUTLINE: &str = r#"cutline = "boundary""#;
+
+// the dem plain and clipped to the boundary layer, both over one gray range
+fn clip_layer_file(dir: &Path) -> String {
+    format!(
+        r#"
+[[layer]]
+name = "boundary"
+source = {{ kind = "geojson", path = "{boundary}" }}
+
+[[layer]]
+name = "dem"
+source = {{ kind = "cog", path = "{dem}" }}
+gray = {{ min = 300.0, max = 700.0 }}
+
+[[layer]]
+name = "clipped"
+source = {{ kind = "cog", path = "{dem}" }}
+gray = {{ min = 300.0, max = 700.0 }}
+
+[[layer.op]]
+kind = "clip_raster"
+{CLIP_CUTLINE}
+"#,
+        boundary = write_geojson(dir, "boundary.geojson", boundary_geojson()),
+        dem = write_dem(dir),
+    )
+}
+
+#[test]
+fn config_parses_a_clip_raster_op_and_checks_its_cutline_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = clip_layer_file(dir.path());
+    let ops_of = |config: &Config| {
+        config
+            .layers
+            .iter()
+            .find(|l| l.name == "clipped")
+            .unwrap()
+            .ops
+            .clone()
+    };
+    match &ops_of(&Config::parse(&text).unwrap())[..] {
+        [OpConfig::ClipRaster { cutline, nodata }] => {
+            assert_eq!(cutline, "boundary");
+            assert_eq!(*nodata, None);
+        }
+        other => panic!("unexpected ops: {other:?}"),
+    }
+    let with_nodata = text.replace(CLIP_CUTLINE, &format!("{CLIP_CUTLINE}\nnodata = 255"));
+    match &ops_of(&Config::parse(&with_nodata).unwrap())[..] {
+        [OpConfig::ClipRaster { nodata, .. }] => assert_eq!(*nodata, Some(255.0)),
+        other => panic!("unexpected ops: {other:?}"),
+    }
+
+    let missing = text.replace(CLIP_CUTLINE, r#"cutline = "parcels""#);
+    let error = Config::parse(&missing).unwrap_err();
+    assert!(error.contains("cutline layer parcels"), "{error}");
+    let itself = text.replace(CLIP_CUTLINE, r#"cutline = "clipped""#);
+    let error = Config::parse(&itself).unwrap_err();
+    assert!(error.contains("clip_raster of its own"), "{error}");
+}
+
+#[tokio::test]
+async fn a_clip_raster_layer_blanks_the_tile_past_its_cutline() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(&clip_layer_file(dir.path()));
+    let (x, y) = tile_of(12, 7.3, 46.8);
+    let (status, dem) = get(&app, &format!("/tiles/dem/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, clipped) = get(&app, &format!("/tiles/clipped/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (dem, clipped) = (png_pixels(&dem), png_pixels(&clipped));
+
+    let tile_lon = |tile_x: f64| tile_x / f64::from(1u32 << 12) * 360.0 - 180.0;
+    // three dem cells, past where the bilinear warp to web mercator reaches across the cut
+    let margin = 0.003;
+    let (mut kept, mut blanked) = (0, 0);
+    for (index, (dem_pixel, clipped_pixel)) in dem.iter().zip(&clipped).enumerate() {
+        let col = index % 256;
+        let lon = tile_lon(f64::from(x) + (col as f64 + 0.5) / 256.0);
+        assert_eq!(dem_pixel.1, 255, "the dem covers the whole tile");
+        if lon < BOUNDARY_MAX_LON - margin {
+            kept += 1;
+            assert_eq!(clipped_pixel, dem_pixel, "pixel {index} at {lon} is inside");
+        } else if lon > BOUNDARY_MAX_LON + margin {
+            blanked += 1;
+            assert_eq!(clipped_pixel.1, 0, "pixel {index} at {lon} is outside");
+        }
+    }
+    assert!(kept > 0 && blanked > 0, "{kept} kept, {blanked} blanked");
+}

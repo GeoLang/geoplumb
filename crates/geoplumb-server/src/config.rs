@@ -33,7 +33,7 @@ pub struct Config {
     pub layers: Vec<LayerConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LayerConfig {
     /// url path segment the tiles are served under
@@ -55,7 +55,7 @@ pub struct LayerConfig {
 
 /// one input of a fan-in layer: a source and the chain over it, the pair
 /// a linear layer names at the top level
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputConfig {
     pub source: SourceConfig,
@@ -100,7 +100,7 @@ pub struct GrayConfig {
     pub max: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum SourceConfig {
     Stac {
@@ -222,7 +222,7 @@ pub enum CompositeConfig {
     Count,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OpConfig {
     Hillshade {
@@ -332,6 +332,10 @@ pub enum OpConfig {
     },
     Cast {
         dtype: String,
+        nodata: Option<f64>,
+    },
+    ClipRaster {
+        cutline: String,
         nodata: Option<f64>,
     },
 }
@@ -524,6 +528,11 @@ impl Config {
                 }
             }
             layer.gray_range().map_err(named)?;
+            for op in layer.chain_ops() {
+                if let OpConfig::ClipRaster { cutline, .. } = op {
+                    cutline_layer(&config.layers, cutline).map_err(named)?;
+                }
+            }
         }
         Ok(config)
     }
@@ -637,6 +646,27 @@ pub fn read_boundary(path: &Path) -> Result<MultiPolygon, String> {
     Ok(MultiPolygon::new(polygons))
 }
 
+pub(crate) fn cutline_layer<'a>(
+    layer_file: &'a [LayerConfig],
+    name: &str,
+) -> Result<&'a LayerConfig, String> {
+    let cutline = layer_file
+        .iter()
+        .find(|layer| layer.name == name)
+        .ok_or_else(|| {
+            format!("clip_raster names the cutline layer {name}, which the file does not hold")
+        })?;
+    if cutline
+        .chain_ops()
+        .any(|op| matches!(op, OpConfig::ClipRaster { .. }))
+    {
+        return Err(format!(
+            "the cutline layer {name} has a clip_raster of its own, and a cutline is read without one"
+        ));
+    }
+    Ok(cutline)
+}
+
 fn geometry_kind(geometry: &Option<FeatureGeometry>) -> &'static str {
     match geometry {
         None => "a feature with no geometry",
@@ -650,6 +680,13 @@ fn geometry_kind(geometry: &Option<FeatureGeometry>) -> &'static str {
 }
 
 impl LayerConfig {
+    fn chain_ops(&self) -> impl Iterator<Item = &OpConfig> {
+        self.inputs
+            .iter()
+            .flat_map(|input| &input.ops)
+            .chain(&self.ops)
+    }
+
     /// the layer's source side, or what the file got wrong naming it
     pub fn shape(&self) -> Result<LayerShape<'_>, String> {
         match (&self.source, &self.fanin) {
@@ -701,6 +738,7 @@ impl LayerConfig {
                 | OpConfig::Focal { .. }
                 | OpConfig::Mask { .. }
                 | OpConfig::Cast { .. }
+                | OpConfig::ClipRaster { .. }
                 | OpConfig::Unary { .. }
                 | OpConfig::Convolve { .. }
                 | OpConfig::VecFilter { .. }

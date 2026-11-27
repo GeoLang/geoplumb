@@ -2,6 +2,7 @@
 
 ## 2026-11-27
 
+- `ClipRaster`, a fan-in of a raster and a polygon input, is `gdalwarp -cutline` without `-crop_to_cutline`: the raster's grid, bands, dtype and value kind stay, and every pixel whose centre lies outside the polygons, holes included, becomes nodata in every band. Each chunk pulls only the polygons reaching it and burns them by `rasterize`'s pixel centre rule, so chunks agree at seams, and a polygon input in another crs gets a reproject spliced. `ClipRaster::new` takes a nodata value for integer bands without a sentinel, which becomes the sentinel. The layer file op is `clip_raster` with `cutline`, the name of another layer of the file, and an optional `nodata`. A cutline layer missing from the file or with a `clip_raster` of its own fails at parse. `build_layer_graph` takes the file's layers beside the one it builds
 - terrano-core locked to 30e5ff4: `cog` layer sources, `geoplumb info` and `geoplumb run` open BigTIFF, which GDAL writes past 4 GB or with `BIGTIFF=YES`
 - terrano-core locked to 4af0228: `cog` layer sources, `geoplumb info` and `geoplumb run` read ZSTD tiles and strips, GDAL's `COMPRESS=ZSTD`, and `geoplumb info` names that compression `zstd`
 - terrano-core locked to 5a2275b: `cog` layer sources, `geoplumb info` and `geoplumb run` open striped and band-interleaved GeoTIFFs, the layouts `gdal_translate` writes without `-of COG`, and pixel-interleaved multi-band files with the floating-point predictor read right, where every pixel used to read wrong

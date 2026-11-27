@@ -456,6 +456,14 @@ that opens the user's file and writes it back in its own dtype.
       by elevation (`gdaldem color-relief`, part of 8.10), computes TRI, TPI or
       roughness (`gdaldem`), or resamples cubic or lanczos (`gdalwarp -r`).
       Cutline clip and colour relief first, the rest by demand.
+      Built: the cutline clip, `ClipRaster` and the `clip_raster` layer op
+      with `cutline` naming a polygon layer of the same file, pixel centre
+      rule, holes cut out, every band masked in its own dtype, `nodata` for
+      an integer band without one. Proof: on Copernicus GLO-30 and an ESA
+      WorldCover window, each clipped by a polygon with a hole, `geoplumb
+      run` equals `gdalwarp -cutline` in every cell. On the Copernicus tile
+      warped to UTM 32N with the cutline in WGS84, 231 of 9.9 million cells
+      are kept by one tool only, each within one pixel of the boundary.
 - [ ] 9.5 A parity table users can read and rerun. The measured agreement
       with GDAL is in 8.4 and 8.6 of this file, and the proof scripts that
       produced it are outside the repo. Move them into `geoplumb/proofs/`

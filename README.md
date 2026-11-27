@@ -21,6 +21,7 @@ A served layer file can name these:
 - Raster ops: `hillshade`, `slope`, `aspect`, `bandmath`, `focal`, `mask`, `reclassify`, `unary`, `convolve`, `viewshed` and `cast`. `viewshed` takes `lon`, `lat`, `height` and `radius` and marks each cell an observer at `lon`, `lat` with an eye `height` above the ground can see 1 and each hidden one 0, with nodata past `radius`, which is in the source CRS units. `cast` takes `dtype`, one of `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `f32` and `f64`, and for an integer `dtype` an optional `nodata`. See below.
 - Raster to vector ops: `contours`, lines every `interval` elevation units counted from `base` (0 when absent), one feature per level with an `elevation` property, and `polygonize`, one feature per class code of a categorical raster with a `value` property. A layer ending in either is a vector layer, and a `rasterize` after them burns the features back into a raster.
 - Vector ops: `vec_filter`, `vec_schema` and `vec_clip`, and `rasterize`, which burns a constant or a numeric property per feature into a raster.
+- Raster clip: `clip_raster`, which turns every pixel whose centre lies outside the polygons of another layer of the file into nodata, as `gdalwarp -cutline` does without `-crop_to_cutline`. See below.
 - Point op: `idw`, which grids LAS or COPC points into one raster band.
 - Hydrology ops: `flow_direction`, `flow_accumulation`, `watershed` and `stream_order`, each over a one-band DEM. See below.
 - Fan-in: several `input` entries, each with its own op chain, joined by `mosaic` or a two-input `combine`, with an optional chain after the join.
@@ -51,6 +52,15 @@ kind = "stream_order"
 crs = "EPSG:32632"
 region = [381990.0, 5145210.0, 419010.0, 5183190.0]
 threshold = 1000350.0
+```
+
+`clip_raster` takes `cutline`, the name of a layer in the same file whose chain ends in polygons, such as a `geojson` or `gpkg` layer or one ending in `polygonize`. The output keeps the raster's grid, bands, sample format and value kind. A pixel stays when its centre lies inside a polygon of the cutline layer and outside its holes, the rule `rasterize` burns by, and every other pixel of every band becomes nodata. The cutline layer is reprojected into the raster's CRS, and each tile reads only the features that reach it. At zoom levels coarser than the cutline's vertex spacing its polygons are simplified first, as they are for `rasterize`. Its features have to be polygons or multipolygons, and it cannot have a `clip_raster` of its own. Nodata is the band's own, NaN in a float band and the sentinel in an integer band that has one. An integer band without a sentinel needs `nodata`, which becomes its sentinel, and a kept pixel equal to it moves one step off it, as in `cast`. `nodata` on a band that already marks absent cells fails at startup. A clipped layer carries no colour table into exports.
+
+```toml
+[[layer.op]]
+kind = "clip_raster"
+cutline = "parcels"
+nodata = 0
 ```
 
 Only Rust code against the crate can reach these: the in-memory GeoTIFF source (`RasterSrc::from_geotiff`), COG reads over HTTP range requests, the tensor elements (`ToTensor`, `TensorConv`, `ToRaster`, which `convolve` chains), explicit `Reproject`, which takes raster and vector links alike (also inserted automatically on any link that differs only in CRS), the zonal statistics and time-series drivers, and the XYZ tile adapter in `geoplumb::tile`.

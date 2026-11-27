@@ -369,6 +369,82 @@ async fn an_export_writes_its_file_under_the_export_dir() {
     assert!(reason.contains("no temp file for the export"), "{reason}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_export_of_a_clip_raster_layer_is_nodata_past_its_cutline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (west, south, east, north) = (7.1302, 46.8202, 7.1698, 46.8798);
+    let cutline = serde_json::json!({
+        "type": "Polygon",
+        "coordinates": [[[west, south], [east, south], [east, north], [west, north], [west, south]]],
+    });
+    let cutline_path = dir.path().join("cutline.geojson");
+    std::fs::write(&cutline_path, cutline.to_string()).unwrap();
+    let text = format!(
+        r#"
+[[layer]]
+name = "cutline"
+source = {{ kind = "geojson", path = "{}" }}
+
+[[layer]]
+name = "clipped"
+source = {{ kind = "cog", path = "{}" }}
+gray = {{ min = 300.0, max = 700.0 }}
+
+[[layer.op]]
+kind = "clip_raster"
+cutline = "cutline"
+"#,
+        cutline_path.display().to_string().replace('\\', "/"),
+        write_dem(dir.path()),
+    );
+    let config = Config::parse(&text).expect("the layer file must parse");
+    let layers = Layer::build_all(config, 64 << 20, None).expect("the layers must build");
+    let app = router(layers, Some(dir.path().to_path_buf()));
+
+    let answer = get(
+        &app,
+        "/export/clipped?bbox=7.1,46.8,7.2,46.9&crs=EPSG:4326&resolution=0.001",
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let reader = CogReader::open(answer.body.as_slice()).unwrap();
+    let pixels = reader.read_window(0, 0, 0, 100, 100).unwrap();
+    // two cells clear of the cut, where the export's resampling reads no neighbour across it
+    let margin = 0.002;
+    let (mut kept, mut blanked) = (0, 0);
+    for row in 0..100 {
+        for col in 0..100 {
+            let lon = 7.1 + (col as f64 + 0.5) * CELL;
+            let lat = 46.9 - (row as f64 + 0.5) * CELL;
+            let got = pixels.get(row, col).unwrap();
+            let inside = west + margin < lon
+                && lon < east - margin
+                && south + margin < lat
+                && lat < north - margin;
+            let outside = lon < west - margin
+                || lon > east + margin
+                || lat < south - margin
+                || lat > north + margin;
+            if inside {
+                kept += 1;
+                assert!(
+                    (got - dem_at(lon, lat)).abs() < 1e-6,
+                    "pixel {col},{row} holds {got}"
+                );
+            } else if outside {
+                blanked += 1;
+                assert!(got.is_nan(), "pixel {col},{row} holds {got}");
+            }
+        }
+    }
+    assert!(kept > 0 && blanked > 0, "{kept} kept, {blanked} blanked");
+}
+
 fn geoplumb(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_geoplumb"))
         .args(arguments)

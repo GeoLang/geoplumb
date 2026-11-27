@@ -35,10 +35,10 @@ use geoplumb::elements::GdalSrc;
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::stac::format_rfc3339;
 use geoplumb::elements::{
-    Aspect, BandMath, Cast, CogSrc, Combine, Contours, CopcSrc, FlowAccumulation, FlowDirection,
-    Focal, GpkgSrc, Hillshade, IdwGrid, LasSrc, MapAlgebra, Mosaic, NetcdfSrc, Polygonize,
-    QualityMask, RasterSrc, Rasterize, Reproject, Slope, StacSrc, StreamOrder, TensorConv,
-    ToRaster, ToTensor, VecClip, VecFilter, VecSchema, VecSrc, Viewshed, Watershed,
+    Aspect, BandMath, Cast, ClipRaster, CogSrc, Combine, Contours, CopcSrc, FlowAccumulation,
+    FlowDirection, Focal, GpkgSrc, Hillshade, IdwGrid, LasSrc, MapAlgebra, Mosaic, NetcdfSrc,
+    Polygonize, QualityMask, RasterSrc, Rasterize, Reproject, Slope, StacSrc, StreamOrder,
+    TensorConv, ToRaster, ToTensor, VecClip, VecFilter, VecSchema, VecSrc, Viewshed, Watershed,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Bbox, Caps, CapsSet, Crs, Engine, Graph, NodeId, Source, TimeInterval};
@@ -65,6 +65,7 @@ pub struct Layer {
     output: LayerOutput,
     info: LayerInfo,
     config: LayerConfig,
+    layer_file: Arc<[LayerConfig]>,
     chain_crs: Crs,
     budget_bytes: usize,
 }
@@ -103,23 +104,30 @@ impl Layer {
         budget_bytes: usize,
         disk: Option<&Path>,
     ) -> Result<Vec<Layer>, String> {
+        let layer_file: Arc<[LayerConfig]> = config.layers.clone().into();
         config
             .layers
             .into_iter()
             .map(|layer| {
                 let name = layer.name.clone();
-                Layer::build(layer, budget_bytes, disk).map_err(|e| format!("layer {name}: {e}"))
+                Layer::build(layer, Arc::clone(&layer_file), budget_bytes, disk)
+                    .map_err(|e| format!("layer {name}: {e}"))
             })
             .collect()
     }
 
-    fn build(cfg: LayerConfig, budget_bytes: usize, disk: Option<&Path>) -> Result<Layer, String> {
+    fn build(
+        cfg: LayerConfig,
+        layer_file: Arc<[LayerConfig]>,
+        budget_bytes: usize,
+        disk: Option<&Path>,
+    ) -> Result<Layer, String> {
         let LayerGraph {
             mut graph,
             node: chain_tip,
             info,
             chain_crs,
-        } = build_layer_graph(&cfg)?;
+        } = build_layer_graph(&cfg, &layer_file)?;
         let node = graph.add_transform(chain_tip, Box::new(Reproject::new(Crs::WEB_MERCATOR)));
         let engine = match disk {
             None => Engine::new(graph, budget_bytes),
@@ -148,6 +156,7 @@ impl Layer {
             output,
             info,
             config: cfg,
+            layer_file,
             chain_crs,
             budget_bytes,
         })
@@ -165,8 +174,35 @@ pub struct LayerGraph {
     pub chain_crs: Crs,
 }
 
-pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
+pub fn build_layer_graph(
+    layer: &LayerConfig,
+    layer_file: &[LayerConfig],
+) -> Result<LayerGraph, String> {
     let mut graph = Graph::new();
+    let LayerChain {
+        node,
+        chain_crs,
+        info,
+    } = add_layer_chain(&mut graph, layer, layer_file)?;
+    Ok(LayerGraph {
+        graph,
+        node,
+        info,
+        chain_crs,
+    })
+}
+
+struct LayerChain {
+    node: NodeId,
+    chain_crs: Crs,
+    info: LayerInfo,
+}
+
+fn add_layer_chain(
+    graph: &mut Graph,
+    layer: &LayerConfig,
+    layer_file: &[LayerConfig],
+) -> Result<LayerChain, String> {
     let (node, crs, info) = match layer.shape()? {
         LayerShape::Single(source) => {
             let (source, info) = open_source(&layer.name, source)?;
@@ -181,7 +217,7 @@ pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
                 let (source, info) = open_source(&layer.name, &input.source)?;
                 let crs = source_crs(source.as_ref())?;
                 let head = graph.add_source(source);
-                let (tip, tip_crs) = add_ops(&mut graph, head, &input.ops, crs)?;
+                let (tip, tip_crs) = add_ops(graph, head, &input.ops, crs, layer_file)?;
                 tips.push(tip);
                 infos.push(info);
                 input_crs.push(tip_crs);
@@ -196,12 +232,11 @@ pub fn build_layer_graph(layer: &LayerConfig) -> Result<LayerGraph, String> {
             (joined, input_crs[0], composite_info(&layer.name, infos))
         }
     };
-    let (node, crs) = add_ops(&mut graph, node, &layer.ops, crs)?;
-    Ok(LayerGraph {
-        graph,
+    let (node, chain_crs) = add_ops(graph, node, &layer.ops, crs, layer_file)?;
+    Ok(LayerChain {
         node,
+        chain_crs,
         info,
-        chain_crs: crs,
     })
 }
 
@@ -225,6 +260,7 @@ fn add_ops(
     node: NodeId,
     ops: &[OpConfig],
     crs: Crs,
+    layer_file: &[LayerConfig],
 ) -> Result<(NodeId, Crs), String> {
     let mut node = node;
     let mut crs = crs;
@@ -258,6 +294,12 @@ fn add_ops(
             OpConfig::Cast { dtype, nodata } => {
                 let to = config::cast_dtype(dtype, *nodata)?;
                 graph.add_transform(node, Box::new(Cast::new(BandDtypes::from(to))))
+            }
+            OpConfig::ClipRaster { cutline, nodata } => {
+                let cutline_layer = config::cutline_layer(layer_file, cutline)?;
+                let polygons = add_layer_chain(graph, cutline_layer, layer_file)
+                    .map_err(|e| format!("cutline layer {cutline}: {e}"))?;
+                graph.add_fanin(&[node, polygons.node], Box::new(ClipRaster::new(*nodata)))
             }
             OpConfig::Rasterize { burn } => {
                 graph.add_transform(node, Box::new(Rasterize { burn: burn.into() }))
