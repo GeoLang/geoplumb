@@ -399,8 +399,8 @@ only after a proof script passes on real input, recorded in
       (tiletopia 008c4c4), and Lake Thun's outlet drains 0.997 of terrano's
       area at 90 m through the route, with flow accumulation as the `peak`
       value kind.
-- [ ] 8.8 Zarr source over `zarrs` 0.23 (MIT or Apache-2.0, the current
-      Rust Zarr crate). Built, proof pending. A `zarr` layer source,
+- [x] 8.8 Zarr source over `zarrs` 0.23 (MIT or Apache-2.0, the current
+      Rust Zarr crate). Built. A `zarr` layer source,
       `ZarrSrc`, reads one array of a v3 store or a v3-compatible v2 store,
       local or over HTTP, pulling only the chunks a window touches. It
       shares `NetcdfSrc`'s CF reading: coordinates from the layer or the
@@ -411,9 +411,13 @@ only after a proof script passes on real input, recorded in
       its range cache, not `zarrs_http` or `object_store`. Codecs are
       pure Rust (owner decision 2026-11-27): raw, gzip, zlib, crc32c,
       sharding, transpose, and zstd through a decode-only `ruzstd` codec.
-      blosc fails naming the codec, `blusc` depending on the C zstd crate. Proof: a public
-      Zarr store served as tiles whose values match xarray's read at
-      sampled pixels.
+      blosc fails naming the codec, `blusc` depending on the C zstd crate. Proof: NOAA OISST
+      v2.1 written by xarray as a v3 zstd float32 store and a v2 zlib int16
+      store packed by 0.01, read by `geoplumb run` over a 20 by 15 degree
+      window from disk and over HTTP: every cell equals the stored value,
+      unpacked for v2, with nodata exactly at the fill cells, and a blosc
+      store is refused naming blosc. xarray writes v2 coordinates with blosc
+      by default, so a v2 store needs another compressor named for them.
 - [x] 8.9 Native dtype. terrano's `TypedBand` holds each band in its file
       format, raster caps carry a dtype per band, and `CogSrc`, `StacSrc`
       and `GdalSrc` serve the file's own format through export and `.tif`
