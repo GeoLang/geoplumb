@@ -27,6 +27,7 @@ pub mod vector;
 pub mod viewshed;
 #[cfg(feature = "wgpu")]
 pub mod wgpu;
+pub mod zarr;
 
 #[cfg(feature = "gdal")]
 pub use self::gdal::GdalSrc;
@@ -52,6 +53,7 @@ pub use tensor::{TensorConv, ToRaster, ToTensor};
 pub use vec_ops::{VecClip, VecFilter, VecSchema};
 pub use vector::{Burn, Rasterize, VecSrc};
 pub use viewshed::Viewshed;
+pub use zarr::{ZarrLayer, ZarrSrc, ZarrStore};
 
 pub(crate) fn default_adapters() -> Vec<crate::element::Adapter> {
     vec![Reproject::adapter(), Cast::adapter()]

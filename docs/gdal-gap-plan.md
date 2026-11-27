@@ -220,9 +220,11 @@ like today, by what the org already touches:
 - COG tile compressions beyond deflate, LZW, ZSTD, JPEG and WebP: LERC has a
   C binding crate and no pure-Rust decoder that I know of.
 - NetCDF-4 and HDF5, the largest raster gap. HDF5 is a C library with no
-  complete pure-Rust reader. Zarr is the way around it: `zarrs` is pure Rust
-  and the EO catalogs that matter publish Zarr beside NetCDF. One week for a
-  `ZarrSrc`, and NetCDF-4 stays on GDAL or is converted at ingest.
+  complete pure-Rust reader. Zarr is the way around it, and the EO catalogs
+  that matter publish Zarr beside NetCDF. `ZarrSrc` over `zarrs` is built
+  (8.8). zarrs is built with its pure-Rust codecs only, zstd decodes
+  through `ruzstd`, and blosc is not read. NetCDF-4 stays on GDAL
+  or is converted at ingest.
 - GRIB2 complex and JPEG 2000 packing. JPEG 2000 has no pure-Rust decoder
   that I know of, so GRIB2 JPEG 2000 messages stay on a C codec or GDAL.
 - FileGDB, the one verne needs. OpenFileGDB is a documented
@@ -397,8 +399,21 @@ only after a proof script passes on real input, recorded in
       (tiletopia 008c4c4), and Lake Thun's outlet drains 0.997 of terrano's
       area at 90 m through the route, with flow accumulation as the `peak`
       value kind.
-- [ ] 8.8 Zarr source over `zarrs`, after checking the crate is still the
-      current choice.
+- [ ] 8.8 Zarr source over `zarrs` 0.23 (MIT or Apache-2.0, the current
+      Rust Zarr crate). Built, proof pending. A `zarr` layer source,
+      `ZarrSrc`, reads one array of a v3 store or a v3-compatible v2 store,
+      local or over HTTP, pulling only the chunks a window touches. It
+      shares `NetcdfSrc`'s CF reading: coordinates from the layer or the
+      array's dimension names, regular spacing, time per pull, `select` for
+      other dimensions, packing and fill values, and EPSG:4326 only for
+      lat/lon coordinates without a layer `crs`. Bands keep the array's
+      dtype when unpacked. HTTP goes through `HttpRange`, its retries and
+      its range cache, not `zarrs_http` or `object_store`. Codecs are
+      pure Rust (owner decision 2026-11-27): raw, gzip, zlib, crc32c,
+      sharding, transpose, and zstd through a decode-only `ruzstd` codec.
+      blosc fails naming the codec, `blusc` depending on the C zstd crate. Proof: a public
+      Zarr store served as tiles whose values match xarray's read at
+      sampled pixels.
 - [x] 8.9 Native dtype. terrano's `TypedBand` holds each band in its file
       format, raster caps carry a dtype per band, and `CogSrc`, `StacSrc`
       and `GdalSrc` serve the file's own format through export and `.tif`

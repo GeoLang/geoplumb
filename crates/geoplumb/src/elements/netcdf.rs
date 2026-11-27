@@ -35,9 +35,9 @@ pub struct NetcdfSrc {
     decoded_steps: Mutex<VecDeque<(usize, DecodedStep)>>,
 }
 
-struct TimeSteps {
-    datetime: TimeInterval,
-    instants_ms: Vec<i64>,
+pub(crate) struct TimeSteps {
+    pub(crate) datetime: TimeInterval,
+    pub(crate) instants_ms: Vec<i64>,
 }
 
 struct NetcdfGrid {
@@ -52,7 +52,7 @@ struct NetcdfGrid {
     time_position: Option<usize>,
 }
 
-enum Axis {
+pub(crate) enum Axis {
     Latitude,
     Longitude,
     ProjectionX,
@@ -98,8 +98,8 @@ impl NetcdfSrc {
         let x_coordinate = coordinate_of(x_name.as_str())?;
         let y_coordinate = coordinate_of(y_name.as_str())?;
         let (crs, x_is_longitude) = match (
-            axis_of(x_coordinate).map_err(named)?,
-            axis_of(y_coordinate).map_err(named)?,
+            variable_axis(x_coordinate).map_err(named)?,
+            variable_axis(y_coordinate).map_err(named)?,
         ) {
             (Axis::Longitude, Axis::Latitude) => match crs {
                 None | Some(Crs::WGS84) => (Crs::WGS84, true),
@@ -129,105 +129,46 @@ impl NetcdfSrc {
         };
         let x_values = values_of(x_coordinate)?;
         let y_values = values_of(y_coordinate)?;
-        let (first_column_x, column_step) = regular_axis(x_name, &x_values).map_err(named)?;
-        let (first_row_y, row_step) = regular_axis(y_name, &y_values).map_err(named)?;
-        let cell_size = column_step.abs();
-        let longest_side = x_values.len().max(y_values.len()) as f64;
-        if (cell_size - row_step.abs()).abs() * longest_side > CELL_TOLERANCE * cell_size {
-            return Err(named(format!(
-                "cells are {cell_size} by {}, the engine takes square cells",
-                row_step.abs()
-            )));
-        }
-        let stored = StoredGrid {
-            columns: x_values.len(),
-            rows: y_values.len(),
-            cell_size,
-            first_column_x,
-            first_row_y,
-            columns_run_west: column_step < 0.0,
-            rows_run_north: row_step > 0.0,
-            x_is_longitude,
-        };
+        let stored =
+            regular_grid(x_name, &x_values, y_name, &y_values, x_is_longitude).map_err(named)?;
 
         let leading = &target.dimensions[..dimension_count - 2];
-        let mut time_position = None;
-        let mut fixed_indices = vec![0usize; leading.len()];
-        for (position, dimension) in leading.iter().enumerate() {
-            let coordinate = coordinate_variable(&metadata, dimension);
-            let is_time = match coordinate {
-                Some(coordinate) => matches!(axis_of(coordinate).map_err(named)?, Axis::Time),
-                None => false,
-            };
-            if is_time {
-                if time_position.is_some() {
-                    return Err(named("has two time dimensions".into()));
-                }
-                time_position = Some(position);
-                continue;
-            }
-            let index = *select.get(dimension).ok_or_else(|| {
-                named(format!(
-                    "has a {dimension} dimension of size {}, name an index for it in select",
-                    sizes[position]
-                ))
-            })?;
-            if index >= sizes[position] {
-                return Err(named(format!(
-                    "select {dimension} = {index} is past the dimension's size {}",
-                    sizes[position]
-                )));
-            }
-            fixed_indices[position] = index;
-        }
-        for name in select.keys() {
-            let selectable = leading
-                .iter()
-                .enumerate()
-                .any(|(position, dimension)| dimension == name && time_position != Some(position));
-            if !selectable {
-                return Err(named(format!(
-                    "select names {name}, which is not a dimension besides time, y and x"
-                )));
-            }
-        }
+        let time_flags = leading
+            .iter()
+            .map(
+                |dimension| match coordinate_variable(&metadata, dimension) {
+                    Some(coordinate) => Ok(matches!(variable_axis(coordinate)?, Axis::Time)),
+                    None => Ok(false),
+                },
+            )
+            .collect::<core::result::Result<Vec<bool>, String>>()
+            .map_err(named)?;
+        let LeadingIndices {
+            time_position,
+            fixed_indices,
+        } = leading_indices(leading, &sizes[..dimension_count - 2], &time_flags, select)
+            .map_err(named)?;
 
-        let time = match (time_position, datetime) {
-            (None, None) => None,
-            (None, Some(_)) => {
-                return Err(named(
-                    "has no time dimension for the layer's datetime".into(),
-                ));
-            }
-            (Some(_), None) => {
-                return Err(named(
-                    "has a time dimension, the layer needs datetime = \"start/end\"".into(),
-                ));
-            }
-            (Some(position), Some(datetime)) => {
+        let time = match time_pairing(time_position, datetime).map_err(named)? {
+            None => None,
+            Some((position, datetime)) => {
                 let coordinate = coordinate_of(leading[position].as_str())?;
                 let values = values_of(coordinate)?;
-                let instants_ms = time_instants(coordinate, &values).map_err(named)?;
-                Some(TimeSteps {
-                    datetime,
-                    instants_ms,
-                })
+                let instants_ms = time_instants(
+                    &coordinate.name,
+                    text_attribute(coordinate, "units").map_err(named)?,
+                    text_attribute(coordinate, "calendar").map_err(named)?,
+                    &values,
+                )
+                .map_err(named)?;
+                Some(time_steps(datetime, instants_ms).map_err(named)?)
             }
         };
-        let step_count = time.as_ref().map_or(1, |time| time.instants_ms.len());
-        if step_count == 0 {
-            return Err(named("has no time steps".into()));
-        }
         let resident_step = match &time {
             None => 0,
-            Some(time) => step_in(&time.instants_ms, time.datetime).ok_or_else(|| {
-                named(format!(
-                    "datetime {} holds no time step, the file runs {} to {}",
-                    time.datetime.to_stac_datetime(),
-                    format_rfc3339(time.instants_ms[0]),
-                    format_rfc3339(time.instants_ms[time.instants_ms.len() - 1])
-                ))
-            })?,
+            Some(time) => {
+                step_in(&time.instants_ms, time.datetime).expect("time_steps found a step")
+            }
         };
         let grid = Arc::new(NetcdfGrid {
             path: path.to_path_buf(),
@@ -291,7 +232,7 @@ impl NetcdfSrc {
     }
 }
 
-fn step_in(instants_ms: &[i64], interval: TimeInterval) -> Option<usize> {
+pub(crate) fn step_in(instants_ms: &[i64], interval: TimeInterval) -> Option<usize> {
     instants_ms
         .iter()
         .enumerate()
@@ -392,10 +333,20 @@ fn coordinate_variable<'a>(metadata: &'a NetCdfMetadata, dimension: &str) -> Opt
         .find(|v| v.name == dimension && v.dimensions.len() == 1 && v.dimensions[0] == dimension)
 }
 
-fn axis_of(coordinate: &Variable) -> core::result::Result<Axis, String> {
-    let standard_name = text_attribute(coordinate, "standard_name")?;
-    let units = text_attribute(coordinate, "units")?;
-    if let Some(axis) = standard_name.and_then(|name| match name {
+fn variable_axis(coordinate: &Variable) -> core::result::Result<Axis, String> {
+    Ok(coordinate_axis(
+        &coordinate.name,
+        text_attribute(coordinate, "standard_name")?,
+        text_attribute(coordinate, "units")?,
+    ))
+}
+
+pub(crate) fn coordinate_axis(
+    name: &str,
+    standard_name: Option<&str>,
+    units: Option<&str>,
+) -> Axis {
+    if let Some(axis) = standard_name.and_then(|standard_name| match standard_name {
         "latitude" => Some(Axis::Latitude),
         "longitude" => Some(Axis::Longitude),
         "projection_x_coordinate" => Some(Axis::ProjectionX),
@@ -403,26 +354,142 @@ fn axis_of(coordinate: &Variable) -> core::result::Result<Axis, String> {
         "time" => Some(Axis::Time),
         _ => None,
     }) {
-        return Ok(axis);
+        return axis;
     }
     if let Some(units) = units {
         // cf conventions section 4.1 lists these spellings
         match units {
             "degrees_north" | "degree_north" | "degree_N" | "degrees_N" | "degreeN"
-            | "degreesN" => return Ok(Axis::Latitude),
+            | "degreesN" => return Axis::Latitude,
             "degrees_east" | "degree_east" | "degree_E" | "degrees_E" | "degreeE" | "degreesE" => {
-                return Ok(Axis::Longitude);
+                return Axis::Longitude;
             }
-            _ if units.contains(" since ") => return Ok(Axis::Time),
+            _ if units.contains(" since ") => return Axis::Time,
             _ => {}
         }
     }
-    Ok(match coordinate.name.to_ascii_lowercase().as_str() {
+    match name.to_ascii_lowercase().as_str() {
         "lat" | "latitude" => Axis::Latitude,
         "lon" | "longitude" => Axis::Longitude,
         "x" => Axis::ProjectionX,
         "y" => Axis::ProjectionY,
         _ => Axis::Other,
+    }
+}
+
+pub(crate) fn regular_grid(
+    x_name: &str,
+    x_values: &[f64],
+    y_name: &str,
+    y_values: &[f64],
+    x_is_longitude: bool,
+) -> core::result::Result<StoredGrid, String> {
+    let (first_column_x, column_step) = regular_axis(x_name, x_values)?;
+    let (first_row_y, row_step) = regular_axis(y_name, y_values)?;
+    let cell_size = column_step.abs();
+    let longest_side = x_values.len().max(y_values.len()) as f64;
+    if (cell_size - row_step.abs()).abs() * longest_side > CELL_TOLERANCE * cell_size {
+        return Err(format!(
+            "cells are {cell_size} by {}, the engine takes square cells",
+            row_step.abs()
+        ));
+    }
+    Ok(StoredGrid {
+        columns: x_values.len(),
+        rows: y_values.len(),
+        cell_size,
+        first_column_x,
+        first_row_y,
+        columns_run_west: column_step < 0.0,
+        rows_run_north: row_step > 0.0,
+        x_is_longitude,
+    })
+}
+
+pub(crate) struct LeadingIndices {
+    pub(crate) time_position: Option<usize>,
+    pub(crate) fixed_indices: Vec<usize>,
+}
+
+pub(crate) fn leading_indices(
+    leading: &[String],
+    sizes: &[usize],
+    time_flags: &[bool],
+    select: &BTreeMap<String, usize>,
+) -> core::result::Result<LeadingIndices, String> {
+    let mut time_position = None;
+    let mut fixed_indices = vec![0usize; leading.len()];
+    for (position, dimension) in leading.iter().enumerate() {
+        if time_flags[position] {
+            if time_position.is_some() {
+                return Err("has two time dimensions".into());
+            }
+            time_position = Some(position);
+            continue;
+        }
+        let index = *select.get(dimension).ok_or_else(|| {
+            format!(
+                "has a {dimension} dimension of size {}, name an index for it in select",
+                sizes[position]
+            )
+        })?;
+        if index >= sizes[position] {
+            return Err(format!(
+                "select {dimension} = {index} is past the dimension's size {}",
+                sizes[position]
+            ));
+        }
+        fixed_indices[position] = index;
+    }
+    for name in select.keys() {
+        let selectable = leading
+            .iter()
+            .enumerate()
+            .any(|(position, dimension)| dimension == name && time_position != Some(position));
+        if !selectable {
+            return Err(format!(
+                "select names {name}, which is not a dimension besides time, y and x"
+            ));
+        }
+    }
+    Ok(LeadingIndices {
+        time_position,
+        fixed_indices,
+    })
+}
+
+pub(crate) fn time_pairing(
+    time_position: Option<usize>,
+    datetime: Option<TimeInterval>,
+) -> core::result::Result<Option<(usize, TimeInterval)>, String> {
+    match (time_position, datetime) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err("has no time dimension for the layer's datetime".into()),
+        (Some(_), None) => {
+            Err("has a time dimension, the layer needs datetime = \"start/end\"".into())
+        }
+        (Some(position), Some(datetime)) => Ok(Some((position, datetime))),
+    }
+}
+
+pub(crate) fn time_steps(
+    datetime: TimeInterval,
+    instants_ms: Vec<i64>,
+) -> core::result::Result<TimeSteps, String> {
+    if instants_ms.is_empty() {
+        return Err("has no time steps".into());
+    }
+    if step_in(&instants_ms, datetime).is_none() {
+        return Err(format!(
+            "datetime {} holds no time step, the file runs {} to {}",
+            datetime.to_stac_datetime(),
+            format_rfc3339(instants_ms[0]),
+            format_rfc3339(instants_ms[instants_ms.len() - 1])
+        ));
+    }
+    Ok(TimeSteps {
+        datetime,
+        instants_ms,
     })
 }
 
@@ -445,11 +512,15 @@ fn regular_axis(name: &str, values: &[f64]) -> core::result::Result<(f64, f64), 
     Ok((first, step))
 }
 
-fn time_instants(coordinate: &Variable, values: &[f64]) -> core::result::Result<Vec<i64>, String> {
-    let units = text_attribute(coordinate, "units")?
-        .ok_or_else(|| format!("time coordinate {} has no units", coordinate.name))?;
+pub(crate) fn time_instants(
+    name: &str,
+    units: Option<&str>,
+    calendar: Option<&str>,
+    values: &[f64],
+) -> core::result::Result<Vec<i64>, String> {
+    let units = units.ok_or_else(|| format!("time coordinate {name} has no units"))?;
     let (unit_ms, reference_ms) = parse_time_units(units)?;
-    let calendar = text_attribute(coordinate, "calendar")?.map(str::to_ascii_lowercase);
+    let calendar = calendar.map(str::to_ascii_lowercase);
     let proleptic = match calendar.as_deref() {
         None | Some("standard") | Some("gregorian") => false,
         Some("proleptic_gregorian") => true,

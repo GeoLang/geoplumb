@@ -343,12 +343,33 @@ async fn fetch_once(
     Ok(bytes.to_vec())
 }
 
-/// retried fetch under a transfer permit
-async fn fetch_range(
-    url: &str,
-    offset: u64,
-    len: u64,
-) -> core::result::Result<Vec<u8>, terrano_core::Error> {
+async fn fetch_object_once(url: &str) -> core::result::Result<Option<Vec<u8>>, (bool, String)> {
+    let resp = FETCH_CLIENT
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| (true, format!("request failed: {e}")))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status.is_client_error() || status.is_server_error() {
+        let transient =
+            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        return Err((transient, format!("request failed: status {status}")));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| (true, format!("body read failed: {e}")))?;
+    Ok(Some(bytes.to_vec()))
+}
+
+async fn retried<T, F, Attempt>(attempt: F) -> core::result::Result<T, terrano_core::Error>
+where
+    F: Fn() -> Attempt,
+    Attempt: std::future::Future<Output = core::result::Result<T, (bool, String)>>,
+{
     let _permit = TRANSFER_PERMITS
         .acquire()
         .await
@@ -356,8 +377,8 @@ async fn fetch_range(
     let mut attempts = 0;
     let mut delay = RANGE_BACKOFF;
     loop {
-        match fetch_once(url, offset, len).await {
-            Ok(bytes) => return Ok(bytes),
+        match attempt().await {
+            Ok(fetched) => return Ok(fetched),
             Err((transient, detail)) => {
                 attempts += 1;
                 if !transient || attempts == RANGE_ATTEMPTS {
@@ -368,6 +389,14 @@ async fn fetch_range(
             }
         }
     }
+}
+
+async fn fetch_range(
+    url: &str,
+    offset: u64,
+    len: u64,
+) -> core::result::Result<Vec<u8>, terrano_core::Error> {
+    retried(|| fetch_once(url, offset, len)).await
 }
 
 /// process-wide budget for cached range bytes, compressed as fetched
@@ -517,6 +546,16 @@ impl HttpRange {
 
     // one HEAD request, blocking
     pub fn content_length(&self) -> Result<u64> {
+        self.length_if_found()?.ok_or_else(|| {
+            Error::Source(format!(
+                "{}: head request failed: status {}",
+                self.url,
+                reqwest::StatusCode::NOT_FOUND
+            ))
+        })
+    }
+
+    pub(crate) fn length_if_found(&self) -> Result<Option<u64>> {
         let named = |detail: String| Error::Source(format!("{}: {detail}", self.url));
         FETCH_RT.block_on(async {
             let resp = FETCH_CLIENT
@@ -525,6 +564,9 @@ impl HttpRange {
                 .await
                 .map_err(|e| named(format!("head request failed: {e}")))?;
             let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
             if !status.is_success() {
                 return Err(named(format!("head request failed: status {status}")));
             }
@@ -535,8 +577,34 @@ impl HttpRange {
                 .to_str()
                 .ok()
                 .and_then(|length| length.parse().ok())
+                .map(Some)
                 .ok_or_else(|| named("head response content length is not a byte count".into()))
         })
+    }
+
+    pub(crate) fn read_object(
+        &self,
+    ) -> core::result::Result<Option<Arc<Vec<u8>>>, terrano_core::Error> {
+        // whole objects share the range cache under a length no byte range has
+        let key = (self.url.clone(), 0, u64::MAX);
+        if let Some(bytes) = RANGE_CACHE.get_or_claim(&key) {
+            return Ok(Some(bytes));
+        }
+        match FETCH_RT.block_on(retried(|| fetch_object_once(&self.url))) {
+            Ok(Some(bytes)) => {
+                let bytes = Arc::new(bytes);
+                RANGE_CACHE.publish(&key, Some(bytes.clone()));
+                Ok(Some(bytes))
+            }
+            Ok(None) => {
+                RANGE_CACHE.publish(&key, None);
+                Ok(None)
+            }
+            Err(e) => {
+                RANGE_CACHE.publish(&key, None);
+                Err(e)
+            }
+        }
     }
 }
 

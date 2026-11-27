@@ -35,10 +35,11 @@ use geoplumb::elements::GdalSrc;
 use geoplumb::elements::algebra::AlgebraOp;
 use geoplumb::elements::stac::format_rfc3339;
 use geoplumb::elements::{
-    Aspect, BandMath, Cast, ClipRaster, CogSrc, Combine, Contours, CopcSrc, FlowAccumulation,
-    FlowDirection, Focal, GpkgSrc, Hillshade, IdwGrid, LasSrc, MapAlgebra, Mosaic, NetcdfSrc,
-    Polygonize, QualityMask, RasterSrc, Rasterize, Reproject, Slope, StacSrc, StreamOrder,
-    TensorConv, ToRaster, ToTensor, VecClip, VecFilter, VecSchema, VecSrc, Viewshed, Watershed,
+    Aspect, BandMath, Cast, ClipRaster, CogSrc, Combine, Contours, CopcSrc, FlowAccumulation, FlowDirection,
+    Focal, GpkgSrc, Hillshade, IdwGrid, LasSrc, MapAlgebra, Mosaic, NetcdfSrc, Polygonize,
+    QualityMask, RasterSrc, Rasterize, Reproject, Slope, StacSrc, StreamOrder, TensorConv,
+    ToRaster, ToTensor, VecClip, VecFilter, VecSchema, VecSrc, Viewshed, Watershed, ZarrLayer,
+    ZarrSrc, ZarrStore,
 };
 use geoplumb::tile::{XyzTile, render_tile_at};
 use geoplumb::{Bbox, Caps, CapsSet, Crs, Engine, Graph, NodeId, Source, TimeInterval};
@@ -79,7 +80,7 @@ enum LayerOutput {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerInfo {
     pub name: String,
-    /// `stac`, `cog`, `gdal`, `geojson`, `gpkg`, `shapefile`, `csv`, `las`, `copc`, `netcdf`, `grib`, or
+    /// `stac`, `cog`, `gdal`, `geojson`, `gpkg`, `shapefile`, `csv`, `las`, `copc`, `netcdf`, `zarr`, `grib`, or
     /// `composite` for a fan-in layer
     pub source: &'static str,
     pub collection: Option<String>,
@@ -444,6 +445,17 @@ fn composite_info(name: &str, inputs: Vec<LayerInfo>) -> LayerInfo {
     }
 }
 
+fn step_extent(steps: &[i64]) -> Option<TemporalExtent> {
+    steps
+        .iter()
+        .min()
+        .zip(steps.iter().max())
+        .map(|(start, end)| TemporalExtent {
+            start: Some(format_rfc3339(*start)),
+            end: Some(format_rfc3339(*end)),
+        })
+}
+
 fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, LayerInfo), String> {
     let name = layer.to_string();
     match source {
@@ -606,20 +618,54 @@ fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, L
                 (*value_kind).into(),
             )
             .map_err(|e| e.to_string())?;
-            let steps = src.step_instants_ms();
-            let temporal_extent = steps
-                .iter()
-                .min()
-                .zip(steps.iter().max())
-                .map(|(start, end)| TemporalExtent {
-                    start: Some(format_rfc3339(*start)),
-                    end: Some(format_rfc3339(*end)),
-                });
+            let temporal_extent = step_extent(src.step_instants_ms());
             Ok((
                 Box::new(src),
                 LayerInfo {
                     name,
                     source: "netcdf",
+                    collection: None,
+                    default_datetime: datetime.clone(),
+                    temporal_extent,
+                },
+            ))
+        }
+        SourceConfig::Zarr {
+            path,
+            url,
+            array,
+            x_coordinate,
+            y_coordinate,
+            crs,
+            datetime,
+            select,
+            value_kind,
+        } => {
+            let store = match (path, url) {
+                (Some(path), None) => ZarrStore::Path(path.clone()),
+                (None, Some(url)) => ZarrStore::Url(url.clone()),
+                _ => return Err(config::ZARR_NEEDS_ONE_LOCATION.into()),
+            };
+            let layer = ZarrLayer {
+                array: array.clone(),
+                x_coordinate: x_coordinate.clone(),
+                y_coordinate: y_coordinate.clone(),
+                select: select.clone(),
+                crs: crs.map(Crs),
+                datetime: datetime
+                    .as_deref()
+                    .map(TimeInterval::parse)
+                    .transpose()
+                    .map_err(|e| e.to_string())?,
+                value_kind: (*value_kind).into(),
+            };
+            let src = ZarrSrc::open(&store, &layer).map_err(|e| e.to_string())?;
+            let temporal_extent = step_extent(src.step_instants_ms());
+            Ok((
+                Box::new(src),
+                LayerInfo {
+                    name,
+                    source: "zarr",
                     collection: None,
                     default_datetime: datetime.clone(),
                     temporal_extent,

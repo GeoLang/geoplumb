@@ -211,6 +211,21 @@ pub enum SourceConfig {
         #[serde(default)]
         value_kind: ValueKindConfig,
     },
+    // one array of a zarr v2 or v3 store, from a local `path` or a `url`, its
+    // last two dimensions y and x
+    Zarr {
+        path: Option<PathBuf>,
+        url: Option<String>,
+        array: String,
+        x_coordinate: Option<String>,
+        y_coordinate: Option<String>,
+        crs: Option<u32>,
+        datetime: Option<String>,
+        #[serde(default)]
+        select: BTreeMap<String, usize>,
+        #[serde(default)]
+        value_kind: ValueKindConfig,
+    },
     // one field of a grib2 file, 1-based
     Grib {
         path: PathBuf,
@@ -605,6 +620,9 @@ fn is_color_relief(op: &OpConfig) -> bool {
 pub(crate) const COPC_NEEDS_ONE_LOCATION: &str =
     "the copc source names exactly one of path and url";
 
+pub(crate) const ZARR_NEEDS_ONE_LOCATION: &str =
+    "the zarr source names exactly one of path and url";
+
 pub(crate) const GDAL_NOT_BUILT: &str =
     "the gdal source needs a server built with the gdal feature, this one was built without it";
 
@@ -643,6 +661,15 @@ fn check_branch(source: &SourceConfig, ops: &[OpConfig]) -> Result<(), String> {
             ..
         } => {
             TimeInterval::parse(datetime).map_err(|e| format!("netcdf datetime: {e}"))?;
+        }
+        SourceConfig::Zarr { path, url, .. } if path.is_some() == url.is_some() => {
+            return Err(ZARR_NEEDS_ONE_LOCATION.into());
+        }
+        SourceConfig::Zarr {
+            datetime: Some(datetime),
+            ..
+        } => {
+            TimeInterval::parse(datetime).map_err(|e| format!("zarr datetime: {e}"))?;
         }
         SourceConfig::Grib { message: 0, .. } => {
             return Err("grib messages count from 1".into());
@@ -909,6 +936,7 @@ impl SourceConfig {
             | SourceConfig::Las { .. }
             | SourceConfig::Copc { .. }
             | SourceConfig::Netcdf { .. }
+            | SourceConfig::Zarr { .. }
             | SourceConfig::Grib { .. } => None,
             SourceConfig::Stac {
                 api,
