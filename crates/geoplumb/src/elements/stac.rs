@@ -991,7 +991,7 @@ impl Inner {
         }
         let value_kinds = BandKinds::from(self.asset_value_kinds[k]);
         match &item.reprojection {
-            None if meta.pixel_width > self.base_resolution => {
+            None if meta.pixel_width > self.base_resolution || !on_asset_grid(reader, req) => {
                 read_resampled(reader, req, self.crs, &value_kinds)
             }
             None => read_chunk(
@@ -1054,6 +1054,16 @@ impl Inner {
         items.sort_by(|a, b| b.datetime.cmp(&a.datetime));
         Ok(items)
     }
+}
+
+fn on_asset_grid(reader: &CogReader<HttpRange>, req: &WindowReq) -> bool {
+    let (origin_x, origin_y) = (reader.meta().origin_x, reader.meta().origin_y);
+    // read_chunk rounds the window's top left corner onto the pixel grid of the level it reads
+    let level_resolution = reader.levels()[reader.select_level(req.resolution)].pixel_width;
+    let aligned = align_outward(&req.bbox, origin_x, origin_y, level_resolution);
+    let tolerance = 1e-6 * level_resolution;
+    (aligned.min_x - req.bbox.min_x).abs() <= tolerance
+        && (aligned.max_y - req.bbox.max_y).abs() <= tolerance
 }
 
 fn read_resampled(

@@ -2641,6 +2641,11 @@ fn grid_cog(
     buf.into_inner()
 }
 
+// bilinear sampling reproduces a linear field exactly, so any offset in the read shows as a value error
+fn ramp(lon: f64, lat: f64) -> f64 {
+    (lon - ORIGIN_X) / CELL + 1000.0 * (ORIGIN_Y - lat) / CELL
+}
+
 async fn start_mixed_resolution_mock() -> (String, Arc<Mock>) {
     start_mock_with(|base| {
         let coarse = |origin_x: f64, origin_y: f64| CogParams {
@@ -2679,6 +2684,20 @@ async fn start_mixed_resolution_mock() -> (String, Arc<Mock>) {
                 coarse_code,
             ),
         );
+        let ramp_off_grid = CogParams {
+            origin_x: ORIGIN_X + OFF_GRID,
+            origin_y: ORIGIN_Y - OFF_GRID,
+            ..class_params()
+        };
+        cogs.insert(
+            "ramp_off_grid.tif".into(),
+            grid_cog(&ramp_off_grid, CLASS_COLS, CLASS_ROWS, |col, row| {
+                ramp(
+                    ramp_off_grid.origin_x + (col as f64 + 0.5) * CELL,
+                    ramp_off_grid.origin_y - (row as f64 + 0.5) * CELL,
+                )
+            }),
+        );
         let features = vec![asset_item(
             "mixed",
             "2024-06-01T00:00:00Z",
@@ -2686,6 +2705,7 @@ async fn start_mixed_resolution_mock() -> (String, Arc<Mock>) {
                 ("red", format!("{base}/cog/red.tif")),
                 ("scl", format!("{base}/cog/scl.tif")),
                 ("scl_off_grid", format!("{base}/cog/scl_off_grid.tif")),
+                ("ramp_off_grid", format!("{base}/cog/ramp_off_grid.tif")),
             ],
             CLASS_BBOX,
             4326,
@@ -2767,6 +2787,37 @@ async fn a_coarser_categorical_asset_off_the_fine_grid_keeps_its_codes_at_every_
             bits(red_only.bands.band(0).unwrap().to_raster().data()),
             "red pulled at {resolution}"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_continuous_asset_off_the_grid_at_the_base_resolution_reads_where_it_lies() {
+    let (base, _mock) = start_mixed_resolution_mock().await;
+    for resolution in [CELL, 2.0 * CELL, 4.0 * CELL] {
+        let (src, mixed) =
+            read_assets(&base, &["red", "ramp_off_grid"], class_window(resolution)).await;
+        assert_eq!(
+            (src.grid().origin_x, src.grid().origin_y),
+            (ORIGIN_X, ORIGIN_Y)
+        );
+        let margin = 2.0 * resolution;
+        let mut checked = 0;
+        each_pixel(&mixed, |bi, x, y, got| {
+            let inside = x > CLASS_BBOX[0] + margin
+                && x < CLASS_BBOX[2] - margin
+                && y > CLASS_BBOX[1] + margin
+                && y < CLASS_BBOX[3] - margin;
+            if bi != 1 || !inside {
+                return;
+            }
+            checked += 1;
+            assert!(
+                (got - ramp(x, y)).abs() < 1e-6,
+                "({x:.5},{y:.5}) pulled at {resolution}: {got} against {}",
+                ramp(x, y)
+            );
+        });
+        assert!(checked > 0, "no interior pixel at {resolution}");
     }
 }
 
