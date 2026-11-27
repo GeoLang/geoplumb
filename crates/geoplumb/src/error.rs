@@ -19,6 +19,8 @@ pub enum Error {
     InvalidGraph(String),
     #[error("source read failed: {0}")]
     Source(String),
+    #[error("write failed: {0}")]
+    Write(String),
     #[error("compute failed at node {node:?}: {detail}")]
     Compute { node: NodeId, detail: String },
     #[error("reprojection failed: {0}")]

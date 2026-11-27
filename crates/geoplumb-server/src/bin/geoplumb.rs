@@ -17,7 +17,7 @@ struct Arguments {
 #[derive(Subcommand)]
 enum Command {
     #[command(
-        about = "Write one layer of a layer TOML over a window: a raster layer as a COG, a vector layer as GeoJSON"
+        about = "Write one layer of a layer TOML over a window: a raster layer as a COG, a vector layer as GeoJSON or a GeoPackage"
     )]
     Run {
         #[arg(help = "the layer TOML geoplumb-server reads")]
@@ -40,7 +40,7 @@ enum Command {
             help = "rfc 3339 start/end interval, the source's own when absent"
         )]
         t: Option<String>,
-        #[arg(short = 'o', long = "output", help = "a .tif or a .geojson path")]
+        #[arg(short = 'o', long = "output", help = "a .tif, .geojson or .gpkg path")]
         output: PathBuf,
     },
     #[command(

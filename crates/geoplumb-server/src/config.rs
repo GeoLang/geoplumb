@@ -161,12 +161,28 @@ pub enum SourceConfig {
         value_kind: ValueKindConfig,
     },
     /// a feature collection read whole at startup, lon/lat per rfc 7946
-    Geojson { path: PathBuf },
+    Geojson {
+        path: PathBuf,
+    },
     // table defaults to the first feature table, crs to the table's epsg srs
     Gpkg {
         path: PathBuf,
         table: Option<String>,
         crs: Option<u32>,
+    },
+    // a shapefile read whole at startup, `path` naming the .shp. crs defaults
+    // to the epsg code the .prj beside it names
+    Shapefile {
+        path: PathBuf,
+        crs: Option<u32>,
+    },
+    // a csv of points read whole at startup, `x` and `y` naming the
+    // coordinate columns. csv carries no crs, so the layer file names it
+    Csv {
+        path: PathBuf,
+        x: String,
+        y: String,
+        crs: u32,
     },
     /// a las point cloud read whole at startup. points are not pixels, so
     /// the chain over it needs an `idw`
@@ -888,6 +904,8 @@ impl SourceConfig {
             | SourceConfig::Gdal { .. }
             | SourceConfig::Geojson { .. }
             | SourceConfig::Gpkg { .. }
+            | SourceConfig::Shapefile { .. }
+            | SourceConfig::Csv { .. }
             | SourceConfig::Las { .. }
             | SourceConfig::Copc { .. }
             | SourceConfig::Netcdf { .. }

@@ -79,7 +79,7 @@ enum LayerOutput {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerInfo {
     pub name: String,
-    /// `stac`, `cog`, `gdal`, `geojson`, `gpkg`, `las`, `copc`, `netcdf`, `grib`, or
+    /// `stac`, `cog`, `gdal`, `geojson`, `gpkg`, `shapefile`, `csv`, `las`, `copc`, `netcdf`, `grib`, or
     /// `composite` for a fan-in layer
     pub source: &'static str,
     pub collection: Option<String>,
@@ -516,6 +516,32 @@ fn open_source(layer: &str, source: &SourceConfig) -> Result<(Box<dyn Source>, L
                 LayerInfo {
                     name,
                     source: "gpkg",
+                    collection: None,
+                    default_datetime: None,
+                    temporal_extent: None,
+                },
+            ))
+        }
+        SourceConfig::Shapefile { path, crs } => {
+            let src = VecSrc::from_shapefile(path, crs.map(Crs)).map_err(|e| e.to_string())?;
+            Ok((
+                Box::new(src),
+                LayerInfo {
+                    name,
+                    source: "shapefile",
+                    collection: None,
+                    default_datetime: None,
+                    temporal_extent: None,
+                },
+            ))
+        }
+        SourceConfig::Csv { path, x, y, crs } => {
+            let src = VecSrc::from_csv(path, x, y, Crs(*crs)).map_err(|e| e.to_string())?;
+            Ok((
+                Box::new(src),
+                LayerInfo {
+                    name,
+                    source: "csv",
                     collection: None,
                     default_datetime: None,
                     temporal_extent: None,

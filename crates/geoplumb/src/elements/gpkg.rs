@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -6,9 +6,11 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use serde_json::Value;
+use topoi_core::geojson::FeatureGeometry;
 
 use super::file_stamp;
-use super::vector::simplify_geometry;
+use super::vector::{geometry_envelope, simplify_geometry};
 use crate::caps::{CapsPattern, CapsSet, Constraint, Crs, ResRange, SetField, VectorPattern};
 use crate::chunk::{Chunk, VectorChunk, VectorFeature, clip_geometry};
 use crate::element::Source;
@@ -157,16 +159,16 @@ impl GpkgSrc {
         let selected: Vec<String> = [primary_key, &geometry_column]
             .into_iter()
             .chain(&property_columns)
-            .map(|c| quote_identifier(c))
+            .map(|c| quote_identifier(c).map_err(source_error))
             .collect::<Result<_>>()?;
-        let primary_key = quote_identifier(primary_key)?;
+        let primary_key = quote_identifier(primary_key).map_err(source_error)?;
         let window_query = format!(
             "SELECT {} FROM {} WHERE {primary_key} IN (SELECT id FROM {} \
              WHERE maxx >= ?1 AND minx <= ?2 AND maxy >= ?3 AND miny <= ?4) \
              ORDER BY {primary_key}",
             selected.join(", "),
-            quote_identifier(&table)?,
-            quote_identifier(&rtree)?,
+            quote_identifier(&table).map_err(source_error)?,
+            quote_identifier(&rtree).map_err(source_error)?,
         );
 
         Ok(GpkgSrc {
@@ -200,11 +202,11 @@ fn connect(path: &Path) -> Result<Connection> {
     .map_err(|e| Error::Source(format!("{}: {e}", path.display())))
 }
 
-fn quote_identifier(identifier: &str) -> Result<String> {
+fn quote_identifier(identifier: &str) -> std::result::Result<String, String> {
     if identifier.contains('"') {
-        return Err(Error::Source(format!(
+        return Err(format!(
             "geopackage identifier {identifier} contains a double quote"
-        )));
+        ));
     }
     Ok(format!("\"{identifier}\""))
 }
@@ -371,4 +373,365 @@ impl Source for GpkgSrc {
             .await
         })
     }
+}
+
+// "GPKG" in the sqlite header's application id field
+const GPKG_APPLICATION_ID: i32 = 0x4750_4B47;
+// geopackage 1.4, the spec version times ten thousand
+const GPKG_USER_VERSION: i32 = 10400;
+const GEOMETRY_COLUMN: &str = "geom";
+const PRIMARY_KEY: &str = "fid";
+
+// the tables the geopackage spec requires, with the columns and constraints gdal creates
+const METADATA_TABLES: &str = "
+    CREATE TABLE gpkg_spatial_ref_sys (
+        srs_name TEXT NOT NULL,
+        srs_id INTEGER NOT NULL PRIMARY KEY,
+        organization TEXT NOT NULL,
+        organization_coordsys_id INTEGER NOT NULL,
+        definition TEXT NOT NULL,
+        description TEXT);
+    CREATE TABLE gpkg_contents (
+        table_name TEXT NOT NULL PRIMARY KEY,
+        data_type TEXT NOT NULL,
+        identifier TEXT UNIQUE,
+        description TEXT DEFAULT '',
+        last_change DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        min_x DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE,
+        srs_id INTEGER,
+        CONSTRAINT fk_gc_r_srs_id FOREIGN KEY (srs_id) REFERENCES gpkg_spatial_ref_sys(srs_id));
+    CREATE TABLE gpkg_geometry_columns (
+        table_name TEXT NOT NULL,
+        column_name TEXT NOT NULL,
+        geometry_type_name TEXT NOT NULL,
+        srs_id INTEGER NOT NULL,
+        z TINYINT NOT NULL,
+        m TINYINT NOT NULL,
+        CONSTRAINT pk_geom_cols PRIMARY KEY (table_name, column_name),
+        CONSTRAINT uk_gc_table_name UNIQUE (table_name),
+        CONSTRAINT fk_gc_tn FOREIGN KEY (table_name) REFERENCES gpkg_contents(table_name),
+        CONSTRAINT fk_gc_srs FOREIGN KEY (srs_id) REFERENCES gpkg_spatial_ref_sys (srs_id));
+    CREATE TABLE gpkg_extensions (
+        table_name TEXT,
+        column_name TEXT,
+        extension_name TEXT NOT NULL,
+        definition TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name));
+    INSERT INTO gpkg_spatial_ref_sys VALUES
+        ('Undefined Cartesian SRS', -1, 'NONE', -1, 'undefined',
+            'undefined Cartesian coordinate reference system'),
+        ('Undefined geographic SRS', 0, 'NONE', 0, 'undefined',
+            'undefined geographic coordinate reference system');";
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ColumnType {
+    Integer,
+    Real,
+    Text,
+    Boolean,
+}
+
+impl ColumnType {
+    fn of(value: &Value) -> Option<ColumnType> {
+        match value {
+            Value::Null => None,
+            Value::Bool(_) => Some(ColumnType::Boolean),
+            Value::Number(number) if number.is_i64() => Some(ColumnType::Integer),
+            Value::Number(_) => Some(ColumnType::Real),
+            Value::String(_) | Value::Array(_) | Value::Object(_) => Some(ColumnType::Text),
+        }
+    }
+
+    fn merge(self, other: ColumnType) -> ColumnType {
+        match (self, other) {
+            (a, b) if a == b => a,
+            (ColumnType::Integer, ColumnType::Real) | (ColumnType::Real, ColumnType::Integer) => {
+                ColumnType::Real
+            }
+            _ => ColumnType::Text,
+        }
+    }
+
+    fn sql_name(self) -> &'static str {
+        match self {
+            ColumnType::Integer => "INTEGER",
+            ColumnType::Real => "REAL",
+            ColumnType::Text => "TEXT",
+            ColumnType::Boolean => "BOOLEAN",
+        }
+    }
+
+    fn sql_value(self, value: Option<&Value>) -> rusqlite::types::Value {
+        use rusqlite::types::Value as Sql;
+        let Some(value) = value.filter(|v| !v.is_null()) else {
+            return Sql::Null;
+        };
+        match (self, value) {
+            (ColumnType::Text, Value::String(text)) => Sql::Text(text.clone()),
+            (ColumnType::Text, other) => Sql::Text(other.to_string()),
+            (ColumnType::Boolean, value) => Sql::Integer(i64::from(
+                value
+                    .as_bool()
+                    .expect("a boolean column holds only booleans"),
+            )),
+            (ColumnType::Integer, value) => Sql::Integer(
+                value
+                    .as_i64()
+                    .expect("an integer column holds only i64 numbers"),
+            ),
+            (ColumnType::Real, value) => {
+                Sql::Real(value.as_f64().expect("a real column holds only numbers"))
+            }
+        }
+    }
+}
+
+fn property_columns(
+    features: &[VectorFeature],
+) -> std::result::Result<Vec<(String, ColumnType)>, String> {
+    let mut columns: BTreeMap<&str, Option<ColumnType>> = BTreeMap::new();
+    for feature in features {
+        for (name, value) in &feature.properties {
+            let seen = columns.entry(name.as_str()).or_default();
+            *seen = match (*seen, ColumnType::of(value)) {
+                (Some(a), Some(b)) => Some(a.merge(b)),
+                (a, b) => a.or(b),
+            };
+        }
+    }
+    // sqlite matches column names case-insensitively
+    let mut folded: HashMap<String, &str> = HashMap::from([
+        (PRIMARY_KEY.to_string(), PRIMARY_KEY),
+        (GEOMETRY_COLUMN.to_string(), GEOMETRY_COLUMN),
+    ]);
+    for name in columns.keys().copied() {
+        if let Some(other) = folded.insert(name.to_ascii_lowercase(), name) {
+            return Err(format!(
+                "property {name} has the name of column {other} once case is ignored, \
+                 as geopackage column names are, rename the property"
+            ));
+        }
+    }
+    Ok(columns
+        .into_iter()
+        .map(|(name, kind)| (name.to_string(), kind.unwrap_or(ColumnType::Text)))
+        .collect())
+}
+
+fn geometry_type_name(geometry: &FeatureGeometry) -> &'static str {
+    match geometry {
+        FeatureGeometry::Point(_) => "POINT",
+        FeatureGeometry::LineString(_) => "LINESTRING",
+        FeatureGeometry::Polygon(_) => "POLYGON",
+        FeatureGeometry::MultiPoint(_) => "MULTIPOINT",
+        FeatureGeometry::MultiLineString(_) => "MULTILINESTRING",
+        FeatureGeometry::MultiPolygon(_) => "MULTIPOLYGON",
+        FeatureGeometry::GeometryCollection(_) => "GEOMETRYCOLLECTION",
+    }
+}
+
+fn rtree_triggers(table: &str, rtree: &str) -> std::result::Result<String, String> {
+    let trigger = |suffix: &str| quote_identifier(&format!("{rtree}_{suffix}"));
+    let (insert, update6, update7, update2, update5, update4, delete) = (
+        trigger("insert")?,
+        trigger("update6")?,
+        trigger("update7")?,
+        trigger("update2")?,
+        trigger("update5")?,
+        trigger("update4")?,
+        trigger("delete")?,
+    );
+    let quoted_table = quote_identifier(table)?;
+    let quoted_rtree = quote_identifier(rtree)?;
+    let geometry = format!("\"{GEOMETRY_COLUMN}\"");
+    let key = format!("\"{PRIMARY_KEY}\"");
+    let bounds = format!(
+        "ST_MinX(NEW.{geometry}), ST_MaxX(NEW.{geometry}), ST_MinY(NEW.{geometry}), ST_MaxY(NEW.{geometry})"
+    );
+    // gdal's geopackage 1.4 rtree triggers, calling ST_ functions plain sqlite lacks
+    Ok(format!(
+        "CREATE TRIGGER {insert} AFTER INSERT ON {quoted_table} \
+         WHEN (new.{geometry} NOT NULL AND NOT ST_IsEmpty(NEW.{geometry})) \
+         BEGIN INSERT OR REPLACE INTO {quoted_rtree} VALUES (NEW.{key}, {bounds}); END;
+         CREATE TRIGGER {update6} AFTER UPDATE OF {geometry} ON {quoted_table} \
+         WHEN OLD.{key} = NEW.{key} AND (NEW.{geometry} NOTNULL AND NOT ST_IsEmpty(NEW.{geometry})) \
+         AND (OLD.{geometry} NOTNULL AND NOT ST_IsEmpty(OLD.{geometry})) \
+         BEGIN UPDATE {quoted_rtree} SET minx = ST_MinX(NEW.{geometry}), maxx = ST_MaxX(NEW.{geometry}), \
+         miny = ST_MinY(NEW.{geometry}), maxy = ST_MaxY(NEW.{geometry}) WHERE id = NEW.{key}; END;
+         CREATE TRIGGER {update7} AFTER UPDATE OF {geometry} ON {quoted_table} \
+         WHEN OLD.{key} = NEW.{key} AND (NEW.{geometry} NOTNULL AND NOT ST_IsEmpty(NEW.{geometry})) \
+         AND (OLD.{geometry} ISNULL OR ST_IsEmpty(OLD.{geometry})) \
+         BEGIN INSERT INTO {quoted_rtree} VALUES (NEW.{key}, {bounds}); END;
+         CREATE TRIGGER {update2} AFTER UPDATE OF {geometry} ON {quoted_table} \
+         WHEN OLD.{key} = NEW.{key} AND (NEW.{geometry} ISNULL OR ST_IsEmpty(NEW.{geometry})) \
+         BEGIN DELETE FROM {quoted_rtree} WHERE id = OLD.{key}; END;
+         CREATE TRIGGER {update5} AFTER UPDATE ON {quoted_table} \
+         WHEN OLD.{key} != NEW.{key} AND (NEW.{geometry} NOTNULL AND NOT ST_IsEmpty(NEW.{geometry})) \
+         BEGIN DELETE FROM {quoted_rtree} WHERE id = OLD.{key}; \
+         INSERT OR REPLACE INTO {quoted_rtree} VALUES (NEW.{key}, {bounds}); END;
+         CREATE TRIGGER {update4} AFTER UPDATE ON {quoted_table} \
+         WHEN OLD.{key} != NEW.{key} AND (NEW.{geometry} ISNULL OR ST_IsEmpty(NEW.{geometry})) \
+         BEGIN DELETE FROM {quoted_rtree} WHERE id IN (OLD.{key}, NEW.{key}); END;
+         CREATE TRIGGER {delete} AFTER DELETE ON {quoted_table} WHEN old.{geometry} NOT NULL \
+         BEGIN DELETE FROM {quoted_rtree} WHERE id = OLD.{key}; END;"
+    ))
+}
+
+pub fn write_geopackage(
+    path: &Path,
+    table: &str,
+    features: &[VectorFeature],
+    crs: Crs,
+) -> Result<()> {
+    let write_error = |message: String| Error::Write(format!("{}: {message}", path.display()));
+    let sql_error = |e: rusqlite::Error| write_error(e.to_string());
+    let columns = property_columns(features).map_err(write_error)?;
+    let srs_id = i32::try_from(crs.0)
+        .map_err(|_| write_error(format!("{crs} does not fit a geopackage srs_id")))?;
+    let definition = u16::try_from(crs.0)
+        .ok()
+        .and_then(crs_definitions::from_code)
+        .ok_or_else(|| {
+            write_error(format!(
+                "no well-known text for {crs}, which gpkg_spatial_ref_sys needs"
+            ))
+        })?
+        .wkt;
+    let mut kinds = features.iter().map(|f| geometry_type_name(&f.geometry));
+    let geometry_type = match kinds.next() {
+        Some(first) if kinds.all(|kind| kind == first) => first,
+        _ => "GEOMETRY",
+    };
+    let envelopes: Vec<_> = features
+        .iter()
+        .map(|f| geometry_envelope(&f.geometry))
+        .collect();
+    // geometry_envelope gives an empty geometry an infinite envelope
+    let extent = envelopes
+        .iter()
+        .filter(|e| e.min_x.is_finite())
+        .copied()
+        .reduce(|a, b| a.union(&b));
+
+    let rtree = format!("rtree_{table}_{GEOMETRY_COLUMN}");
+    let quoted_table = quote_identifier(table).map_err(write_error)?;
+    let quoted_rtree = quote_identifier(&rtree).map_err(write_error)?;
+    let column_names: Vec<String> = columns
+        .iter()
+        .map(|(name, _)| quote_identifier(name))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(write_error)?;
+    let column_definitions: String = column_names
+        .iter()
+        .zip(&columns)
+        .map(|(name, (_, kind))| format!(", {name} {}", kind.sql_name()))
+        .collect();
+    let insert_feature = format!(
+        "INSERT INTO {quoted_table} (\"{GEOMETRY_COLUMN}\"{}) VALUES (?1{})",
+        column_names
+            .iter()
+            .map(|name| format!(", {name}"))
+            .collect::<String>(),
+        (0..columns.len())
+            .map(|i| format!(", ?{}", i + 2))
+            .collect::<String>(),
+    );
+    let triggers = rtree_triggers(table, &rtree).map_err(write_error)?;
+
+    let mut connection = Connection::open(path).map_err(sql_error)?;
+    connection
+        .pragma_update(None, "application_id", GPKG_APPLICATION_ID)
+        .map_err(sql_error)?;
+    connection
+        .pragma_update(None, "user_version", GPKG_USER_VERSION)
+        .map_err(sql_error)?;
+    let transaction = connection.transaction().map_err(sql_error)?;
+    transaction
+        .execute_batch(METADATA_TABLES)
+        .map_err(sql_error)?;
+    transaction
+        .execute(
+            "INSERT INTO gpkg_spatial_ref_sys VALUES ('WGS 84 geodetic', 4326, 'EPSG', 4326, ?1, \
+             'longitude/latitude coordinates in decimal degrees on the WGS 84 spheroid')",
+            [crs_definitions::EPSG_4326.wkt],
+        )
+        .map_err(sql_error)?;
+    if crs != Crs::WGS84 {
+        transaction
+            .execute(
+                "INSERT INTO gpkg_spatial_ref_sys VALUES (?1, ?2, 'EPSG', ?2, ?3, NULL)",
+                rusqlite::params![crs.to_string(), srs_id, definition],
+            )
+            .map_err(sql_error)?;
+    }
+    transaction
+        .execute_batch(&format!(
+            "CREATE TABLE {quoted_table} (\"{PRIMARY_KEY}\" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, \
+             \"{GEOMETRY_COLUMN}\" {geometry_type}{column_definitions});
+             CREATE VIRTUAL TABLE {quoted_rtree} USING rtree(id, minx, maxx, miny, maxy);"
+        ))
+        .map_err(sql_error)?;
+    transaction
+        .execute(
+            "INSERT INTO gpkg_contents (table_name, data_type, identifier, min_x, min_y, \
+             max_x, max_y, srs_id) VALUES (?1, 'features', ?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                table,
+                extent.map(|e| e.min_x),
+                extent.map(|e| e.min_y),
+                extent.map(|e| e.max_x),
+                extent.map(|e| e.max_y),
+                srs_id
+            ],
+        )
+        .map_err(sql_error)?;
+    transaction
+        .execute(
+            "INSERT INTO gpkg_geometry_columns VALUES (?1, ?2, ?3, ?4, 0, 0)",
+            rusqlite::params![table, GEOMETRY_COLUMN, geometry_type, srs_id],
+        )
+        .map_err(sql_error)?;
+    transaction
+        .execute(
+            "INSERT INTO gpkg_extensions VALUES (?1, ?2, 'gpkg_rtree_index', \
+             'http://www.geopackage.org/spec120/#extension_rtree', 'write-only')",
+            rusqlite::params![table, GEOMETRY_COLUMN],
+        )
+        .map_err(sql_error)?;
+    {
+        let mut insert = transaction.prepare(&insert_feature).map_err(sql_error)?;
+        let mut index = transaction
+            .prepare(&format!(
+                "INSERT INTO {quoted_rtree} VALUES (?1, ?2, ?3, ?4, ?5)"
+            ))
+            .map_err(sql_error)?;
+        for (feature, envelope) in features.iter().zip(&envelopes) {
+            let mut values = vec![rusqlite::types::Value::Blob(
+                topoi_core::write_geopackage_geometry(&feature.geometry, srs_id),
+            )];
+            values.extend(
+                columns
+                    .iter()
+                    .map(|(name, kind)| kind.sql_value(feature.properties.get(name))),
+            );
+            insert
+                .execute(rusqlite::params_from_iter(values))
+                .map_err(sql_error)?;
+            if envelope.min_x.is_finite() {
+                index
+                    .execute(rusqlite::params![
+                        transaction.last_insert_rowid(),
+                        envelope.min_x,
+                        envelope.max_x,
+                        envelope.min_y,
+                        envelope.max_y
+                    ])
+                    .map_err(sql_error)?;
+            }
+        }
+    }
+    transaction.execute_batch(&triggers).map_err(sql_error)?;
+    transaction.commit().map_err(sql_error)?;
+    connection.close().map_err(|(_, e)| sql_error(e))
 }

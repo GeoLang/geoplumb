@@ -180,7 +180,7 @@ impl Source for VecSrc {
     }
 }
 
-fn geometry_envelope(geometry: &FeatureGeometry) -> Envelope {
+pub(crate) fn geometry_envelope(geometry: &FeatureGeometry) -> Envelope {
     let mut env = Envelope::new(
         f64::INFINITY,
         f64::INFINITY,

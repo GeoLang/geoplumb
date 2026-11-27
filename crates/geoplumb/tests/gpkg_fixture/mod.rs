@@ -61,41 +61,6 @@ pub fn envelope(geometry: &FeatureGeometry) -> [f64; 4] {
     )
 }
 
-fn push_coords(coords: &[Coord], out: &mut Vec<u8>) {
-    out.extend_from_slice(&(coords.len() as u32).to_le_bytes());
-    for c in coords {
-        out.extend_from_slice(&c.x.to_le_bytes());
-        out.extend_from_slice(&c.y.to_le_bytes());
-    }
-}
-
-fn geometry_blob(geometry: &FeatureGeometry, srs_id: i64) -> Vec<u8> {
-    let envelope_type_xy = 1u8 << 1;
-    let little_endian_header = 1u8;
-    let mut out = vec![b'G', b'P', 0, envelope_type_xy | little_endian_header];
-    out.extend_from_slice(&(srs_id as i32).to_le_bytes());
-    for bound in envelope(geometry) {
-        out.extend_from_slice(&bound.to_le_bytes());
-    }
-    out.push(1);
-    match geometry {
-        FeatureGeometry::Polygon(p) => {
-            out.extend_from_slice(&3u32.to_le_bytes());
-            out.extend_from_slice(&(1 + p.interiors().len() as u32).to_le_bytes());
-            push_coords(p.exterior().coords(), &mut out);
-            for hole in p.interiors() {
-                push_coords(hole.coords(), &mut out);
-            }
-        }
-        FeatureGeometry::LineString(l) => {
-            out.extend_from_slice(&2u32.to_le_bytes());
-            push_coords(l.coords(), &mut out);
-        }
-        other => panic!("the fixture writes polygons and lines, got {other:?}"),
-    }
-    out
-}
-
 pub fn write_geopackage(path: &Path, layer: &Layer) {
     let mut connection = Connection::open(path).unwrap();
     let property_columns: String = layer
@@ -147,7 +112,10 @@ pub fn write_geopackage(path: &Path, layer: &Layer) {
     for feature in layer.features {
         let mut values = vec![
             Value::Integer(feature.id),
-            Value::Blob(geometry_blob(&feature.geometry, layer.srs.id)),
+            Value::Blob(topoi_core::write_geopackage_geometry(
+                &feature.geometry,
+                layer.srs.id as i32,
+            )),
         ];
         values.extend(feature.properties.iter().cloned());
         transaction

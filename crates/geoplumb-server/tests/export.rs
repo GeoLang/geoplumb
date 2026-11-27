@@ -4,6 +4,8 @@ use std::process::{Command, Output};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use geoplumb::elements::GpkgSrc;
+use geoplumb::{Bbox, Crs, Source, WindowReq};
 use geoplumb_server::config::Config;
 use geoplumb_server::{Layer, router};
 use projicio_core::Transform;
@@ -714,6 +716,95 @@ fn geoplumb_run_writes_a_filtered_vector_layer_clipped_to_a_western_bbox() {
     assert!(ferry.iter().all(|coord| (coord.y - 37.85).abs() < 1e-6));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn geoplumb_run_writes_a_vector_layer_as_a_geopackage_in_the_crs_it_was_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let layers = write_command_layers(dir.path());
+    let to_utm = Transform::new("EPSG:4326", "EPSG:32610").unwrap();
+    let (easting, northing) = to_utm.convert(-122.4, 37.8).unwrap();
+    let (easting, northing) = (
+        (easting / 100.0).round() * 100.0,
+        (northing / 100.0).round() * 100.0,
+    );
+    // 12 km each way holds the pier and the park, cuts the ferry and leaves out the outside site
+    let reach = 12_000.0;
+    let bbox = Bbox::new(
+        easting - reach,
+        northing - reach,
+        easting + reach,
+        northing + reach,
+    );
+    let out = dir.path().join("sites.gpkg");
+    let output = geoplumb(&[
+        "run",
+        &layers,
+        "sites",
+        "--bbox",
+        &format!(
+            "{},{},{},{}",
+            bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y
+        ),
+        "--crs",
+        "EPSG:32610",
+        "--resolution",
+        "100",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let src = GpkgSrc::open(&out, Some("sites"), None).unwrap();
+    let request = WindowReq {
+        bbox,
+        resolution: src.grid().base_resolution,
+        time: None,
+    };
+    let chunk = src.read(&request).await.unwrap().into_vector().unwrap();
+    assert_eq!(chunk.crs, Crs(32610));
+    let name_of = |feature: &geoplumb::VectorFeature| {
+        feature.properties["name"].as_str().unwrap().to_string()
+    };
+    let mut names: Vec<String> = chunk.features.iter().map(name_of).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["ferry", "park", "pier"]);
+
+    let geometry_of = |name: &str| {
+        chunk
+            .features
+            .iter()
+            .find(|feature| name_of(feature) == name)
+            .map(|feature| feature.geometry.clone())
+            .unwrap()
+    };
+    let FeatureGeometry::Point(pier) = geometry_of("pier") else {
+        panic!("the pier is no longer a point");
+    };
+    let (pier_easting, pier_northing) = to_utm.convert(-122.45, 37.75).unwrap();
+    assert!(
+        (pier.0.x - pier_easting).abs() < 0.01 && (pier.0.y - pier_northing).abs() < 0.01,
+        "the pier is at {},{}, utm 10n puts it at {pier_easting},{pier_northing}",
+        pier.0.x,
+        pier.0.y
+    );
+    let ferry = match geometry_of("ferry") {
+        FeatureGeometry::LineString(line) => line.coords().to_vec(),
+        FeatureGeometry::MultiLineString(lines) => lines
+            .linestrings()
+            .iter()
+            .flat_map(|line| line.coords().to_vec())
+            .collect(),
+        other => panic!("the ferry is {other:?}"),
+    };
+    let ferry_east_end = ferry
+        .iter()
+        .map(|coord| coord.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        (ferry_east_end - bbox.max_x).abs() < 1e-6,
+        "the ferry ends at {ferry_east_end}"
+    );
+}
+
 #[test]
 fn geoplumb_run_refuses_a_job_it_cannot_write_and_writes_no_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -729,7 +820,7 @@ fn geoplumb_run_refuses_a_job_it_cannot_write_and_writes_no_file() {
             &utm_bbox,
             "EPSG:32632",
             "dem.gpkg",
-            ".geojson for a vector layer",
+            "raster layer, its output is a .tif",
         ),
         (
             &layers,

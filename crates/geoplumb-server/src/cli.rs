@@ -2,9 +2,10 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
+use geoplumb::elements::write_geopackage;
 use geoplumb::export::write_cog;
 use geoplumb::tile::XyzTile;
-use geoplumb::{Caps, Crs, Engine, NodeId, WindowReq};
+use geoplumb::{Caps, Crs, Engine, NodeId, VectorChunk, WindowReq};
 use tempfile::NamedTempFile;
 use terrano_core::CogReader;
 use topoi_core::geojson::{Feature, FeatureCollection, write_geojson};
@@ -20,6 +21,13 @@ use crate::{
 enum OutputFormat {
     Cog,
     Geojson,
+    Gpkg,
+}
+
+#[derive(Clone, Copy)]
+enum LayerKind {
+    Raster,
+    Vector,
 }
 
 fn output_format(output: &Path) -> Result<OutputFormat, String> {
@@ -30,8 +38,9 @@ fn output_format(output: &Path) -> Result<OutputFormat, String> {
     match extension.as_deref() {
         Some("tif" | "tiff") => Ok(OutputFormat::Cog),
         Some("geojson") => Ok(OutputFormat::Geojson),
+        Some("gpkg") => Ok(OutputFormat::Gpkg),
         _ => Err(format!(
-            "{}: the output is a .tif for a raster layer or a .geojson for a vector layer",
+            "{}: the output is a .tif for a raster layer, or a .geojson or .gpkg for a vector layer",
             output.display()
         )),
     }
@@ -43,7 +52,7 @@ struct LayerJob {
     plan: Plan,
 }
 
-async fn features(job: &LayerJob) -> Result<FeatureCollection, String> {
+async fn features(job: &LayerJob) -> Result<VectorChunk, String> {
     let bbox = job.plan.grid.bbox();
     let request = WindowReq {
         bbox,
@@ -56,17 +65,7 @@ async fn features(job: &LayerJob) -> Result<FeatureCollection, String> {
         .await
         .and_then(|chunk| chunk.into_vector())
         .map_err(|e| e.to_string())?;
-    let dissolved = pulled.crop_to(&bbox).dissolve();
-    Ok(FeatureCollection {
-        features: dissolved
-            .features
-            .into_iter()
-            .map(|feature| Feature {
-                geometry: Some(feature.geometry),
-                properties: feature.properties,
-            })
-            .collect(),
-    })
+    Ok(pulled.crop_to(&bbox).dissolve())
 }
 
 fn read_layer_file(
@@ -107,9 +106,9 @@ pub async fn write_layer(
     .await
     .map_err(|e| e.to_string())??;
 
-    let layer_format = match job.engine.caps(job.node) {
-        Caps::Raster(_) => OutputFormat::Cog,
-        Caps::Vector(_) => OutputFormat::Geojson,
+    let layer_kind = match job.engine.caps(job.node) {
+        Caps::Raster(_) => LayerKind::Raster,
+        Caps::Vector(_) => LayerKind::Vector,
         Caps::PointCloud(_) | Caps::Tensor(_) => {
             return Err(format!(
                 "layer {layer} ends in neither a raster nor features"
@@ -126,14 +125,14 @@ pub async fn write_layer(
             directory.display()
         )
     })?;
-    match (layer_format, format) {
-        (OutputFormat::Cog, OutputFormat::Cog) => {
+    match (layer_kind, format) {
+        (LayerKind::Raster, OutputFormat::Cog) => {
             let LayerJob { engine, node, plan } = job;
             file = write_cog(Arc::new(engine), node, plan.grid, plan.time, file)
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        (OutputFormat::Geojson, OutputFormat::Geojson) => {
+        (LayerKind::Vector, OutputFormat::Geojson) => {
             if job.plan.crs != Crs::WGS84 {
                 return Err(format!(
                     "geojson coordinates are lon/lat (rfc 7946), so a .geojson output takes \
@@ -141,18 +140,33 @@ pub async fn write_layer(
                     job.plan.crs
                 ));
             }
-            let collection = features(&job).await?;
+            let collection = FeatureCollection {
+                features: features(&job)
+                    .await?
+                    .features
+                    .into_iter()
+                    .map(|feature| Feature {
+                        geometry: Some(feature.geometry),
+                        properties: feature.properties,
+                    })
+                    .collect(),
+            };
             file.write_all(write_geojson(&collection).as_bytes())
                 .map_err(|e| format!("{}: {e}", file.path().display()))?;
         }
-        (OutputFormat::Cog, OutputFormat::Geojson) => {
+        (LayerKind::Vector, OutputFormat::Gpkg) => {
+            let chunk = features(&job).await?;
+            write_geopackage(file.path(), layer, &chunk.features, job.plan.crs)
+                .map_err(|e| e.to_string())?;
+        }
+        (LayerKind::Raster, OutputFormat::Geojson | OutputFormat::Gpkg) => {
             return Err(format!(
                 "layer {layer} is a raster layer, its output is a .tif"
             ));
         }
-        (OutputFormat::Geojson, OutputFormat::Cog) => {
+        (LayerKind::Vector, OutputFormat::Cog) => {
             return Err(format!(
-                "layer {layer} is a vector layer, its output is a .geojson"
+                "layer {layer} is a vector layer, its output is a .geojson or a .gpkg"
             ));
         }
     }

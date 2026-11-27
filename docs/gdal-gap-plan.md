@@ -20,7 +20,8 @@ Where GDAL still is today, across the org:
   feature-gated, shipped in a container with GDAL from the distro.
 - geoplumb: `GdalSrc` over the `gdal` crate, behind the `gdal` feature and
   off in the default build (section 1). Its other layer sources, `stac`,
-  `cog`, `geojson`, `gpkg`, `las` and `copc`, use no GDAL.
+  `cog`, `geojson`, `gpkg`, `shapefile`, `csv`, `las` and `copc`, use no
+  GDAL.
 
 Pure-Rust coverage today: terrano reads COGs compressed with deflate or LZW or
 uncompressed and writes deflate or uncompressed ones (horizontal and floating-point predictors, u8 through f64, multi-band pixel
@@ -428,21 +429,21 @@ that opens the user's file and writes it back in its own dtype.
       reads (`config::Config`) and writes to disk instead of serving.
       `geoplumb run <layers.toml> <layer> --bbox --crs --resolution [--t] -o
       out.tif` writes a COG through `export::write_cog`. A vector layer writes
-      `-o out.geojson` or `out.gpkg` through geodukt. `geoplumb pyramid`
+      `-o out.geojson` or `out.gpkg`. `geoplumb pyramid`
       writes what the `pyramid` example writes. `geoplumb info <file>` prints
       size, bands, dtype, CRS, geotransform, overviews, nodata and compression,
       in place of `gdalinfo`. The server's four-minute timeout and export pixel
       cap protect a shared process and do not apply on the command line.
       Built: the binary in `geoplumb-server`, jobs always through a TOML
-      file, `run` to `.tif` and `.geojson` (EPSG:4326 only), `info`, and
+      file, `run` to `.tif`, `.geojson` (EPSG:4326 only) and `.gpkg` (any
+      EPSG crs, written by `elements::write_geopackage`), `info`, and
       `pyramid`, which writes a layer's xyz tiles as a z/x/y directory of
       the bytes `/tiles` serves.
       Proof: on a GDAL LZW COG of Copernicus GLO-30, `info` matches
       `gdalinfo` and `run` to UTM 32N at 30 m matches
       `gdalwarp -r bilinear -et 0` within 0.65 mm on every pixel.
-      Left: `.gpkg`, blocked on geodukt (its writers take `geodukt-core`
-      types, `geodukt-core` depends on geoplumb, and its rusqlite 0.40 links
-      a different `libsqlite3-sys` than geoplumb's 0.39).
+      Left: a proof that `ogrinfo` and GDAL's `validate_gpkg.py` accept a
+      `run` `.gpkg` written from a real layer.
 - [ ] 9.2 Open every GeoTIFF GDAL writes with its defaults. Built: striped
       GeoTIFF, BigTIFF and band interleave (PlanarConfiguration 2), raw, LZW,
       deflate or ZSTD with either predictor, including the floating-point
@@ -451,9 +452,9 @@ that opens the user's file and writes it back in its own dtype.
       Proof: `gdal_translate` on Copernicus GLO-30 and an ESA WorldCover
       window, where `geoplumb run` over each file's own grid equals GDAL's
       read of every pixel and band, JPEG and WebP included. A CRS given as
-      WKT or PROJ JSON is
-      8.10. Vector: shapefile and CSV as layer sources through geodukt, which
-      reads both, then FlatGeobuf and GeoParquet (section 7).
+      WKT or PROJ JSON is 8.10. Vector: the `shapefile` and `csv` layer
+      sources are built, read by geoplumb itself. FlatGeobuf and GeoParquet
+      are left (section 7).
 - [x] 9.3 Native dtype on output, which is 8.9. A byte raster exports as
       Byte, where it used to come back as Float64.
 - [ ] 9.4 GDAL operators with no geoplumb element. Nothing in geoplumb or

@@ -20,6 +20,8 @@ use geoplumb_server::{Layer, parse_time, router};
 use jung_mvt::{AttributeValue, TileGeometry, VectorLayer, decode_tile};
 use nubis_core::{Point3, PointCloud, write_las};
 use rusqlite::types::Value;
+use shapefile::PolygonRing;
+use shapefile::dbase::{FieldValue, Record, TableWriterBuilder};
 use terrano_core::{
     BandedRaster, CogParams, CogReader, GeoTiffMetadata, Raster, write_cog, write_cog_bands,
 };
@@ -1633,6 +1635,111 @@ async fn a_gpkg_layer_burns_its_features_into_the_tile() {
     assert_eq!(status, StatusCode::OK);
     let layers: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(layers[0]["source"], "gpkg", "{layers}");
+}
+
+fn write_parcels_shapefile(dir: &Path) -> String {
+    let path = dir.join("parcels.shp");
+    let table = TableWriterBuilder::new()
+        .add_numeric_field("depth".try_into().unwrap(), 8, 2)
+        .add_character_field("zone".try_into().unwrap(), 16);
+    let mut writer = shapefile::Writer::from_path(&path, table).unwrap();
+    for (min_lon, max_lon, depth, zone) in [(7.25, 7.35, 1.0, "shallow"), (7.35, 7.45, 3.0, "deep")]
+    {
+        let ring = box_ring(min_lon, PARCEL_MIN_LAT, max_lon, PARCEL_MAX_LAT)
+            .into_iter()
+            .map(|[x, y]| shapefile::Point::new(x, y))
+            .collect();
+        let mut record = Record::default();
+        record.insert("depth".into(), FieldValue::Numeric(Some(depth)));
+        record.insert("zone".into(), FieldValue::Character(Some(zone.into())));
+        writer
+            .write_shape_and_record(&shapefile::Polygon::new(PolygonRing::Outer(ring)), &record)
+            .unwrap();
+    }
+    drop(writer);
+    path.display().to_string().replace('\\', "/")
+}
+
+const SHAPEFILE: &str = r#"
+[[layer]]
+name = "parcels"
+source = { kind = "shapefile", path = "SHAPEFILE_PATH", crs = 4326 }
+gray = { min = 0.0, max = 4.0 }
+
+[[layer.op]]
+kind = "rasterize"
+burn = { property = "depth" }
+"#;
+
+#[tokio::test]
+async fn a_shapefile_layer_burns_its_features_into_the_tile() {
+    let dir = tempfile::tempdir().unwrap();
+    let layer_file = SHAPEFILE.replace("SHAPEFILE_PATH", &write_parcels_shapefile(dir.path()));
+    let app = app(&layer_file);
+    let (x, y) = tile_of(12, 7.3, 46.8);
+
+    let (status, png) = get(&app, &format!("/tiles/parcels/12/{x}/{y}.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    let grays = opaque_grays(&png);
+    assert!(grays.len() > 60_000, "only {} pixels burned", grays.len());
+    assert!(grays.contains(&SHALLOW_GRAY), "the 1.0 parcel is missing");
+    assert!(grays.contains(&DEEP_GRAY), "the 3.0 parcel is missing");
+
+    let (status, body) = get(&app, "/layers").await;
+    assert_eq!(status, StatusCode::OK);
+    let layers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(layers[0]["source"], "shapefile", "{layers}");
+}
+
+const CSV_POINTS: &str = r#"
+[[layer]]
+name = "sites"
+source = { kind = "csv", path = "CSV_PATH", x = "lon", y = "lat", crs = 4326 }
+
+[[layer.op]]
+kind = "vec_filter"
+field = "count"
+equals = 3
+"#;
+
+#[tokio::test]
+async fn a_csv_layer_filters_on_an_integer_column_and_serves_points_as_mvt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sites.csv");
+    std::fs::write(
+        &path,
+        "name,lon,lat,count\npier,7.30,46.80,3\ndock,7.31,46.80,7\nbuoy,7.32,46.80,3\n",
+    )
+    .unwrap();
+    let csv = path.display().to_string().replace('\\', "/");
+    let app = app(&CSV_POINTS.replace("CSV_PATH", &csv));
+    let (x, y) = tile_of(12, 7.31, 46.80);
+
+    let (status, body) = get(&app, &format!("/tiles/sites/12/{x}/{y}.mvt")).await;
+    assert_eq!(status, StatusCode::OK);
+    let layer = decoded_layer(&body, "sites");
+    let mut names: Vec<String> = Vec::new();
+    for feature in &layer.features {
+        assert_eq!(
+            feature.attributes.get("count"),
+            Some(&AttributeValue::Integer(3))
+        );
+        let TileGeometry::Points(points) = &feature.geometry else {
+            panic!("not points: {:?}", feature.geometry);
+        };
+        assert_eq!(points.len(), 1);
+        match feature.attributes.get("name") {
+            Some(AttributeValue::String(name)) => names.push(name.clone()),
+            other => panic!("name is {other:?}"),
+        }
+    }
+    names.sort();
+    assert_eq!(names, ["buoy", "pier"]);
+
+    let (status, body) = get(&app, "/layers").await;
+    assert_eq!(status, StatusCode::OK);
+    let layers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(layers[0]["source"], "csv", "{layers}");
 }
 
 #[tokio::test]
